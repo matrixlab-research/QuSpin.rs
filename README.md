@@ -15,6 +15,9 @@ same rectangular `shape + apply` interface. This supports square Hamiltonians,
 cross-sector probes, and open-system generators without model-specific solver
 paths.
 
-Status: initial implementation in progress. API presence alone is not a claim
-of Python/Julia parity; numerical completion is tracked by the private paper
-workflow verifier.
+Status: the public release-mode gate executes all 12 frozen paper workflows,
+including symmetry reduction, sparse shift-invert, Floquet evolution,
+open-system dynamics, and cross-sector spectroscopy. API presence and this
+public regression suite are still not, by themselves, a claim of Python/Julia
+parity; independent numerical observations and benchmark records remain the
+responsibility of the private paper-workflow verifier.

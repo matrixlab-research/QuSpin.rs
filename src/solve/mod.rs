@@ -563,6 +563,29 @@ struct LanczosProjection {
     eigenvectors: DMatrix<f64>,
 }
 
+pub(crate) fn lanczos_spectral_measure(
+    operator: &(impl LinearOperator + ?Sized),
+    source: &[Complex64],
+    krylov_dimension: usize,
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    let shape = operator.shape();
+    if shape.0 != shape.1 || source.len() != shape.0 {
+        return Err(QuSpinError::DimensionMismatch(
+            "spectral Lanczos requires a square operator matching the source".into(),
+        ));
+    }
+    if krylov_dimension == 0 {
+        return Err(QuSpinError::InvalidOptions(
+            "spectral Krylov dimension must be positive".into(),
+        ));
+    }
+    let projection = lanczos_projection(operator, source, krylov_dimension)?;
+    let weights = (0..projection.eigenvalues.len())
+        .map(|index| projection.initial_norm.powi(2) * projection.eigenvectors[(0, index)].powi(2))
+        .collect();
+    Ok((projection.eigenvalues, weights))
+}
+
 fn lanczos_projection(
     operator: &(impl LinearOperator + ?Sized),
     initial: &[Complex64],
