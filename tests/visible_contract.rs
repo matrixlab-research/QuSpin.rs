@@ -172,6 +172,7 @@ fn spin_translation_sector_uses_normalized_orbit_representatives() {
 }
 
 #[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
 fn paper_scale_translation_xxz_sector_stays_sparse() {
     let basis = SpinBasis1D::builder(18).up(9).momentum(0).build().unwrap();
     assert_eq!(basis.len(), 2_704);
@@ -197,6 +198,7 @@ fn paper_scale_translation_xxz_sector_stays_sparse() {
 }
 
 #[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
 fn paper_scale_xxz_lanczos_quench_preserves_norm() {
     let sites = 16;
     let basis = SpinBasis1D::builder(sites).up(8).build().unwrap();
@@ -252,6 +254,7 @@ fn paper_scale_xxz_lanczos_quench_preserves_norm() {
 }
 
 #[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
 fn paper_scale_pxp_revival_uses_the_universal_user_basis_path() {
     let sites = 24;
     let basis = UserBasis::builder(sites)
@@ -295,6 +298,7 @@ fn paper_scale_pxp_revival_uses_the_universal_user_basis_path() {
 }
 
 #[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
 fn paper_scale_bose_hubbard_mott_quench_reuses_one_krylov_projection() {
     let sites = 11;
     let basis = BosonBasis1D::builder(sites, 3)
@@ -350,6 +354,180 @@ fn paper_scale_bose_hubbard_mott_quench_reuses_one_krylov_projection() {
         returns.push(state[basis.index(mott).unwrap()].norm_sqr());
     }
     assert!(returns[1..].iter().copied().fold(1.0_f64, f64::min) < 0.99);
+}
+
+#[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
+fn paper_scale_spinful_hubbard_low_energy_residuals() {
+    let sites = 8;
+    let basis = SpinfulFermionBasis1D::builder(sites)
+        .particles(4, 4)
+        .build()
+        .unwrap();
+    assert_eq!(basis.len(), 4_900);
+    let bonds = 0..(sites - 1);
+    let hamiltonian = OperatorBuilder::on(&basis)
+        .terms([
+            OperatorTerm::new(
+                "+-|",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(-1.0, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "-+|",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(1.0, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "|+-",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(-1.0, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "|-+",
+                bonds.map(|site| Coupling::new(1.0, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "n|n",
+                (0..sites).map(|site| Coupling::new(4.0, vec![site, site])),
+            )
+            .unwrap(),
+        ])
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let result = eigsh(
+        &hamiltonian,
+        EigshOptions {
+            eigenpairs: 6,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: Some(160),
+            tolerance: 1.0e-9,
+            max_iterations: 192,
+            seed: 37,
+        },
+    )
+    .unwrap();
+    assert!(result.residuals.iter().all(|residual| *residual < 2.0e-7));
+}
+
+#[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
+fn paper_scale_interacting_ssh_low_energy_residuals() {
+    let sites = 16;
+    let basis = SpinlessFermionBasis1D::builder(sites)
+        .particles(8)
+        .build()
+        .unwrap();
+    assert_eq!(basis.len(), 12_870);
+    let hopping = |site: usize| if site % 2 == 0 { 0.6 } else { 1.0 };
+    let bonds = 0..(sites - 1);
+    let hamiltonian = OperatorBuilder::on(&basis)
+        .terms([
+            OperatorTerm::new(
+                "+-",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(-hopping(site), vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "-+",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(hopping(site), vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "nn",
+                bonds.map(|site| Coupling::new(2.0, vec![site, site + 1])),
+            )
+            .unwrap(),
+        ])
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let result = eigsh(
+        &hamiltonian,
+        EigshOptions {
+            eigenpairs: 6,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: Some(160),
+            tolerance: 1.0e-9,
+            max_iterations: 192,
+            seed: 41,
+        },
+    )
+    .unwrap();
+    assert!(result.residuals.iter().all(|residual| *residual < 2.0e-7));
+}
+
+#[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
+fn paper_scale_tfim_tracks_degenerate_subspaces() {
+    let sites = 16;
+    let basis = SpinBasis1D::builder(sites).pauli(true).build().unwrap();
+    assert_eq!(basis.len(), 65_536);
+    let mut subspaces = Vec::new();
+    for (field_index, field) in [0.8, 0.9, 1.0, 1.1, 1.2].into_iter().enumerate() {
+        let hamiltonian = OperatorBuilder::on(&basis)
+            .terms([
+                OperatorTerm::new(
+                    "zz",
+                    (0..sites).map(|site| Coupling::new(-1.0, vec![site, (site + 1) % sites])),
+                )
+                .unwrap(),
+                OperatorTerm::new(
+                    "x",
+                    (0..sites).map(|site| Coupling::new(-field, vec![site])),
+                )
+                .unwrap(),
+            ])
+            .build(MatrixFormat::Csc)
+            .unwrap();
+        let result = eigsh(
+            &hamiltonian,
+            EigshOptions {
+                eigenpairs: 2,
+                target: SpectrumTarget::SmallestAlgebraic,
+                krylov_dimension: Some(100),
+                tolerance: 1.0e-9,
+                max_iterations: 128,
+                seed: 43 + field_index as u64,
+            },
+        )
+        .unwrap();
+        assert!(result.residuals.iter().all(|residual| *residual < 3.0e-7));
+        subspaces.push(
+            Subspace::from_columns(
+                basis.len(),
+                2,
+                result.eigenvectors.into_iter().flatten().collect(),
+            )
+            .unwrap(),
+        );
+    }
+    let fidelities: Vec<_> = subspaces
+        .windows(2)
+        .map(|pair| subspace_fidelity(&pair[0], &pair[1]).unwrap())
+        .collect();
+    assert!(
+        fidelities
+            .iter()
+            .all(|value| *value > 0.0 && *value <= 1.0 + 1.0e-12)
+    );
+    let minimum = fidelities
+        .iter()
+        .enumerate()
+        .min_by(|left, right| left.1.total_cmp(right.1))
+        .unwrap()
+        .0;
+    assert!((1..=2).contains(&minimum));
 }
 
 #[test]

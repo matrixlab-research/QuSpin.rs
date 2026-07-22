@@ -357,14 +357,13 @@ where
             }
         }
 
-        // Full double reorthogonalization is more expensive than a three-term
-        // recurrence but keeps multiple and interior Ritz vectors reliable.
-        for _ in 0..2 {
-            for vector in &basis {
-                let overlap = inner(vector, &output);
-                for (value, basis_value) in output.iter_mut().zip(vector) {
-                    *value -= overlap * *basis_value;
-                }
+        // Full modified Gram-Schmidt reorthogonalization keeps multiple and
+        // interior Ritz vectors reliable without the quadratic cost of a
+        // second unconditional pass.
+        for vector in &basis {
+            let overlap = inner(vector, &output);
+            for (value, basis_value) in output.iter_mut().zip(vector) {
+                *value -= overlap * *basis_value;
             }
         }
         let beta = vector_norm(&output);
