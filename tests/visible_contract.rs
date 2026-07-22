@@ -18,6 +18,23 @@ fn c(value: f64) -> Complex64 {
     Complex64::new(value, 0.0)
 }
 
+fn periodic_heisenberg_terms(sites: usize) -> [OperatorTerm; 3] {
+    let mut zz = Vec::with_capacity(sites);
+    let mut forward = Vec::with_capacity(sites);
+    let mut backward = Vec::with_capacity(sites);
+    for site in 0..sites {
+        let next = (site + 1) % sites;
+        zz.push(Coupling::new(1.0, vec![site, next]));
+        forward.push(Coupling::new(0.5, vec![site, next]));
+        backward.push(Coupling::new(0.5, vec![site, next]));
+    }
+    [
+        OperatorTerm::new("zz", zz).unwrap(),
+        OperatorTerm::new("+-", forward).unwrap(),
+        OperatorTerm::new("-+", backward).unwrap(),
+    ]
+}
+
 struct DiagonalOperator {
     diagonal: Vec<f64>,
 }
@@ -81,6 +98,68 @@ fn built_in_basis_visible_anchors() {
         .build()
         .unwrap();
     assert_eq!(spinful.len(), 9);
+}
+
+#[test]
+fn spin_translation_sector_uses_normalized_orbit_representatives() {
+    let momentum_zero = SpinBasis1D::builder(4).up(2).momentum(0).build().unwrap();
+    let momentum_one = SpinBasis1D::builder(4).up(2).momentum(1).build().unwrap();
+    assert_eq!(momentum_zero.len(), 2);
+    assert_eq!(momentum_one.len(), 1);
+    assert_eq!(momentum_zero.momentum(), Some(0));
+
+    let terms = periodic_heisenberg_terms(4);
+    let hamiltonian = OperatorBuilder::on(&momentum_zero)
+        .terms(terms.clone())
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    assert!(hamiltonian.is_hermitian(1.0e-12));
+    let result = eigsh(
+        &hamiltonian,
+        EigshOptions {
+            eigenpairs: 1,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: None,
+            tolerance: 1.0e-12,
+            max_iterations: 100,
+            seed: 5,
+        },
+    )
+    .unwrap();
+    assert_abs_diff_eq!(result.eigenvalues[0], -2.0, epsilon = 1.0e-12);
+
+    let nonzero_momentum = OperatorBuilder::on(&momentum_one)
+        .terms(terms)
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    assert!(nonzero_momentum.is_hermitian(1.0e-12));
+    assert_abs_diff_eq!(nonzero_momentum.to_dense()[0].re, 0.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(nonzero_momentum.to_dense()[0].im, 0.0, epsilon = 1.0e-12);
+}
+
+#[test]
+fn paper_scale_translation_xxz_sector_stays_sparse() {
+    let basis = SpinBasis1D::builder(18).up(9).momentum(0).build().unwrap();
+    assert_eq!(basis.len(), 2_704);
+    let hamiltonian = OperatorBuilder::on(&basis)
+        .terms(periodic_heisenberg_terms(18))
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    assert_eq!(hamiltonian.shape(), (2_704, 2_704));
+    assert!(hamiltonian.nnz() < 60_000);
+    let result = eigsh(
+        &hamiltonian,
+        EigshOptions {
+            eigenpairs: 4,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: Some(96),
+            tolerance: 1.0e-8,
+            max_iterations: 128,
+            seed: 31,
+        },
+    )
+    .unwrap();
+    assert!(result.residuals.iter().all(|residual| *residual < 2.0e-7));
 }
 
 #[test]
