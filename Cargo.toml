@@ -1,0 +1,26 @@
+[package]
+name = "quspin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Rust-native exact diagonalization toolkit derived from scientific workflows"
+repository = "https://github.com/matrixlab-research/QuSpin.rs"
+readme = "README.md"
+keywords = ["quantum", "exact-diagonalization", "sparse", "physics"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+nalgebra = "0.33"
+num-complex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+approx = "0.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
