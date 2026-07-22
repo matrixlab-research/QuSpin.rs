@@ -149,9 +149,7 @@ where
         let ordering = match options.target {
             SpectrumTarget::SmallestAlgebraic => left_value.total_cmp(&right_value),
             SpectrumTarget::LargestAlgebraic => right_value.total_cmp(&left_value),
-            SpectrumTarget::LargestMagnitude => {
-                right_value.abs().total_cmp(&left_value.abs())
-            }
+            SpectrumTarget::LargestMagnitude => right_value.abs().total_cmp(&left_value.abs()),
             SpectrumTarget::Shift(shift) => (left_value - shift)
                 .abs()
                 .total_cmp(&(right_value - shift).abs()),

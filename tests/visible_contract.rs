@@ -1,10 +1,9 @@
-use std::f64::consts::{LN_2, PI};
+use std::f64::consts::{FRAC_2_PI, LN_2, PI};
 use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
 use quspin::basis::{
-    Basis, BosonBasis1D, SpinBasis1D, SpinfulFermionBasis1D,
-    SpinlessFermionBasis1D, UserBasis,
+    Basis, BosonBasis1D, SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D, UserBasis,
 };
 use quspin::dynamics::{DriveStep, Floquet, SpectrumOptions, spectral_function};
 use quspin::measure::{Subspace, subspace_fidelity};
@@ -110,12 +109,8 @@ fn terms_couplings_and_formats_are_explicit() {
 
 #[test]
 fn linear_operator_is_rectangular_capable() {
-    let operator = Operator::from_dense(
-        2,
-        3,
-        vec![c(1.0), c(0.0), c(2.0), c(0.0), c(-1.0), c(1.0)],
-    )
-    .unwrap();
+    let operator =
+        Operator::from_dense(2, 3, vec![c(1.0), c(0.0), c(2.0), c(0.0), c(-1.0), c(1.0)]).unwrap();
     let mut output = vec![c(0.0); 2];
     operator
         .apply(&[c(1.0), c(2.0), c(3.0)], &mut output)
@@ -179,9 +174,8 @@ fn cross_sector_builder_has_target_by_source_shape() {
 
 #[test]
 fn evolution_and_floquet_match_diagonal_visible_anchors() {
-    let diagonal = Arc::new(
-        Operator::from_dense(2, 2, vec![c(0.0), c(0.0), c(0.0), c(2.0)]).unwrap(),
-    );
+    let diagonal =
+        Arc::new(Operator::from_dense(2, 2, vec![c(0.0), c(0.0), c(0.0), c(2.0)]).unwrap());
     let initial = vec![c(1.0 / 2.0_f64.sqrt()), c(1.0 / 2.0_f64.sqrt())];
     let options = EvolutionOptions {
         times: vec![0.0, PI / 2.0],
@@ -192,7 +186,11 @@ fn evolution_and_floquet_match_diagonal_visible_anchors() {
     };
     let trajectory = evolve(diagonal.as_ref(), &initial, options).unwrap();
     assert_abs_diff_eq!(trajectory.states[0][1].re, initial[1].re, epsilon = 1.0e-12);
-    assert_abs_diff_eq!(trajectory.states[1][1].re, -initial[1].re, epsilon = 1.0e-10);
+    assert_abs_diff_eq!(
+        trajectory.states[1][1].re,
+        -initial[1].re,
+        epsilon = 1.0e-10
+    );
     assert_abs_diff_eq!(trajectory.states[1][1].im, 0.0, epsilon = 1.0e-10);
 
     let zero = Arc::new(Operator::from_dense(2, 2, vec![c(0.0); 4]).unwrap());
@@ -223,33 +221,32 @@ fn spectrum_visible_anchor_is_one_lorentzian_pole() {
         },
     )
     .unwrap();
-    assert_abs_diff_eq!(spectrum[0], 0.636_619_772_367_581_4, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(spectrum[0], FRAC_2_PI, epsilon = 1.0e-12);
 }
 
 #[test]
 fn subspace_fidelity_is_rotation_invariant() {
     let scale = 1.0 / 2.0_f64.sqrt();
-    let left = Subspace::from_columns(
-        3,
-        2,
-        vec![c(1.0), c(0.0), c(0.0), c(0.0), c(1.0), c(0.0)],
-    )
-    .unwrap();
+    let left =
+        Subspace::from_columns(3, 2, vec![c(1.0), c(0.0), c(0.0), c(0.0), c(1.0), c(0.0)]).unwrap();
     let right = Subspace::from_columns(
         3,
         2,
         vec![c(scale), c(scale), c(0.0), c(scale), c(-scale), c(0.0)],
     )
     .unwrap();
-    assert_abs_diff_eq!(subspace_fidelity(&left, &right).unwrap(), 1.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(
+        subspace_fidelity(&left, &right).unwrap(),
+        1.0,
+        epsilon = 1.0e-12
+    );
 }
 
 #[test]
 fn lindblad_amplitude_damping_preserves_trace() {
     let zero = Arc::new(Operator::from_dense(2, 2, vec![c(0.0); 4]).unwrap());
-    let lowering = Arc::new(
-        Operator::from_dense(2, 2, vec![c(0.0), c(1.0), c(0.0), c(0.0)]).unwrap(),
-    );
+    let lowering =
+        Arc::new(Operator::from_dense(2, 2, vec![c(0.0), c(1.0), c(0.0), c(0.0)]).unwrap());
     let generator = LindbladGenerator::new(zero, vec![lowering]).unwrap();
     let initial_density_column_major = vec![c(0.0), c(0.0), c(0.0), c(1.0)];
     let trajectory = evolve(

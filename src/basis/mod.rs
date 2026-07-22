@@ -63,7 +63,10 @@ fn checked_site(site: usize, sites: usize) -> Result<()> {
 }
 
 fn operator_chars(operator: &str, sites: &[usize]) -> Result<Vec<char>> {
-    let chars: Vec<_> = operator.chars().filter(|character| *character != '|').collect();
+    let chars: Vec<_> = operator
+        .chars()
+        .filter(|character| *character != '|')
+        .collect();
     if chars.len() != sites.len() {
         return Err(QuSpinError::InvalidCoupling(format!(
             "operator arity {} does not match {} sites",
@@ -438,11 +441,7 @@ impl SpinlessFermionBasisBuilder {
     }
 }
 
-fn apply_fermion(
-    mut state: u128,
-    orbital: usize,
-    op: char,
-) -> Result<Option<(u128, Complex64)>> {
+fn apply_fermion(mut state: u128, orbital: usize, op: char) -> Result<Option<(u128, Complex64)>> {
     let mask = 1_u128 << orbital;
     let occupied = state & mask != 0;
     let prior_mask = mask - 1;
@@ -454,7 +453,12 @@ fn apply_fermion(
     let amplitude = match op {
         'I' => 1.0,
         'n' => return Ok(occupied.then_some((state, Complex64::new(1.0, 0.0)))),
-        'z' => return Ok(Some((state, Complex64::new(if occupied { 1.0 } else { -1.0 }, 0.0)))),
+        'z' => {
+            return Ok(Some((
+                state,
+                Complex64::new(if occupied { 1.0 } else { -1.0 }, 0.0),
+            )));
+        }
         '+' if !occupied => {
             state |= mask;
             sign
@@ -611,9 +615,9 @@ impl Basis for SpinfulFermionBasis1D {
         sites: &[usize],
     ) -> Result<Option<(Self::State, Complex64)>> {
         let chars = operator_chars(operator, sites)?;
-        let split = operator.find('|').map_or(chars.len(), |position| {
-            operator[..position].chars().count()
-        });
+        let split = operator
+            .find('|')
+            .map_or(chars.len(), |position| operator[..position].chars().count());
         let mut amplitude = Complex64::new(1.0, 0.0);
         for (position, (&site, op)) in sites.iter().zip(chars).enumerate().rev() {
             checked_site(site, self.sites)?;

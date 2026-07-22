@@ -23,7 +23,7 @@ impl Subspace {
                 "subspace storage must contain ambient_dimension * rank entries".into(),
             ));
         }
-        let mut columns = Vec::with_capacity(rank);
+        let mut columns: Vec<Vec<Complex64>> = Vec::with_capacity(rank);
         for column in 0..rank {
             let mut vector = column_major_vectors
                 [column * ambient_dimension..(column + 1) * ambient_dimension]

@@ -36,17 +36,13 @@ impl LindbladGenerator {
     }
 }
 
-fn multiply(
-    left: &[Complex64],
-    right: &[Complex64],
-    dimension: usize,
-) -> Vec<Complex64> {
+fn multiply(left: &[Complex64], right: &[Complex64], dimension: usize) -> Vec<Complex64> {
     let mut product = vec![Complex64::new(0.0, 0.0); dimension * dimension];
     for row in 0..dimension {
         for middle in 0..dimension {
             for column in 0..dimension {
-                product[row * dimension + column] += left[row * dimension + middle]
-                    * right[middle * dimension + column];
+                product[row * dimension + column] +=
+                    left[row * dimension + middle] * right[middle * dimension + column];
             }
         }
     }
@@ -109,12 +105,15 @@ impl LinearOperator for LindbladGenerator {
             let jump = materialize_dense(jump.as_ref())?;
             let jump_adjoint = adjoint(&jump, dimension);
             let jump_product = multiply(&jump_adjoint, &jump, dimension);
-            let gain = multiply(&multiply(&jump, &density, dimension), &jump_adjoint, dimension);
+            let gain = multiply(
+                &multiply(&jump, &density, dimension),
+                &jump_adjoint,
+                dimension,
+            );
             let loss_left = multiply(&jump_product, &density, dimension);
             let loss_right = multiply(&density, &jump_product, dimension);
             for index in 0..derivative.len() {
-                derivative[index] +=
-                    gain[index] - 0.5 * (loss_left[index] + loss_right[index]);
+                derivative[index] += gain[index] - 0.5 * (loss_left[index] + loss_right[index]);
             }
         }
         output.copy_from_slice(&row_major_to_column_major(&derivative, dimension));

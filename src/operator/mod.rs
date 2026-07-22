@@ -34,7 +34,10 @@ impl OperatorTerm {
         couplings: impl IntoIterator<Item = Coupling>,
     ) -> Result<Self> {
         let operator = operator.as_ref();
-        let arity = operator.chars().filter(|character| *character != '|').count();
+        let arity = operator
+            .chars()
+            .filter(|character| *character != '|')
+            .count();
         if arity == 0 {
             return Err(QuSpinError::InvalidOperator(operator.into()));
         }
@@ -234,7 +237,9 @@ pub(crate) fn check_apply_shape(
     Ok(())
 }
 
-pub(crate) fn materialize_dense(operator: &(impl LinearOperator + ?Sized)) -> Result<Vec<Complex64>> {
+pub(crate) fn materialize_dense(
+    operator: &(impl LinearOperator + ?Sized),
+) -> Result<Vec<Complex64>> {
     let (rows, columns) = operator.shape();
     let mut dense = vec![Complex64::new(0.0, 0.0); rows * columns];
     let mut input = vec![Complex64::new(0.0, 0.0); columns];
@@ -312,11 +317,10 @@ where
             let source_state = self.source.state(column)?;
             for term in &self.terms {
                 for coupling in term.couplings() {
-                    let Some((target_state, local_amplitude)) = self.source.apply_local(
-                        source_state,
-                        term.operator(),
-                        &coupling.sites,
-                    )? else {
+                    let Some((target_state, local_amplitude)) =
+                        self.source
+                            .apply_local(source_state, term.operator(), &coupling.sites)?
+                    else {
                         continue;
                     };
                     let row = match self.target.index(target_state) {
