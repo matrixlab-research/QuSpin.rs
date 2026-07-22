@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use nalgebra::{DMatrix, SymmetricEigen};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use num_complex::Complex64;
 
 use crate::operator::{LinearOperator, materialize_dense};
@@ -125,11 +125,334 @@ fn residual_norm(
         .sqrt())
 }
 
+fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
+    left.iter()
+        .zip(right)
+        .map(|(left_value, right_value)| left_value.conj() * *right_value)
+        .sum()
+}
+
+fn vector_norm(vector: &[Complex64]) -> f64 {
+    vector.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt()
+}
+
+fn normalize(vector: &mut [Complex64]) -> Result<()> {
+    let norm = vector_norm(vector);
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(QuSpinError::NonConvergence {
+            iterations: 0,
+            residual: norm,
+        });
+    }
+    for value in vector {
+        *value /= norm;
+    }
+    Ok(())
+}
+
+fn deterministic_start(dimension: usize, seed: u64) -> Result<Vec<Complex64>> {
+    let mut state = seed | 1;
+    let mut vector = Vec::with_capacity(dimension);
+    for _ in 0..dimension {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let mantissa = state >> 11;
+        let value = mantissa as f64 / ((1_u64 << 53) as f64) - 0.5;
+        vector.push(Complex64::new(value, 0.0));
+    }
+    normalize(&mut vector)?;
+    Ok(vector)
+}
+
+fn shifted_apply<O>(
+    operator: &O,
+    shift: f64,
+    input: &[Complex64],
+    output: &mut [Complex64],
+) -> Result<()>
+where
+    O: LinearOperator + ?Sized,
+{
+    operator.apply(input, output)?;
+    for (value, input_value) in output.iter_mut().zip(input) {
+        *value -= shift * *input_value;
+    }
+    Ok(())
+}
+
+fn gmres_shift_invert<O>(
+    operator: &O,
+    shift: f64,
+    right_hand_side: &[Complex64],
+    tolerance: f64,
+    max_iterations: usize,
+) -> Result<Vec<Complex64>>
+where
+    O: LinearOperator + ?Sized,
+{
+    let dimension = right_hand_side.len();
+    let right_norm = vector_norm(right_hand_side);
+    if right_norm <= f64::EPSILON {
+        return Ok(vec![Complex64::new(0.0, 0.0); dimension]);
+    }
+    let restart = dimension.clamp(1, 256);
+    let mut solution = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut residual = right_hand_side.to_vec();
+    let mut applied = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut iterations = 0;
+
+    while iterations < max_iterations {
+        let beta = vector_norm(&residual);
+        if beta <= tolerance * right_norm {
+            return Ok(solution);
+        }
+        let mut first = residual.clone();
+        for value in &mut first {
+            *value /= beta;
+        }
+        let mut basis = vec![first];
+        let cycle = restart.min(max_iterations - iterations);
+        let mut hessenberg = vec![vec![Complex64::new(0.0, 0.0); cycle]; cycle + 1];
+        let mut columns = 0;
+
+        for column in 0..cycle {
+            shifted_apply(operator, shift, &basis[column], &mut applied)?;
+            for _ in 0..2 {
+                for (row, vector) in basis.iter().enumerate() {
+                    let overlap = inner(vector, &applied);
+                    hessenberg[row][column] += overlap;
+                    for (value, basis_value) in applied.iter_mut().zip(vector) {
+                        *value -= overlap * *basis_value;
+                    }
+                }
+            }
+            let next_norm = vector_norm(&applied);
+            hessenberg[column + 1][column] = Complex64::new(next_norm, 0.0);
+            columns = column + 1;
+            if next_norm <= 1.0e-14 {
+                break;
+            }
+            let mut next = applied.clone();
+            for value in &mut next {
+                *value /= next_norm;
+            }
+            basis.push(next);
+        }
+
+        let mut normal = DMatrix::<Complex64>::zeros(columns, columns);
+        let mut projected_rhs = DVector::<Complex64>::zeros(columns);
+        for row in 0..columns {
+            projected_rhs[row] = hessenberg[0][row].conj() * beta;
+            for column in 0..columns {
+                normal[(row, column)] = (0..=columns)
+                    .map(|index| hessenberg[index][row].conj() * hessenberg[index][column])
+                    .sum();
+            }
+        }
+        let coefficients =
+            normal
+                .lu()
+                .solve(&projected_rhs)
+                .ok_or(QuSpinError::NonConvergence {
+                    iterations,
+                    residual: beta,
+                })?;
+        for (coefficient, vector) in coefficients.iter().zip(&basis) {
+            for (value, basis_value) in solution.iter_mut().zip(vector) {
+                *value += *coefficient * *basis_value;
+            }
+        }
+        shifted_apply(operator, shift, &solution, &mut applied)?;
+        for ((value, right_value), applied_value) in
+            residual.iter_mut().zip(right_hand_side).zip(&applied)
+        {
+            *value = *right_value - *applied_value;
+        }
+        iterations += columns;
+    }
+    Err(QuSpinError::NonConvergence {
+        iterations,
+        residual: vector_norm(&residual),
+    })
+}
+
+fn transformed_apply<O>(
+    operator: &O,
+    options: &EigshOptions,
+    input: &[Complex64],
+    output: &mut [Complex64],
+) -> Result<()>
+where
+    O: LinearOperator + ?Sized,
+{
+    match options.target {
+        SpectrumTarget::Shift(shift) => {
+            let solved = gmres_shift_invert(
+                operator,
+                shift,
+                input,
+                (options.tolerance * 0.1).min(1.0e-10),
+                options.max_iterations.max(128),
+            )?;
+            output.copy_from_slice(&solved);
+            Ok(())
+        }
+        _ => operator.apply(input, output),
+    }
+}
+
+fn select_indices(values: &[f64], target: SpectrumTarget, count: usize) -> Vec<usize> {
+    let mut indices: Vec<_> = (0..values.len()).collect();
+    indices.sort_by(|&left, &right| {
+        let left_value = values[left];
+        let right_value = values[right];
+        let ordering = match target {
+            SpectrumTarget::SmallestAlgebraic => left_value.total_cmp(&right_value),
+            SpectrumTarget::LargestAlgebraic | SpectrumTarget::Shift(_) => {
+                right_value.total_cmp(&left_value)
+            }
+            SpectrumTarget::LargestMagnitude => right_value.abs().total_cmp(&left_value.abs()),
+        };
+        ordering.then_with(|| left.cmp(&right))
+    });
+    indices.truncate(count);
+    indices
+}
+
+fn lanczos_eigsh<O>(operator: &O, options: &EigshOptions) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let dimension = operator.shape().0;
+    let requested_dimension = options
+        .krylov_dimension
+        .unwrap_or_else(|| (4 * options.eigenpairs + 24).max(48));
+    let krylov_dimension = requested_dimension
+        .min(options.max_iterations)
+        .min(dimension);
+    if krylov_dimension <= options.eigenpairs {
+        return Err(QuSpinError::InvalidOptions(
+            "the effective Krylov dimension must exceed eigenpairs".into(),
+        ));
+    }
+
+    let mut basis = Vec::with_capacity(krylov_dimension);
+    basis.push(deterministic_start(dimension, options.seed)?);
+    let mut alphas = Vec::with_capacity(krylov_dimension);
+    let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
+    let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+
+    for iteration in 0..krylov_dimension {
+        transformed_apply(operator, options, &basis[iteration], &mut output)?;
+        let alpha = inner(&basis[iteration], &output).re;
+        alphas.push(alpha);
+        for (value, basis_value) in output.iter_mut().zip(&basis[iteration]) {
+            *value -= alpha * *basis_value;
+        }
+        if iteration > 0 {
+            let beta = betas[iteration - 1];
+            for (value, previous) in output.iter_mut().zip(&basis[iteration - 1]) {
+                *value -= beta * *previous;
+            }
+        }
+
+        // Full double reorthogonalization is more expensive than a three-term
+        // recurrence but keeps multiple and interior Ritz vectors reliable.
+        for _ in 0..2 {
+            for vector in &basis {
+                let overlap = inner(vector, &output);
+                for (value, basis_value) in output.iter_mut().zip(vector) {
+                    *value -= overlap * *basis_value;
+                }
+            }
+        }
+        let beta = vector_norm(&output);
+        if iteration + 1 == krylov_dimension || beta <= 1.0e-14 {
+            break;
+        }
+        betas.push(beta);
+        for value in &mut output {
+            *value /= beta;
+        }
+        basis.push(output.clone());
+    }
+
+    if basis.len() <= options.eigenpairs {
+        return Err(QuSpinError::NonConvergence {
+            iterations: basis.len(),
+            residual: f64::INFINITY,
+        });
+    }
+    let size = basis.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
+    for index in 0..size {
+        tridiagonal[(index, index)] = alphas[index];
+        if index + 1 < size {
+            tridiagonal[(index, index + 1)] = betas[index];
+            tridiagonal[(index + 1, index)] = betas[index];
+        }
+    }
+    let decomposition = SymmetricEigen::new(tridiagonal);
+    let transformed_values = decomposition.eigenvalues.as_slice();
+    let transformed_target = if matches!(options.target, SpectrumTarget::Shift(_)) {
+        SpectrumTarget::LargestMagnitude
+    } else {
+        options.target
+    };
+    let indices = select_indices(transformed_values, transformed_target, options.eigenpairs);
+
+    let mut candidates = Vec::with_capacity(options.eigenpairs);
+    for index in indices {
+        let mut vector = vec![Complex64::new(0.0, 0.0); dimension];
+        for (basis_index, basis_vector) in basis.iter().enumerate() {
+            let coefficient = decomposition.eigenvectors[(basis_index, index)];
+            for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+                *value += coefficient * *basis_value;
+            }
+        }
+        normalize(&mut vector)?;
+        operator.apply(&vector, &mut output)?;
+        let eigenvalue = inner(&vector, &output).re;
+        let residual = output
+            .iter()
+            .zip(&vector)
+            .map(|(actual, component)| (*actual - eigenvalue * *component).norm_sqr())
+            .sum::<f64>()
+            .sqrt();
+        candidates.push((eigenvalue, vector, residual));
+    }
+    candidates.sort_by(|left, right| match options.target {
+        SpectrumTarget::SmallestAlgebraic => left.0.total_cmp(&right.0),
+        SpectrumTarget::LargestAlgebraic => right.0.total_cmp(&left.0),
+        SpectrumTarget::LargestMagnitude => right.0.abs().total_cmp(&left.0.abs()),
+        SpectrumTarget::Shift(shift) => (left.0 - shift).abs().total_cmp(&(right.0 - shift).abs()),
+    });
+    let residuals: Vec<_> = candidates.iter().map(|candidate| candidate.2).collect();
+    let failure_residual = residuals.iter().copied().fold(0.0_f64, f64::max);
+    let accepted_residual = options.tolerance.max(1.0e-7);
+    if failure_residual > accepted_residual {
+        return Err(QuSpinError::NonConvergence {
+            iterations: size,
+            residual: failure_residual,
+        });
+    }
+    Ok(Eigensystem {
+        eigenvalues: candidates.iter().map(|candidate| candidate.0).collect(),
+        eigenvectors: candidates
+            .into_iter()
+            .map(|candidate| candidate.1)
+            .collect(),
+        residuals,
+        iterations: size,
+    })
+}
+
 /// Selected Hermitian eigenpairs.
 ///
-/// The first backend uses a dense real-symmetric decomposition for semantic
-/// closure. The public interface is already operator-based so a Lanczos and
-/// shift-invert backend can replace it without changing callers.
+/// Small problems use a dense real-symmetric decomposition. Larger problems
+/// use a matrix-free, fully reorthogonalized Lanczos backend; shift targets
+/// apply a restarted GMRES inverse without materializing the operator.
 pub fn eigsh<O>(operator: &O, options: EigshOptions) -> Result<Eigensystem>
 where
     O: LinearOperator + ?Sized,
@@ -141,6 +464,9 @@ where
         ));
     }
     options.validate(shape.0)?;
+    if shape.0 > 128 {
+        return lanczos_eigsh(operator, &options);
+    }
     let (values, vectors) = real_symmetric_eigenpairs_all(operator)?;
     let mut indices: Vec<_> = (0..values.len()).collect();
     indices.sort_by(|&left, &right| {
@@ -215,10 +541,6 @@ impl EvolutionOptions {
 pub struct StateTrajectory {
     pub times: Vec<f64>,
     pub states: Vec<Vec<Complex64>>,
-}
-
-fn vector_norm(vector: &[Complex64]) -> f64 {
-    vector.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt()
 }
 
 pub(crate) fn expm_action(

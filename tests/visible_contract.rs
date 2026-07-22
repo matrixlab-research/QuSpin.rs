@@ -18,6 +18,32 @@ fn c(value: f64) -> Complex64 {
     Complex64::new(value, 0.0)
 }
 
+struct DiagonalOperator {
+    diagonal: Vec<f64>,
+}
+
+impl LinearOperator for DiagonalOperator {
+    fn shape(&self) -> (usize, usize) {
+        (self.diagonal.len(), self.diagonal.len())
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if input.len() != self.diagonal.len() || output.len() != self.diagonal.len() {
+            return Err(QuSpinError::DimensionMismatch(
+                "diagonal test operator shape mismatch".into(),
+            ));
+        }
+        for ((result, input_value), diagonal) in output.iter_mut().zip(input).zip(&self.diagonal) {
+            *result = *diagonal * *input_value;
+        }
+        Ok(())
+    }
+}
+
 fn periodic_blockade(state: u128, sites: usize) -> bool {
     (0..sites).all(|site| {
         let next = (site + 1) % sites;
@@ -153,6 +179,52 @@ fn universal_builder_and_eigsh_match_the_dimer_anchor() {
     assert_abs_diff_eq!(result.eigenvalues[0], -0.75, epsilon = 1.0e-12);
     assert_abs_diff_eq!(result.eigenvalues[1], 0.25, epsilon = 1.0e-12);
     assert!(result.residuals.iter().all(|residual| *residual < 1.0e-12));
+}
+
+#[test]
+fn lanczos_backend_avoids_dense_materialization_for_large_operators() {
+    let operator = DiagonalOperator {
+        diagonal: (0..256).map(|value| value as f64).collect(),
+    };
+    let result = eigsh(
+        &operator,
+        EigshOptions {
+            eigenpairs: 3,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: Some(160),
+            tolerance: 1.0e-8,
+            max_iterations: 192,
+            seed: 17,
+        },
+    )
+    .unwrap();
+    assert_abs_diff_eq!(result.eigenvalues[0], 0.0, epsilon = 1.0e-7);
+    assert_abs_diff_eq!(result.eigenvalues[1], 1.0, epsilon = 1.0e-7);
+    assert_abs_diff_eq!(result.eigenvalues[2], 2.0, epsilon = 1.0e-7);
+    assert!(result.residuals.iter().all(|residual| *residual < 1.0e-7));
+    assert_eq!(result.iterations, 160);
+}
+
+#[test]
+fn shift_invert_finds_interior_eigenpairs_matrix_free() {
+    let operator = DiagonalOperator {
+        diagonal: (-128..128).map(f64::from).collect(),
+    };
+    let result = eigsh(
+        &operator,
+        EigshOptions {
+            eigenpairs: 2,
+            target: SpectrumTarget::Shift(0.3),
+            krylov_dimension: Some(24),
+            tolerance: 1.0e-8,
+            max_iterations: 512,
+            seed: 23,
+        },
+    )
+    .unwrap();
+    assert_abs_diff_eq!(result.eigenvalues[0], 0.0, epsilon = 1.0e-7);
+    assert_abs_diff_eq!(result.eigenvalues[1], 1.0, epsilon = 1.0e-7);
+    assert!(result.residuals.iter().all(|residual| *residual < 1.0e-7));
 }
 
 #[test]
