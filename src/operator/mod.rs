@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use faer::linalg::solvers::Solve;
+use faer::sparse::{SparseColMat, Triplet as FaerTriplet};
 use num_complex::Complex64;
 
 use crate::basis::Basis;
@@ -85,6 +87,15 @@ pub trait LinearOperator: Send + Sync {
     fn shape(&self) -> (usize, usize);
     fn format(&self) -> MatrixFormat;
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
+
+    fn shifted_solver(&self, _shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
+        Ok(None)
+    }
+}
+
+/// Reusable factorization of `(A - shift * I)` for interior eigensolvers.
+pub trait ShiftedLinearSolver: Send + Sync {
+    fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +164,27 @@ pub struct Operator {
     storage: Storage,
 }
 
+struct FaerShiftedSolver {
+    factorization: faer::sparse::linalg::solvers::Lu<usize, Complex64>,
+    dimension: usize,
+}
+
+impl ShiftedLinearSolver for FaerShiftedSolver {
+    fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if input.len() != self.dimension || output.len() != self.dimension {
+            return Err(QuSpinError::DimensionMismatch(
+                "shifted solve input or output length does not match".into(),
+            ));
+        }
+        let mut right_hand_side = faer::Col::from_fn(self.dimension, |index| input[index]);
+        self.factorization.solve_in_place(right_hand_side.as_mut());
+        for (index, value) in output.iter_mut().enumerate() {
+            *value = right_hand_side[index];
+        }
+        Ok(())
+    }
+}
+
 impl Operator {
     pub fn from_dense(
         rows: usize,
@@ -169,6 +201,68 @@ impl Operator {
             shape: (rows, columns),
             format: MatrixFormat::Dense,
             storage: Storage::Dense(values_row_major),
+        })
+    }
+
+    pub fn from_triplets(
+        rows: usize,
+        columns: usize,
+        triplets: impl IntoIterator<Item = (usize, usize, Complex64)>,
+        format: MatrixFormat,
+    ) -> Result<Self> {
+        if format == MatrixFormat::Dense {
+            let mut values = vec![Complex64::new(0.0, 0.0); rows.saturating_mul(columns)];
+            for (row, column, value) in triplets {
+                if row >= rows
+                    || column >= columns
+                    || !value.re.is_finite()
+                    || !value.im.is_finite()
+                {
+                    return Err(QuSpinError::InvalidCoupling(
+                        "triplet index is out of bounds or its value is non-finite".into(),
+                    ));
+                }
+                values[row * columns + column] += value;
+            }
+            return Self::from_dense(rows, columns, values);
+        }
+        let mut accumulated = HashMap::new();
+        for (row, column, value) in triplets {
+            if row >= rows || column >= columns || !value.re.is_finite() || !value.im.is_finite() {
+                return Err(QuSpinError::InvalidCoupling(
+                    "triplet index is out of bounds or its value is non-finite".into(),
+                ));
+            }
+            *accumulated
+                .entry((row, column))
+                .or_insert(Complex64::new(0.0, 0.0)) += value;
+        }
+        let mut entries: Vec<_> = accumulated
+            .into_iter()
+            .filter_map(|((row, column), value)| {
+                (value.norm() > f64::EPSILON).then_some(Triplet { row, column, value })
+            })
+            .collect();
+        match format {
+            MatrixFormat::Csc => entries.sort_by_key(|entry| (entry.column, entry.row)),
+            MatrixFormat::Csr => entries.sort_by_key(|entry| (entry.row, entry.column)),
+            MatrixFormat::Dia | MatrixFormat::MatrixFree => {
+                entries.sort_by_key(|entry| (entry.row, entry.column));
+            }
+            MatrixFormat::Dense => unreachable!(),
+        }
+        let shape = (rows, columns);
+        let storage = match format {
+            MatrixFormat::Csc => csc_storage(&entries, columns),
+            MatrixFormat::Csr => csr_storage(&entries, rows),
+            MatrixFormat::Dia => dia_storage(&entries, rows),
+            MatrixFormat::MatrixFree => Storage::MatrixFree(entries),
+            MatrixFormat::Dense => unreachable!(),
+        };
+        Ok(Self {
+            shape,
+            format,
+            storage,
         })
     }
 
@@ -449,6 +543,59 @@ impl LinearOperator for Operator {
             }
         }
         Ok(())
+    }
+
+    fn shifted_solver(&self, shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
+        if self.shape.0 != self.shape.1 || !shift.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "shifted factorization requires a square operator and finite shift".into(),
+            ));
+        }
+        let Storage::Csc {
+            column_offsets,
+            row_indices,
+            values,
+        } = &self.storage
+        else {
+            return Ok(None);
+        };
+        let dimension = self.shape.0;
+        let mut triplets = Vec::with_capacity(values.len() + dimension);
+        for column in 0..dimension {
+            let mut has_diagonal = false;
+            for position in column_offsets[column]..column_offsets[column + 1] {
+                let row = row_indices[position];
+                let mut value = values[position];
+                if row == column {
+                    value -= shift;
+                    has_diagonal = true;
+                }
+                triplets.push(FaerTriplet::new(row, column, value));
+            }
+            if !has_diagonal {
+                triplets.push(FaerTriplet::new(
+                    column,
+                    column,
+                    Complex64::new(-shift, 0.0),
+                ));
+            }
+        }
+        let matrix = SparseColMat::<usize, Complex64>::try_new_from_triplets(
+            dimension, dimension, &triplets,
+        )
+        .map_err(|error| {
+            QuSpinError::UnsupportedBackend(format!(
+                "could not construct sparse shifted matrix: {error}"
+            ))
+        })?;
+        let factorization = matrix.sp_lu().map_err(|_| QuSpinError::NonConvergence {
+            iterations: 0,
+            residual: f64::INFINITY,
+        })?;
+        Ok(Some(Box::new(FaerShiftedSolver {
+            factorization,
+            dimension,
+        })))
     }
 }
 

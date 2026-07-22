@@ -11,6 +11,7 @@ keywords = ["quantum", "exact-diagonalization", "sparse", "physics"]
 categories = ["science", "mathematics"]
 
 [dependencies]
+faer = { version = "0.24.4", default-features = false, features = ["std", "linalg"] }
 nalgebra = "0.33"
 num-complex = "0.4"
 thiserror = "2"
