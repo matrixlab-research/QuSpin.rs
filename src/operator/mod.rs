@@ -128,7 +128,21 @@ struct Triplet {
 #[derive(Clone, Debug)]
 enum Storage {
     Dense(Vec<Complex64>),
-    Sparse(Vec<Triplet>),
+    Csc {
+        column_offsets: Vec<usize>,
+        row_indices: Vec<usize>,
+        values: Vec<Complex64>,
+    },
+    Csr {
+        row_offsets: Vec<usize>,
+        column_indices: Vec<usize>,
+        values: Vec<Complex64>,
+    },
+    Dia {
+        offsets: Vec<isize>,
+        values_by_row: Vec<Complex64>,
+    },
+    MatrixFree(Vec<Triplet>),
 }
 
 /// Concrete operator returned by universal assembly.
@@ -159,15 +173,71 @@ impl Operator {
     }
 
     pub fn to_dense(&self) -> Vec<Complex64> {
+        if let Storage::Dense(values) = &self.storage {
+            return values.clone();
+        }
+        let mut dense = vec![Complex64::new(0.0, 0.0); self.shape.0 * self.shape.1];
         match &self.storage {
-            Storage::Dense(values) => values.clone(),
-            Storage::Sparse(entries) => {
-                let mut values = vec![Complex64::new(0.0, 0.0); self.shape.0 * self.shape.1];
-                for entry in entries {
-                    values[entry.row * self.shape.1 + entry.column] += entry.value;
+            Storage::Dense(_) => unreachable!(),
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => {
+                for column in 0..self.shape.1 {
+                    for position in column_offsets[column]..column_offsets[column + 1] {
+                        dense[row_indices[position] * self.shape.1 + column] = values[position];
+                    }
                 }
-                values
             }
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => {
+                for row in 0..self.shape.0 {
+                    for position in row_offsets[row]..row_offsets[row + 1] {
+                        dense[row * self.shape.1 + column_indices[position]] = values[position];
+                    }
+                }
+            }
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => {
+                for (diagonal, &offset) in offsets.iter().enumerate() {
+                    for row in 0..self.shape.0 {
+                        let Some(column) = row.checked_add_signed(-offset) else {
+                            continue;
+                        };
+                        if column < self.shape.1 {
+                            dense[row * self.shape.1 + column] =
+                                values_by_row[diagonal * self.shape.0 + row];
+                        }
+                    }
+                }
+            }
+            Storage::MatrixFree(entries) => {
+                for entry in entries {
+                    dense[entry.row * self.shape.1 + entry.column] = entry.value;
+                }
+            }
+        }
+        dense
+    }
+
+    pub fn nnz(&self) -> usize {
+        match &self.storage {
+            Storage::Dense(values) => values
+                .iter()
+                .filter(|value| value.norm() > f64::EPSILON)
+                .count(),
+            Storage::Csc { values, .. } | Storage::Csr { values, .. } => values.len(),
+            Storage::Dia { values_by_row, .. } => values_by_row
+                .iter()
+                .filter(|value| value.norm() > f64::EPSILON)
+                .count(),
+            Storage::MatrixFree(entries) => entries.len(),
         }
     }
 
@@ -210,13 +280,107 @@ impl LinearOperator for Operator {
                     }
                 }
             }
-            Storage::Sparse(entries) => {
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => {
+                for column in 0..self.shape.1 {
+                    let input_value = input[column];
+                    for position in column_offsets[column]..column_offsets[column + 1] {
+                        output[row_indices[position]] += values[position] * input_value;
+                    }
+                }
+            }
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => {
+                for row in 0..self.shape.0 {
+                    for position in row_offsets[row]..row_offsets[row + 1] {
+                        output[row] += values[position] * input[column_indices[position]];
+                    }
+                }
+            }
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => {
+                for (diagonal, &offset) in offsets.iter().enumerate() {
+                    for row in 0..self.shape.0 {
+                        let Some(column) = row.checked_add_signed(-offset) else {
+                            continue;
+                        };
+                        if column < self.shape.1 {
+                            output[row] +=
+                                values_by_row[diagonal * self.shape.0 + row] * input[column];
+                        }
+                    }
+                }
+            }
+            Storage::MatrixFree(entries) => {
                 for entry in entries {
                     output[entry.row] += entry.value * input[entry.column];
                 }
             }
         }
         Ok(())
+    }
+}
+
+fn csc_storage(entries: &[Triplet], columns: usize) -> Storage {
+    let mut column_offsets = vec![0_usize; columns + 1];
+    for entry in entries {
+        column_offsets[entry.column + 1] += 1;
+    }
+    for column in 0..columns {
+        column_offsets[column + 1] += column_offsets[column];
+    }
+    Storage::Csc {
+        column_offsets,
+        row_indices: entries.iter().map(|entry| entry.row).collect(),
+        values: entries.iter().map(|entry| entry.value).collect(),
+    }
+}
+
+fn csr_storage(entries: &[Triplet], rows: usize) -> Storage {
+    let mut row_offsets = vec![0_usize; rows + 1];
+    for entry in entries {
+        row_offsets[entry.row + 1] += 1;
+    }
+    for row in 0..rows {
+        row_offsets[row + 1] += row_offsets[row];
+    }
+    Storage::Csr {
+        row_offsets,
+        column_indices: entries.iter().map(|entry| entry.column).collect(),
+        values: entries.iter().map(|entry| entry.value).collect(),
+    }
+}
+
+fn dia_storage(entries: &[Triplet], rows: usize) -> Storage {
+    let mut offsets: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.row as isize - entry.column as isize)
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    let diagonal_index: HashMap<_, _> = offsets
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, offset)| (offset, index))
+        .collect();
+    let mut values_by_row = vec![Complex64::new(0.0, 0.0); offsets.len() * rows];
+    for entry in entries {
+        let offset = entry.row as isize - entry.column as isize;
+        let diagonal = diagonal_index[&offset];
+        values_by_row[diagonal * rows + entry.row] = entry.value;
+    }
+    Storage::Dia {
+        offsets,
+        values_by_row,
     }
 }
 
@@ -358,14 +522,18 @@ where
                 "the requested operator is not usefully diagonal-banded".into(),
             ));
         }
-        let storage = if format == MatrixFormat::Dense {
-            let mut dense = vec![Complex64::new(0.0, 0.0); shape.0 * shape.1];
-            for entry in &entries {
-                dense[entry.row * shape.1 + entry.column] = entry.value;
+        let storage = match format {
+            MatrixFormat::Dense => {
+                let mut dense = vec![Complex64::new(0.0, 0.0); shape.0 * shape.1];
+                for entry in &entries {
+                    dense[entry.row * shape.1 + entry.column] = entry.value;
+                }
+                Storage::Dense(dense)
             }
-            Storage::Dense(dense)
-        } else {
-            Storage::Sparse(entries)
+            MatrixFormat::Csc => csc_storage(&entries, shape.1),
+            MatrixFormat::Csr => csr_storage(&entries, shape.0),
+            MatrixFormat::Dia => dia_storage(&entries, shape.0),
+            MatrixFormat::MatrixFree => Storage::MatrixFree(entries),
         };
         let operator = Operator {
             shape,
