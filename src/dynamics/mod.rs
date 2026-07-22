@@ -4,7 +4,9 @@ use std::sync::Arc;
 use num_complex::Complex64;
 
 use crate::operator::{LinearOperator, MatrixFormat};
-use crate::solve::{EvolutionOptions, expm_action, real_symmetric_eigenpairs_all};
+use crate::solve::{
+    EvolutionOptions, expm_action, lanczos_spectral_measure, real_symmetric_eigenpairs_all,
+};
 use crate::{QuSpinError, Result};
 
 pub struct DriveStep {
@@ -159,18 +161,23 @@ where
     }
     let mut created = vec![Complex64::new(0.0, 0.0); probe_shape.0];
     probe.apply(source, &mut created)?;
-    let (energies, eigenvectors) = real_symmetric_eigenpairs_all(target_hamiltonian)?;
-    let weights: Vec<_> = eigenvectors
-        .iter()
-        .map(|vector| {
-            vector
-                .iter()
-                .zip(&created)
-                .map(|(left, right)| left.conj() * *right)
-                .sum::<Complex64>()
-                .norm_sqr()
-        })
-        .collect();
+    let (energies, weights) = if target_shape.0 <= 128 {
+        let (energies, eigenvectors) = real_symmetric_eigenpairs_all(target_hamiltonian)?;
+        let weights = eigenvectors
+            .iter()
+            .map(|vector| {
+                vector
+                    .iter()
+                    .zip(&created)
+                    .map(|(left, right)| left.conj() * *right)
+                    .sum::<Complex64>()
+                    .norm_sqr()
+            })
+            .collect();
+        (energies, weights)
+    } else {
+        lanczos_spectral_measure(target_hamiltonian, &created, options.krylov_dimension)?
+    };
     Ok(options
         .frequencies
         .iter()
