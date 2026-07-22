@@ -182,6 +182,38 @@ fn universal_builder_and_eigsh_match_the_dimer_anchor() {
 }
 
 #[test]
+fn all_materialization_formats_preserve_sparse_action() {
+    let input = [
+        Complex64::new(1.0, -0.5),
+        Complex64::new(-2.0, 0.25),
+        Complex64::new(0.75, 1.0),
+        Complex64::new(0.5, -1.5),
+    ];
+    let dense = heisenberg_dimer(MatrixFormat::Dense);
+    let expected_dense = dense.to_dense();
+    let mut expected = vec![c(0.0); 4];
+    dense.apply(&input, &mut expected).unwrap();
+
+    for format in [
+        MatrixFormat::Csc,
+        MatrixFormat::Csr,
+        MatrixFormat::Dia,
+        MatrixFormat::MatrixFree,
+    ] {
+        let operator = heisenberg_dimer(format);
+        let mut actual = vec![c(0.0); 4];
+        operator.apply(&input, &mut actual).unwrap();
+        assert_eq!(operator.format(), format);
+        assert_eq!(operator.nnz(), 6);
+        assert_eq!(operator.to_dense(), expected_dense);
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_abs_diff_eq!(actual.re, expected.re, epsilon = 1.0e-12);
+            assert_abs_diff_eq!(actual.im, expected.im, epsilon = 1.0e-12);
+        }
+    }
+}
+
+#[test]
 fn lanczos_backend_avoids_dense_materialization_for_large_operators() {
     let operator = DiagonalOperator {
         diagonal: (0..256).map(|value| value as f64).collect(),
