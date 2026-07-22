@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use num_complex::Complex64;
 
-use crate::operator::{LinearOperator, materialize_dense};
+use crate::operator::{LinearOperator, ShiftedLinearSolver, materialize_dense};
 use crate::{QuSpinError, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -280,6 +280,7 @@ where
 fn transformed_apply<O>(
     operator: &O,
     options: &EigshOptions,
+    shifted_solver: Option<&dyn ShiftedLinearSolver>,
     input: &[Complex64],
     output: &mut [Complex64],
 ) -> Result<()>
@@ -288,6 +289,9 @@ where
 {
     match options.target {
         SpectrumTarget::Shift(shift) => {
+            if let Some(solver) = shifted_solver {
+                return solver.solve(input, output);
+            }
             let solved = gmres_shift_invert(
                 operator,
                 shift,
@@ -342,9 +346,19 @@ where
     let mut alphas = Vec::with_capacity(krylov_dimension);
     let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
     let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+    let shifted_solver = match options.target {
+        SpectrumTarget::Shift(shift) => operator.shifted_solver(shift)?,
+        _ => None,
+    };
 
     for iteration in 0..krylov_dimension {
-        transformed_apply(operator, options, &basis[iteration], &mut output)?;
+        transformed_apply(
+            operator,
+            options,
+            shifted_solver.as_deref(),
+            &basis[iteration],
+            &mut output,
+        )?;
         let alpha = inner(&basis[iteration], &output).re;
         alphas.push(alpha);
         for (value, basis_value) in output.iter_mut().zip(&basis[iteration]) {

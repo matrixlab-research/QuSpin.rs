@@ -531,6 +531,51 @@ fn paper_scale_tfim_tracks_degenerate_subspaces() {
 }
 
 #[test]
+#[ignore = "paper-scale workflow; exercised in release mode"]
+fn paper_scale_mbl_uses_reusable_sparse_shift_invert() {
+    let sites = 14;
+    let basis = SpinBasis1D::builder(sites).up(7).build().unwrap();
+    assert_eq!(basis.len(), 3_432);
+    let fields = [
+        2.13, -1.77, 0.31, 3.24, -2.63, 0.82, 1.46, -3.17, 2.71, -0.54, 1.09, -2.28, 0.67, 2.94,
+    ];
+    let mut terms = periodic_heisenberg_terms(sites).to_vec();
+    terms.push(
+        OperatorTerm::new(
+            "z",
+            fields
+                .into_iter()
+                .enumerate()
+                .map(|(site, field)| Coupling::new(field, vec![site])),
+        )
+        .unwrap(),
+    );
+    let hamiltonian = OperatorBuilder::on(&basis)
+        .terms(terms)
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let result = eigsh(
+        &hamiltonian,
+        EigshOptions {
+            eigenpairs: 6,
+            target: SpectrumTarget::Shift(0.0),
+            krylov_dimension: Some(32),
+            tolerance: 1.0e-9,
+            max_iterations: 5_000,
+            seed: 47,
+        },
+    )
+    .unwrap();
+    let combined_residual = result
+        .residuals
+        .iter()
+        .map(|residual| residual * residual)
+        .sum::<f64>()
+        .sqrt();
+    assert!(combined_residual < 2.0e-7);
+}
+
+#[test]
 fn user_basis_visible_anchor_uses_universal_contract() -> Result<()> {
     let basis = UserBasis::<u128>::builder(4)
         .state_filter(|state| periodic_blockade(state, 4))?
@@ -685,10 +730,16 @@ fn lanczos_backend_avoids_dense_materialization_for_large_operators() {
 }
 
 #[test]
-fn shift_invert_finds_interior_eigenpairs_matrix_free() {
-    let operator = DiagonalOperator {
-        diagonal: (-128..128).map(f64::from).collect(),
-    };
+fn sparse_shift_invert_finds_interior_eigenpairs() {
+    let operator = Operator::from_triplets(
+        256,
+        256,
+        (-128..128)
+            .enumerate()
+            .map(|(index, value)| (index, index, Complex64::new(f64::from(value), 0.0))),
+        MatrixFormat::Csc,
+    )
+    .unwrap();
     let result = eigsh(
         &operator,
         EigshOptions {
