@@ -2,7 +2,10 @@ use approx::assert_abs_diff_eq;
 use quspin::Complex64;
 use quspin::basis::{
     Basis, BasisProjector, BosonBasis1D, ClosureSymmetryMap, GeneralBasis, PhotonBasis,
-    SpinBasis1D, SymmetrySector, TensorBasis, U256, UserBasis,
+    SpinBasis1D, StateStorage, SymmetrySector, TensorBasis, U256, UserBasis,
+    basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and, bitwise_leftshift, bitwise_not,
+    bitwise_or, bitwise_rightshift, bitwise_xor, coherent_state, get_basis_type, photon_hspace_dim,
+    python_int_to_basis_int,
 };
 use quspin::measure::project_operator;
 use quspin::operator::{Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm};
@@ -145,4 +148,37 @@ fn wide_user_basis_actions_reach_beyond_u128() {
         .unwrap();
     assert_eq!(number.diagonal()[0], Complex64::new(0.0, 0.0));
     assert_eq!(number.diagonal()[1], Complex64::new(1.0, 0.0));
+}
+
+#[test]
+fn wide_integer_helpers_and_photon_utilities_cover_python_helper_semantics() {
+    let low: U256 = python_int_to_basis_int(3);
+    let high = bitwise_leftshift(low, 130);
+    assert!(high.bit(130).unwrap());
+    assert!(high.bit(131).unwrap());
+    assert_eq!(bitwise_rightshift(high, 130), low);
+    assert_eq!(
+        bitwise_and(low, python_int_to_basis_int(1)),
+        python_int_to_basis_int(1)
+    );
+    assert_eq!(
+        bitwise_or(low, python_int_to_basis_int(4)),
+        python_int_to_basis_int(7)
+    );
+    assert_eq!(
+        bitwise_xor(low, python_int_to_basis_int(1)),
+        python_int_to_basis_int(2)
+    );
+    assert_eq!(bitwise_not(bitwise_not(low)), low);
+    assert_eq!(basis_int_to_python_int(low).unwrap(), 3);
+    assert_eq!(basis_zeros::<4>(2), vec![U256::zero(); 2]);
+    assert_eq!(basis_ones::<4>(1)[0].count_ones(), 256);
+    assert_eq!(get_basis_type(200, None, 2).unwrap(), StateStorage::U256);
+
+    let coherent = coherent_state(Complex64::new(0.0, 0.0), 4).unwrap();
+    assert_eq!(coherent[0], Complex64::new(1.0, 0.0));
+    assert!(coherent[1..].iter().all(|value| value.norm() == 0.0));
+    assert_eq!(photon_hspace_dim(2, Some(1), Some(2)).unwrap(), 3);
+    assert_eq!(photon_hspace_dim(4, None, Some(3)).unwrap(), 64);
+    assert_eq!(photon_hspace_dim(8, Some(4), None).unwrap(), 163);
 }

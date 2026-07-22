@@ -260,6 +260,106 @@ pub fn observables_vs_time(
     Ok(result)
 }
 
+/// Exact time evolution from a complete eigendecomposition.
+pub fn ed_state_vs_time(
+    initial: &[Complex64],
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<Complex64>],
+    times: &[f64],
+) -> Result<StateTrajectory> {
+    let dimension = initial.len();
+    if times.is_empty()
+        || times.iter().any(|time| !time.is_finite())
+        || eigenvalues.len() != dimension
+        || eigenvectors.len() != dimension
+        || eigenvectors.iter().any(|vector| vector.len() != dimension)
+    {
+        return Err(QuSpinError::DimensionMismatch(
+            "complete eigensystem, state, and finite nonempty times are required".into(),
+        ));
+    }
+    let coefficients: Vec<_> = eigenvectors
+        .iter()
+        .map(|vector| inner(vector, initial))
+        .collect();
+    let states = times
+        .iter()
+        .map(|time| {
+            let mut state = vec![Complex64::new(0.0, 0.0); dimension];
+            for ((energy, vector), coefficient) in
+                eigenvalues.iter().zip(eigenvectors).zip(&coefficients)
+            {
+                let weight = coefficient * Complex64::new(0.0, -*time * energy).exp();
+                for (value, eigenvector_value) in state.iter_mut().zip(vector) {
+                    *value += weight * *eigenvector_value;
+                }
+            }
+            state
+        })
+        .collect();
+    Ok(StateTrajectory {
+        times: times.to_vec(),
+        states,
+    })
+}
+
+/// Density-matrix counterpart of [`ed_state_vs_time`], with row-major input
+/// and output matrices.
+pub fn ed_density_vs_time(
+    initial: &[Complex64],
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<Complex64>],
+    times: &[f64],
+) -> Result<Vec<Vec<Complex64>>> {
+    let dimension = eigenvalues.len();
+    if initial.len() != dimension.saturating_mul(dimension)
+        || eigenvectors.len() != dimension
+        || eigenvectors.iter().any(|vector| vector.len() != dimension)
+        || times.is_empty()
+        || times.iter().any(|time| !time.is_finite())
+    {
+        return Err(QuSpinError::DimensionMismatch(
+            "density matrix and complete eigensystem dimensions do not match".into(),
+        ));
+    }
+    let mut eigen_density = vec![Complex64::new(0.0, 0.0); dimension * dimension];
+    for left in 0..dimension {
+        for right in 0..dimension {
+            for row in 0..dimension {
+                for column in 0..dimension {
+                    eigen_density[left * dimension + right] += eigenvectors[left][row].conj()
+                        * initial[row * dimension + column]
+                        * eigenvectors[right][column];
+                }
+            }
+        }
+    }
+    Ok(times
+        .iter()
+        .map(|time| {
+            let mut density = vec![Complex64::new(0.0, 0.0); dimension * dimension];
+            for row in 0..dimension {
+                for column in 0..dimension {
+                    for left in 0..dimension {
+                        for right in 0..dimension {
+                            let phase = Complex64::new(
+                                0.0,
+                                -*time * (eigenvalues[left] - eigenvalues[right]),
+                            )
+                            .exp();
+                            density[row * dimension + column] += eigenvectors[left][row]
+                                * phase
+                                * eigen_density[left * dimension + right]
+                                * eigenvectors[right][column].conj();
+                        }
+                    }
+                }
+            }
+            density
+        })
+        .collect())
+}
+
 #[derive(Clone, Debug)]
 pub struct DiagonalEnsemble {
     pub probabilities: Vec<f64>,
@@ -330,32 +430,25 @@ pub fn kl_divergence(left: &[f64], right: &[f64]) -> Result<f64> {
         || left
             .iter()
             .chain(right)
-            .any(|value| !value.is_finite() || *value < 0.0)
+            .any(|value| !value.is_finite() || *value <= 0.0)
     {
         return Err(QuSpinError::InvalidOptions(
-            "KL distributions must be nonempty, equal-length, finite, and nonnegative".into(),
+            "KL distributions must be nonempty, equal-length, finite, and strictly positive".into(),
         ));
     }
     let left_sum = left.iter().sum::<f64>();
     let right_sum = right.iter().sum::<f64>();
-    if left_sum <= f64::EPSILON || right_sum <= f64::EPSILON {
+    if (left_sum - 1.0).abs() > 1.0e-13 || (right_sum - 1.0).abs() > 1.0e-13 {
         return Err(QuSpinError::InvalidOptions(
-            "KL distributions must have positive mass".into(),
+            "KL distributions must be normalized".into(),
         ));
     }
-    let mut divergence = 0.0;
-    for (&left_value, &right_value) in left.iter().zip(right) {
-        let probability = left_value / left_sum;
-        if probability <= f64::EPSILON {
-            continue;
-        }
-        let reference = right_value / right_sum;
-        if reference <= f64::EPSILON {
-            return Ok(f64::INFINITY);
-        }
-        divergence += probability * (probability / reference).ln();
-    }
-    Ok(divergence.max(0.0))
+    Ok(left
+        .iter()
+        .zip(right)
+        .map(|(probability, reference)| probability * (probability / reference).ln())
+        .sum::<f64>()
+        .max(0.0))
 }
 
 /// Mean adjacent-gap ratio of an ordered spectrum.
@@ -365,22 +458,23 @@ pub fn mean_level_spacing(eigenvalues: &[f64]) -> Result<f64> {
             "level-spacing statistics require at least three finite values".into(),
         ));
     }
-    let mut sorted = eigenvalues.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let gaps: Vec<_> = sorted.windows(2).map(|pair| pair[1] - pair[0]).collect();
-    let mut ratios = Vec::with_capacity(gaps.len() - 1);
-    for pair in gaps.windows(2) {
-        let maximum = pair[0].max(pair[1]);
-        if maximum > f64::EPSILON {
-            ratios.push(pair[0].min(pair[1]) / maximum);
-        }
-    }
-    if ratios.is_empty() {
+    if eigenvalues.windows(2).any(|pair| pair[0] > pair[1]) {
         return Err(QuSpinError::InvalidOptions(
-            "level spectrum contains no nonzero adjacent gaps".into(),
+            "level spectrum must be sorted in ascending order".into(),
         ));
     }
-    Ok(ratios.iter().sum::<f64>() / ratios.len() as f64)
+    let gaps: Vec<_> = eigenvalues
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect();
+    if gaps.iter().any(|gap| *gap == 0.0) {
+        return Ok(f64::NAN);
+    }
+    Ok(gaps
+        .windows(2)
+        .map(|pair| pair[0].min(pair[1]) / pair[0].max(pair[1]))
+        .sum::<f64>()
+        / (gaps.len() - 1) as f64)
 }
 
 pub fn states_to_array(
@@ -449,6 +543,52 @@ pub fn array_to_states(arrays: &[Vec<usize>], local_dimension: usize) -> Result<
         .collect()
 }
 
+/// Convert integer states to most-significant-site-first binary rows.
+pub fn ints_to_array(states: &[u128], sites: usize) -> Result<Vec<Vec<u8>>> {
+    if sites > 128 {
+        return Err(QuSpinError::UnsupportedBackend(
+            "u128 binary conversion supports at most 128 sites".into(),
+        ));
+    }
+    if states
+        .iter()
+        .any(|state| sites < 128 && *state >= (1_u128 << sites))
+    {
+        return Err(QuSpinError::StateNotInBasis);
+    }
+    Ok(states
+        .iter()
+        .map(|state| {
+            (0..sites)
+                .map(|column| ((state >> (sites - column - 1)) & 1) as u8)
+                .collect()
+        })
+        .collect())
+}
+
+/// Convert most-significant-site-first binary rows to integer states.
+pub fn array_to_ints(arrays: &[Vec<u8>]) -> Result<Vec<u128>> {
+    let sites = arrays.first().map_or(0, Vec::len);
+    if sites > 128 {
+        return Err(QuSpinError::UnsupportedBackend(
+            "u128 binary conversion supports at most 128 sites".into(),
+        ));
+    }
+    arrays
+        .iter()
+        .map(|row| {
+            if row.len() != sites || row.iter().any(|bit| *bit > 1) {
+                return Err(QuSpinError::InvalidSector(
+                    "binary state rows must have equal lengths and contain only zero or one".into(),
+                ));
+            }
+            Ok(row
+                .iter()
+                .fold(0_u128, |state, bit| (state << 1) | u128::from(*bit)))
+        })
+        .collect()
+}
+
 /// Compute `P† A P` one reduced column at a time.
 pub fn project_operator(
     operator: &(impl LinearOperator + ?Sized),
@@ -457,10 +597,33 @@ pub fn project_operator(
 ) -> Result<Operator> {
     let source_dimension = projector.source_dimension();
     let reduced_dimension = projector.reduced_dimension();
-    if operator.shape() != (source_dimension, source_dimension) {
+    let operator_dimension = operator.shape();
+    if operator_dimension.0 != operator_dimension.1
+        || (operator_dimension.0 != source_dimension && operator_dimension.0 != reduced_dimension)
+    {
         return Err(QuSpinError::DimensionMismatch(
-            "operator and projector parent dimensions do not match".into(),
+            "operator dimension must match the parent or reduced projector space".into(),
         ));
+    }
+    if operator_dimension.0 == reduced_dimension {
+        let mut parent_input = vec![Complex64::new(0.0, 0.0); source_dimension];
+        let mut reduced_input = vec![Complex64::new(0.0, 0.0); reduced_dimension];
+        let mut reduced_output = vec![Complex64::new(0.0, 0.0); reduced_dimension];
+        let mut parent_output = vec![Complex64::new(0.0, 0.0); source_dimension];
+        let mut triplets = Vec::new();
+        for column in 0..source_dimension {
+            parent_input.fill(Complex64::new(0.0, 0.0));
+            parent_input[column] = Complex64::new(1.0, 0.0);
+            projector.project(&parent_input, &mut reduced_input)?;
+            operator.apply(&reduced_input, &mut reduced_output)?;
+            projector.apply(&reduced_output, &mut parent_output)?;
+            for (row, &value) in parent_output.iter().enumerate() {
+                if value.norm() > f64::EPSILON {
+                    triplets.push((row, column, value));
+                }
+            }
+        }
+        return Operator::from_triplets(source_dimension, source_dimension, triplets, format);
     }
     let mut reduced_input = vec![Complex64::new(0.0, 0.0); reduced_dimension];
     let mut parent_input = vec![Complex64::new(0.0, 0.0); source_dimension];

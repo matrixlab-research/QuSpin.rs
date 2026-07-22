@@ -25,6 +25,8 @@ pub enum QuSpinError {
     RankDeficient,
     #[error("unsupported backend: {0}")]
     UnsupportedBackend(String),
+    #[error("archive error: {0}")]
+    Archive(String),
     #[error("solver did not converge after {iterations} iterations; residual={residual:e}")]
     NonConvergence { iterations: usize, residual: f64 },
 }

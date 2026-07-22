@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
 use quspin::basis::SpinBasis1D;
 use quspin::operator::{
-    Coupling, DynamicTerm, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorTerm,
-    QuantumComponent, QuantumOperator, TimeDependentOperator, anticommutator, commutator,
+    Coupling, DynamicTerm, ExpOp, Hamiltonian, LinearOperator, MatrixFormat, Operator,
+    OperatorBuilder, OperatorTerm, QuantumComponent, QuantumOperator, Static,
+    TimeDependentOperator, anticommutator, commutator, is_exp_op, is_hamiltonian,
+    is_quantum_linear_operator, is_quantum_operator,
 };
 use quspin::{Complex64, QuSpinError};
 
@@ -131,4 +134,42 @@ fn operator_algebra_obeys_pauli_identities_and_format_conversion() {
     assert_complex_close(identity[0], Complex64::new(1.0, 0.0));
     assert_complex_close(identity[3], Complex64::new(1.0, 0.0));
     assert_eq!(x.adjoint().unwrap().to_dense(), x.to_dense());
+    assert_eq!(x.transpose().unwrap().to_dense(), x.to_dense());
+    assert_complex_close(x.trace().unwrap(), Complex64::new(0.0, 0.0));
+
+    let rotation = Operator::from_dense(
+        2,
+        2,
+        vec![
+            Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+            Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+            Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+            Complex64::new(-1.0 / 2.0_f64.sqrt(), 0.0),
+        ],
+    )
+    .unwrap();
+    let rotated = x.rotated(&rotation, 1.0e-12).unwrap();
+    assert_complex_close(rotated.diagonal()[0], Complex64::new(1.0, 0.0));
+    assert_complex_close(rotated.diagonal()[1], Complex64::new(-1.0, 0.0));
+}
+
+#[test]
+fn runtime_compatibility_predicates_identify_public_operator_families() {
+    let operator = Operator::from_dense(1, 1, vec![Complex64::new(1.0, 0.0)]).unwrap();
+    let exp = ExpOp::new(
+        Arc::new(operator.clone()),
+        Complex64::new(0.0, -1.0),
+        4,
+        1.0e-12,
+        10,
+    )
+    .unwrap();
+    let hamiltonian = Hamiltonian::<Static>::new(operator.clone()).unwrap();
+    let quantum =
+        QuantumOperator::new([QuantumComponent::with_default("a", operator, 1.0)]).unwrap();
+    assert!(is_exp_op(&exp));
+    assert!(is_hamiltonian(&hamiltonian));
+    assert!(is_quantum_operator(&quantum));
+    assert!(is_quantum_linear_operator(&quantum));
+    assert_eq!(quantum.component_names().collect::<Vec<_>>(), vec!["a"]);
 }

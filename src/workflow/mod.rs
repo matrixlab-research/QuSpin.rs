@@ -120,3 +120,143 @@ impl LinearOperator for LindbladGenerator {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct StateTrackingResult {
+    /// `permutation[previous_index]` is the matched current-state index.
+    pub permutation: Vec<usize>,
+    /// Multiply each matched current state by this phase to align gauges.
+    pub phases: Vec<Complex64>,
+    pub overlaps: Vec<f64>,
+    pub ambiguous: Vec<usize>,
+}
+
+fn state_inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left.conj() * *right)
+        .sum()
+}
+
+/// Match two equal-rank eigenvector frames by globally maximizing absolute
+/// overlaps, then return gauge-aligning phases and ambiguity diagnostics.
+pub fn track_states(
+    previous: &[Vec<Complex64>],
+    current: &[Vec<Complex64>],
+    ambiguity_tolerance: f64,
+) -> Result<StateTrackingResult> {
+    let rank = previous.len();
+    if rank == 0
+        || current.len() != rank
+        || !ambiguity_tolerance.is_finite()
+        || ambiguity_tolerance < 0.0
+    {
+        return Err(QuSpinError::InvalidOptions(
+            "state tracking requires equal nonzero ranks and a nonnegative tolerance".into(),
+        ));
+    }
+    let dimension = previous[0].len();
+    if dimension == 0
+        || previous.iter().any(|vector| vector.len() != dimension)
+        || current.iter().any(|vector| vector.len() != dimension)
+    {
+        return Err(QuSpinError::DimensionMismatch(
+            "tracked state vectors must have equal nonzero dimensions".into(),
+        ));
+    }
+    let overlaps: Vec<Vec<_>> = previous
+        .iter()
+        .map(|left| {
+            current
+                .iter()
+                .map(|right| state_inner(left, right))
+                .collect()
+        })
+        .collect();
+
+    // Hungarian algorithm for the minimum cost `-abs(overlap)` assignment.
+    let mut row_potential = vec![0.0_f64; rank + 1];
+    let mut column_potential = vec![0.0_f64; rank + 1];
+    let mut matched_row = vec![0_usize; rank + 1];
+    let mut predecessor = vec![0_usize; rank + 1];
+    for row in 1..=rank {
+        matched_row[0] = row;
+        let mut column = 0;
+        let mut minimum = vec![f64::INFINITY; rank + 1];
+        let mut used = vec![false; rank + 1];
+        loop {
+            used[column] = true;
+            let active_row = matched_row[column];
+            let mut delta = f64::INFINITY;
+            let mut next_column = 0;
+            for candidate in 1..=rank {
+                if used[candidate] {
+                    continue;
+                }
+                let cost = -overlaps[active_row - 1][candidate - 1].norm()
+                    - row_potential[active_row]
+                    - column_potential[candidate];
+                if cost < minimum[candidate] {
+                    minimum[candidate] = cost;
+                    predecessor[candidate] = column;
+                }
+                if minimum[candidate] < delta {
+                    delta = minimum[candidate];
+                    next_column = candidate;
+                }
+            }
+            for candidate in 0..=rank {
+                if used[candidate] {
+                    row_potential[matched_row[candidate]] += delta;
+                    column_potential[candidate] -= delta;
+                } else {
+                    minimum[candidate] -= delta;
+                }
+            }
+            column = next_column;
+            if matched_row[column] == 0 {
+                break;
+            }
+        }
+        loop {
+            let previous_column = predecessor[column];
+            matched_row[column] = matched_row[previous_column];
+            column = previous_column;
+            if column == 0 {
+                break;
+            }
+        }
+    }
+    let mut permutation = vec![0_usize; rank];
+    for column in 1..=rank {
+        permutation[matched_row[column] - 1] = column - 1;
+    }
+    let mut phases = Vec::with_capacity(rank);
+    let mut assigned_overlaps = Vec::with_capacity(rank);
+    let mut ambiguous = Vec::new();
+    for row in 0..rank {
+        let overlap = overlaps[row][permutation[row]];
+        let magnitude = overlap.norm();
+        phases.push(if magnitude > f64::EPSILON {
+            overlap.conj() / magnitude
+        } else {
+            Complex64::new(1.0, 0.0)
+        });
+        assigned_overlaps.push(magnitude);
+        let alternative = overlaps[row]
+            .iter()
+            .enumerate()
+            .filter(|(column, _)| *column != permutation[row])
+            .map(|(_, value)| value.norm())
+            .fold(0.0_f64, f64::max);
+        if magnitude - alternative <= ambiguity_tolerance {
+            ambiguous.push(row);
+        }
+    }
+    Ok(StateTrackingResult {
+        permutation,
+        phases,
+        overlaps: assigned_overlaps,
+        ambiguous,
+    })
+}

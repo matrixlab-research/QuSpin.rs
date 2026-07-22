@@ -366,6 +366,15 @@ impl Operator {
             .collect()
     }
 
+    pub fn trace(&self) -> Result<Complex64> {
+        if self.shape.0 != self.shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator trace requires a square operator".into(),
+            ));
+        }
+        Ok(self.diagonal().into_iter().sum())
+    }
+
     pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
         let coefficient = coefficient.into();
         if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
@@ -464,6 +473,43 @@ impl Operator {
             }
         }
         Self::from_dense(self.shape.1, self.shape.0, values)?.converted(self.format)
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        let dense = self.to_dense();
+        let mut values = vec![Complex64::new(0.0, 0.0); dense.len()];
+        for row in 0..self.shape.0 {
+            for column in 0..self.shape.1 {
+                values[column * self.shape.0 + row] = dense[row * self.shape.1 + column];
+            }
+        }
+        Self::from_dense(self.shape.1, self.shape.0, values)?.converted(self.format)
+    }
+
+    /// Similarity rotation `U† A U` after validating unitarity.
+    pub fn rotated(&self, unitary: &Self, tolerance: f64) -> Result<Self> {
+        if self.shape.0 != self.shape.1 || unitary.shape != self.shape {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator rotation requires equal square shapes".into(),
+            ));
+        }
+        if !tolerance.is_finite() || tolerance <= 0.0 {
+            return Err(QuSpinError::InvalidOptions(
+                "unitarity tolerance must be positive".into(),
+            ));
+        }
+        let identity = unitary.adjoint()?.product(unitary)?;
+        for row in 0..self.shape.0 {
+            for column in 0..self.shape.1 {
+                let expected = if row == column { 1.0 } else { 0.0 };
+                if (identity.value_at(row, column) - expected).norm() > tolerance {
+                    return Err(QuSpinError::InvalidOptions(
+                        "rotation matrix must be unitary".into(),
+                    ));
+                }
+            }
+        }
+        unitary.adjoint()?.product(self)?.product(unitary)
     }
 
     fn value_at(&self, row: usize, column: usize) -> Complex64 {
@@ -1267,6 +1313,12 @@ impl QuantumOperator {
         self.shape
     }
 
+    pub fn component_names(&self) -> impl Iterator<Item = &str> {
+        self.components
+            .iter()
+            .map(|component| component.name.as_str())
+    }
+
     pub fn evaluate(
         &self,
         parameters: &HashMap<String, Complex64>,
@@ -1308,10 +1360,135 @@ impl QuantumOperator {
     }
 }
 
+/// Parameterized stored and matrix-free operators share one Rust-native type.
+pub type QuantumLinearOperator = QuantumOperator;
+
 pub fn commutator(left: &Operator, right: &Operator) -> Result<Operator> {
     left.product(right)?.subtract(&right.product(left)?)
 }
 
 pub fn anticommutator(left: &Operator, right: &Operator) -> Result<Operator> {
     left.product(right)?.add(&right.product(left)?)
+}
+
+/// Matrix-free exponential `exp(exponent * A)`.
+#[derive(Clone)]
+pub struct ExpOp {
+    operator: Arc<dyn LinearOperator>,
+    exponent: Complex64,
+    krylov_dimension: usize,
+    tolerance: f64,
+    max_substeps: usize,
+}
+
+impl std::fmt::Debug for ExpOp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExpOp")
+            .field("shape", &self.operator.shape())
+            .field("exponent", &self.exponent)
+            .field("krylov_dimension", &self.krylov_dimension)
+            .field("tolerance", &self.tolerance)
+            .field("max_substeps", &self.max_substeps)
+            .finish()
+    }
+}
+
+impl ExpOp {
+    pub fn new(
+        operator: Arc<dyn LinearOperator>,
+        exponent: Complex64,
+        krylov_dimension: usize,
+        tolerance: f64,
+        max_substeps: usize,
+    ) -> Result<Self> {
+        let shape = operator.shape();
+        if shape.0 != shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "ExpOp requires a square operator".into(),
+            ));
+        }
+        if !exponent.re.is_finite()
+            || !exponent.im.is_finite()
+            || krylov_dimension == 0
+            || !tolerance.is_finite()
+            || tolerance <= 0.0
+            || max_substeps == 0
+        {
+            return Err(QuSpinError::InvalidOptions(
+                "invalid ExpOp coefficient or numerical controls".into(),
+            ));
+        }
+        Ok(Self {
+            operator,
+            exponent,
+            krylov_dimension,
+            tolerance,
+            max_substeps,
+        })
+    }
+
+    pub const fn exponent(&self) -> Complex64 {
+        self.exponent
+    }
+
+    pub fn set_exponent(&mut self, exponent: Complex64) -> Result<()> {
+        if !exponent.re.is_finite() || !exponent.im.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "ExpOp coefficient must be finite".into(),
+            ));
+        }
+        self.exponent = exponent;
+        Ok(())
+    }
+
+    pub fn sandwich(&self, state: &[Complex64]) -> Result<Complex64> {
+        let mut output = vec![Complex64::new(0.0, 0.0); state.len()];
+        self.apply(state, &mut output)?;
+        Ok(state
+            .iter()
+            .zip(output)
+            .map(|(left, right)| left.conj() * right)
+            .sum())
+    }
+}
+
+impl LinearOperator for ExpOp {
+    fn shape(&self) -> (usize, usize) {
+        self.operator.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        check_apply_shape(self.shape(), input, output)?;
+        let result = crate::solve::expm_action_complex(
+            self.operator.as_ref(),
+            input,
+            self.exponent,
+            self.krylov_dimension,
+            self.tolerance,
+            self.max_substeps,
+        )?;
+        output.copy_from_slice(&result);
+        Ok(())
+    }
+}
+
+pub fn is_exp_op(value: &dyn std::any::Any) -> bool {
+    value.is::<ExpOp>()
+}
+
+pub fn is_hamiltonian(value: &dyn std::any::Any) -> bool {
+    value.is::<Hamiltonian<Static>>() || value.is::<Hamiltonian<Dynamic>>()
+}
+
+pub fn is_quantum_operator(value: &dyn std::any::Any) -> bool {
+    value.is::<QuantumOperator>()
+}
+
+pub fn is_quantum_linear_operator(value: &dyn std::any::Any) -> bool {
+    is_quantum_operator(value)
 }

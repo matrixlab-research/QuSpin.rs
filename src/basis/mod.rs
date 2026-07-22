@@ -1974,12 +1974,215 @@ impl<const WORDS: usize> WideState<WORDS> {
             .map(|word| word.count_ones() as usize)
             .sum()
     }
+
+    pub fn bitwise_and(self, right: Self) -> Self {
+        Self::from_words(std::array::from_fn(|index| {
+            self.words[index] & right.words[index]
+        }))
+    }
+
+    pub fn bitwise_or(self, right: Self) -> Self {
+        Self::from_words(std::array::from_fn(|index| {
+            self.words[index] | right.words[index]
+        }))
+    }
+
+    pub fn bitwise_xor(self, right: Self) -> Self {
+        Self::from_words(std::array::from_fn(|index| {
+            self.words[index] ^ right.words[index]
+        }))
+    }
+
+    pub fn bitwise_not(self) -> Self {
+        Self::from_words(std::array::from_fn(|index| !self.words[index]))
+    }
+
+    pub fn left_shift(self, shift: usize) -> Self {
+        if shift >= Self::capacity_bits() {
+            return Self::zero();
+        }
+        let word_shift = shift / 64;
+        let bit_shift = shift % 64;
+        let mut words = [0_u64; WORDS];
+        for target in (word_shift..WORDS).rev() {
+            let source = target - word_shift;
+            words[target] |= self.words[source] << bit_shift;
+            if bit_shift > 0 && source > 0 {
+                words[target] |= self.words[source - 1] >> (64 - bit_shift);
+            }
+        }
+        Self::from_words(words)
+    }
+
+    pub fn right_shift(self, shift: usize) -> Self {
+        if shift >= Self::capacity_bits() {
+            return Self::zero();
+        }
+        let word_shift = shift / 64;
+        let bit_shift = shift % 64;
+        let mut words = [0_u64; WORDS];
+        for (target, word) in words.iter_mut().enumerate().take(WORDS - word_shift) {
+            let source = target + word_shift;
+            *word |= self.words[source] >> bit_shift;
+            if bit_shift > 0 && source + 1 < WORDS {
+                *word |= self.words[source + 1] << (64 - bit_shift);
+            }
+        }
+        Self::from_words(words)
+    }
 }
 
 pub type U256 = WideState<4>;
 pub type U1024 = WideState<16>;
 pub type U4096 = WideState<64>;
 pub type U16384 = WideState<256>;
+pub type UInt256 = U256;
+pub type UInt1024 = U1024;
+pub type UInt4096 = U4096;
+pub type UInt16384 = U16384;
+
+pub fn basis_zeros<const WORDS: usize>(length: usize) -> Vec<WideState<WORDS>> {
+    vec![WideState::zero(); length]
+}
+
+pub fn basis_ones<const WORDS: usize>(length: usize) -> Vec<WideState<WORDS>> {
+    vec![WideState::zero().bitwise_not(); length]
+}
+
+pub fn bitwise_and<const WORDS: usize>(
+    left: WideState<WORDS>,
+    right: WideState<WORDS>,
+) -> WideState<WORDS> {
+    left.bitwise_and(right)
+}
+
+pub fn bitwise_or<const WORDS: usize>(
+    left: WideState<WORDS>,
+    right: WideState<WORDS>,
+) -> WideState<WORDS> {
+    left.bitwise_or(right)
+}
+
+pub fn bitwise_xor<const WORDS: usize>(
+    left: WideState<WORDS>,
+    right: WideState<WORDS>,
+) -> WideState<WORDS> {
+    left.bitwise_xor(right)
+}
+
+pub fn bitwise_not<const WORDS: usize>(value: WideState<WORDS>) -> WideState<WORDS> {
+    value.bitwise_not()
+}
+
+pub fn bitwise_leftshift<const WORDS: usize>(
+    value: WideState<WORDS>,
+    shift: usize,
+) -> WideState<WORDS> {
+    value.left_shift(shift)
+}
+
+pub fn bitwise_rightshift<const WORDS: usize>(
+    value: WideState<WORDS>,
+    shift: usize,
+) -> WideState<WORDS> {
+    value.right_shift(shift)
+}
+
+pub fn python_int_to_basis_int<const WORDS: usize>(value: u128) -> WideState<WORDS> {
+    let mut words = [0_u64; WORDS];
+    if WORDS > 0 {
+        words[0] = value as u64;
+    }
+    if WORDS > 1 {
+        words[1] = (value >> 64) as u64;
+    }
+    WideState::from_words(words)
+}
+
+pub fn basis_int_to_python_int<const WORDS: usize>(value: WideState<WORDS>) -> Result<u128> {
+    if value.words.iter().skip(2).any(|word| *word != 0) {
+        return Err(QuSpinError::UnsupportedBackend(
+            "wide basis integer does not fit into a Python-compatible u128".into(),
+        ));
+    }
+    Ok(u128::from(value.words.first().copied().unwrap_or_default())
+        | (u128::from(value.words.get(1).copied().unwrap_or_default()) << 64))
+}
+
+pub fn get_basis_type(
+    sites: usize,
+    _particles: Option<usize>,
+    states_per_site: usize,
+) -> Result<StateStorage> {
+    if states_per_site < 2 {
+        return Err(QuSpinError::InvalidSector(
+            "states_per_site must be at least two".into(),
+        ));
+    }
+    let bits_per_site =
+        usize::try_from(usize::BITS - (states_per_site - 1).leading_zeros()).unwrap_or(usize::MAX);
+    let bits = sites
+        .checked_mul(bits_per_site)
+        .ok_or_else(|| QuSpinError::UnsupportedBackend("basis bit width overflow".into()))?;
+    match bits {
+        0..=128 => Ok(StateStorage::U128),
+        129..=256 => Ok(StateStorage::U256),
+        257..=1024 => Ok(StateStorage::U1024),
+        1025..=4096 => Ok(StateStorage::U4096),
+        4097..=16384 => Ok(StateStorage::U16384),
+        _ => Err(QuSpinError::UnsupportedBackend(
+            "basis requires more than 16384 state bits".into(),
+        )),
+    }
+}
+
+pub fn coherent_state(amplitude: Complex64, states: usize) -> Result<Vec<Complex64>> {
+    if states == 0 || !amplitude.re.is_finite() || !amplitude.im.is_finite() {
+        return Err(QuSpinError::InvalidOptions(
+            "coherent-state amplitude must be finite and the cutoff positive".into(),
+        ));
+    }
+    let mut coefficients = Vec::with_capacity(states);
+    let mut coefficient = Complex64::new((-0.5 * amplitude.norm_sqr()).exp(), 0.0);
+    coefficients.push(coefficient);
+    for occupation in 1..states {
+        coefficient *= amplitude / (occupation as f64).sqrt();
+        coefficients.push(coefficient);
+    }
+    Ok(coefficients)
+}
+
+fn binomial(n: usize, k: usize) -> usize {
+    let k = k.min(n.saturating_sub(k));
+    (0..k).fold(1_usize, |value, index| {
+        value.saturating_mul(n - index) / (index + 1)
+    })
+}
+
+/// Dimension of a spin-half chain plus one photon mode at fixed excitation.
+pub fn photon_hspace_dim(
+    sites: usize,
+    total_excitations: Option<usize>,
+    photon_cutoff: Option<usize>,
+) -> Result<usize> {
+    match (total_excitations, photon_cutoff) {
+        (None, Some(cutoff)) => 1_usize
+            .checked_shl(u32::try_from(sites).unwrap_or(u32::MAX))
+            .and_then(|matter| matter.checked_mul(cutoff.saturating_add(1)))
+            .ok_or_else(|| QuSpinError::UnsupportedBackend("photon dimension overflow".into())),
+        (Some(total), cutoff) => {
+            let minimum_matter =
+                cutoff.map_or(0, |maximum_photons| total.saturating_sub(maximum_photons));
+            let maximum_matter = sites.min(total);
+            Ok((minimum_matter..=maximum_matter)
+                .map(|matter| binomial(sites, matter))
+                .sum())
+        }
+        (None, None) => Err(QuSpinError::InvalidSector(
+            "either total excitation or photon cutoff must be finite".into(),
+        )),
+    }
+}
 
 /// Sparse isometric lift from a symmetry-reduced basis to its parent basis.
 #[derive(Clone, Debug)]

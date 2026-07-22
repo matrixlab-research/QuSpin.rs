@@ -1,9 +1,10 @@
 use approx::assert_abs_diff_eq;
 use quspin::Complex64;
 use quspin::measure::{
-    EntropyOrder, array_to_states, diagonal_ensemble, entanglement_entropy, expectation,
-    kl_divergence, matrix_element, mean_level_spacing, observables_vs_time, partial_trace,
-    quantum_fluctuation, states_to_array,
+    EntropyOrder, array_to_ints, array_to_states, diagonal_ensemble, ed_density_vs_time,
+    ed_state_vs_time, entanglement_entropy, expectation, ints_to_array, kl_divergence,
+    matrix_element, mean_level_spacing, observables_vs_time, partial_trace, quantum_fluctuation,
+    states_to_array,
 };
 use quspin::operator::Operator;
 use quspin::solve::StateTrajectory;
@@ -108,7 +109,7 @@ fn ensemble_statistics_and_state_conversions_are_deterministic() {
     assert_abs_diff_eq!(ensemble.energy_variance, 1.0, epsilon = 1.0e-12);
     assert_abs_diff_eq!(ensemble.entropy, 2.0_f64.ln(), epsilon = 1.0e-12);
     assert_abs_diff_eq!(
-        kl_divergence(&[1.0, 1.0], &[1.0, 1.0]).unwrap(),
+        kl_divergence(&[0.5, 0.5], &[0.5, 0.5]).unwrap(),
         0.0,
         epsilon = 1.0e-12
     );
@@ -121,4 +122,33 @@ fn ensemble_statistics_and_state_conversions_are_deterministic() {
     let states = vec![0_u128, 5, 15];
     let occupations = states_to_array(&states, 4, 2).unwrap();
     assert_eq!(array_to_states(&occupations, 2).unwrap(), states);
+    let binary = ints_to_array(&states, 4).unwrap();
+    assert_eq!(binary[1], vec![0, 1, 0, 1]);
+    assert_eq!(array_to_ints(&binary).unwrap(), states);
+}
+
+#[test]
+fn exact_eigenbasis_evolution_supports_pure_and_mixed_states() {
+    let eigenvalues = [-1.0, 1.0];
+    let eigenvectors = vec![
+        vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
+        vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
+    ];
+    let initial = vec![
+        Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+        Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+    ];
+    let trajectory = ed_state_vs_time(&initial, &eigenvalues, &eigenvectors, &[0.0, 0.5]).unwrap();
+    assert_abs_diff_eq!(trajectory.states[1][0].arg(), 0.5, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(trajectory.states[1][1].arg(), -0.5, epsilon = 1.0e-12);
+
+    let density = vec![
+        Complex64::new(0.5, 0.0),
+        Complex64::new(0.5, 0.0),
+        Complex64::new(0.5, 0.0),
+        Complex64::new(0.5, 0.0),
+    ];
+    let evolved = ed_density_vs_time(&density, &eigenvalues, &eigenvectors, &[0.5]).unwrap();
+    assert_abs_diff_eq!(evolved[0][0].re + evolved[0][3].re, 1.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(evolved[0][1].norm(), 0.5, epsilon = 1.0e-12);
 }

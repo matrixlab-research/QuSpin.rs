@@ -6,6 +6,8 @@ use crate::operator::{
 };
 use crate::{QuSpinError, Result};
 
+pub use crate::operator::ExpOp as ExpmMultiplyParallel;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SpectrumTarget {
     SmallestAlgebraic,
@@ -619,6 +621,182 @@ pub struct StateBatchTrajectory {
     pub states: Vec<Vec<Vec<Complex64>>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LanczosOptions {
+    pub krylov_dimension: usize,
+    pub tolerance: f64,
+}
+
+impl LanczosOptions {
+    fn validate(&self) -> Result<()> {
+        if self.krylov_dimension == 0 || !self.tolerance.is_finite() || self.tolerance <= 0.0 {
+            return Err(QuSpinError::InvalidOptions(
+                "Lanczos dimension and tolerance must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LanczosVector {
+    pub index: usize,
+    pub vector: Vec<Complex64>,
+    pub diagonal: f64,
+    pub next_off_diagonal: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LanczosDecomposition {
+    pub initial_norm: f64,
+    pub basis: Vec<Vec<Complex64>>,
+    pub diagonal: Vec<f64>,
+    pub off_diagonal: Vec<f64>,
+}
+
+pub struct LanczosIter<'a, O>
+where
+    O: LinearOperator + ?Sized,
+{
+    operator: &'a O,
+    options: LanczosOptions,
+    index: usize,
+    previous: Option<Vec<Complex64>>,
+    current: Option<Vec<Complex64>>,
+    previous_beta: f64,
+    failed: bool,
+}
+
+impl<O> Iterator for LanczosIter<'_, O>
+where
+    O: LinearOperator + ?Sized,
+{
+    type Item = Result<LanczosVector>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.index >= self.options.krylov_dimension {
+            return None;
+        }
+        let current = self.current.take()?;
+        let mut applied = vec![Complex64::new(0.0, 0.0); current.len()];
+        if let Err(error) = self.operator.apply(&current, &mut applied) {
+            self.failed = true;
+            return Some(Err(error));
+        }
+        let alpha = inner(&current, &applied);
+        if alpha.im.abs() > self.options.tolerance.max(1.0e-10) {
+            self.failed = true;
+            return Some(Err(QuSpinError::NonHermitian));
+        }
+        for (value, basis_value) in applied.iter_mut().zip(&current) {
+            *value -= alpha.re * *basis_value;
+        }
+        if let Some(previous) = &self.previous {
+            for (value, basis_value) in applied.iter_mut().zip(previous) {
+                *value -= self.previous_beta * *basis_value;
+            }
+        }
+        // One corrective projection against the current vector suppresses
+        // roundoff without retaining the entire Krylov basis.
+        let correction = inner(&current, &applied);
+        for (value, basis_value) in applied.iter_mut().zip(&current) {
+            *value -= correction * *basis_value;
+        }
+        let beta = vector_norm(&applied);
+        let output = LanczosVector {
+            index: self.index,
+            vector: current.clone(),
+            diagonal: alpha.re,
+            next_off_diagonal: beta,
+        };
+        self.index += 1;
+        if self.index < self.options.krylov_dimension && beta > self.options.tolerance {
+            for value in &mut applied {
+                *value /= beta;
+            }
+            self.previous = Some(current);
+            self.current = Some(applied);
+            self.previous_beta = beta;
+        } else {
+            self.current = None;
+        }
+        Some(Ok(output))
+    }
+}
+
+pub fn lanczos_iter<'a, O>(
+    operator: &'a O,
+    initial: &'a [Complex64],
+    options: LanczosOptions,
+) -> Result<LanczosIter<'a, O>>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    let shape = operator.shape();
+    if shape.0 != shape.1 || initial.len() != shape.0 {
+        return Err(QuSpinError::DimensionMismatch(
+            "Lanczos operator and initial vector do not match".into(),
+        ));
+    }
+    let mut current = initial.to_vec();
+    normalize(&mut current)?;
+    Ok(LanczosIter {
+        operator,
+        options,
+        index: 0,
+        previous: None,
+        current: Some(current),
+        previous_beta: 0.0,
+        failed: false,
+    })
+}
+
+pub fn lanczos_full<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: LanczosOptions,
+) -> Result<LanczosDecomposition>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    let initial_norm = vector_norm(initial);
+    let vectors: Vec<_> = lanczos_iter(operator, initial, options)?.collect::<Result<_>>()?;
+    let off_diagonal = vectors
+        .iter()
+        .take(vectors.len().saturating_sub(1))
+        .map(|vector| vector.next_off_diagonal)
+        .collect();
+    Ok(LanczosDecomposition {
+        initial_norm,
+        basis: vectors.iter().map(|vector| vector.vector.clone()).collect(),
+        diagonal: vectors.iter().map(|vector| vector.diagonal).collect(),
+        off_diagonal,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpmOptions {
+    pub times: Vec<f64>,
+    pub krylov_dimension: usize,
+    pub tolerance: f64,
+    pub max_substeps: usize,
+    pub hamiltonian: bool,
+}
+
+impl From<ExpmOptions> for EvolutionOptions {
+    fn from(options: ExpmOptions) -> Self {
+        Self {
+            times: options.times,
+            krylov_dimension: options.krylov_dimension,
+            tolerance: options.tolerance,
+            max_substeps: options.max_substeps,
+            hamiltonian: options.hamiltonian,
+        }
+    }
+}
+
 struct LanczosProjection {
     initial_norm: f64,
     basis: Vec<Vec<Complex64>>,
@@ -777,30 +955,72 @@ pub(crate) fn expm_action(
     if interval == 0.0 {
         return Ok(initial.to_vec());
     }
-    if options.hamiltonian {
-        let projection = lanczos_projection(operator, initial, options.krylov_dimension)?;
+    let exponent = if options.hamiltonian {
+        Complex64::new(0.0, -interval)
+    } else {
+        Complex64::new(interval, 0.0)
+    };
+    expm_action_complex(
+        operator,
+        initial,
+        exponent,
+        options.krylov_dimension,
+        options.tolerance,
+        options.max_substeps,
+    )
+}
+
+pub(crate) fn expm_action_complex(
+    operator: &(impl LinearOperator + ?Sized),
+    initial: &[Complex64],
+    exponent: Complex64,
+    krylov_dimension: usize,
+    tolerance: f64,
+    max_substeps: usize,
+) -> Result<Vec<Complex64>> {
+    let shape = operator.shape();
+    if shape.0 != shape.1 || initial.len() != shape.0 {
+        return Err(QuSpinError::DimensionMismatch(
+            "exponential action requires a square operator matching the state".into(),
+        ));
+    }
+    if !exponent.re.is_finite()
+        || !exponent.im.is_finite()
+        || krylov_dimension == 0
+        || !tolerance.is_finite()
+        || tolerance <= 0.0
+        || max_substeps == 0
+    {
+        return Err(QuSpinError::InvalidOptions(
+            "invalid exponential coefficient or numerical controls".into(),
+        ));
+    }
+    if exponent.norm() <= f64::EPSILON {
+        return Ok(initial.to_vec());
+    }
+    if exponent.re.abs() <= f64::EPSILON {
+        let projection = lanczos_projection(operator, initial, krylov_dimension)?;
         return Ok(projected_exponential_action(
             &projection,
-            interval,
+            -exponent.im,
             true,
             initial.len(),
         ));
     }
-    let requested_steps = interval.abs().ceil().max(1.0) as usize;
-    if requested_steps > options.max_substeps {
+    let requested_steps = exponent.norm().ceil().max(1.0) as usize;
+    if requested_steps > max_substeps {
         return Err(QuSpinError::NonConvergence {
-            iterations: options.max_substeps,
-            residual: interval.abs(),
+            iterations: max_substeps,
+            residual: exponent.norm(),
         });
     }
-    let step = interval / requested_steps as f64;
-    let factor = Complex64::new(step, 0.0);
+    let factor = exponent / requested_steps as f64;
     let mut state = initial.to_vec();
     let mut applied = vec![Complex64::new(0.0, 0.0); shape.0];
     for _ in 0..requested_steps {
         let mut sum = state.clone();
         let mut term = state.clone();
-        for order in 1..=options.krylov_dimension {
+        for order in 1..=krylov_dimension {
             operator.apply(&term, &mut applied)?;
             let scale = factor / order as f64;
             for (next, value) in term.iter_mut().zip(&applied) {
@@ -809,10 +1029,10 @@ pub(crate) fn expm_action(
             for (total, value) in sum.iter_mut().zip(&term) {
                 *total += *value;
             }
-            if vector_norm(&term) <= options.tolerance * vector_norm(&sum).max(1.0) {
+            if vector_norm(&term) <= tolerance * vector_norm(&sum).max(1.0) {
                 break;
             }
-            if order == options.krylov_dimension {
+            if order == krylov_dimension {
                 return Err(QuSpinError::NonConvergence {
                     iterations: order,
                     residual: vector_norm(&term),
@@ -867,6 +1087,180 @@ where
         times: options.times,
         states,
     })
+}
+
+/// Exponential action over a time grid. Hermitian Hamiltonians use one
+/// reusable Lanczos projection for the complete grid.
+pub fn expm_multiply<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: ExpmOptions,
+) -> Result<StateTrajectory>
+where
+    O: LinearOperator + ?Sized,
+{
+    evolve(operator, initial, options.into())
+}
+
+pub fn expm_lanczos<O>(
+    operator: &O,
+    initial: &[Complex64],
+    time: f64,
+    options: LanczosOptions,
+) -> Result<Vec<Complex64>>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    if !time.is_finite() {
+        return Err(QuSpinError::InvalidOptions(
+            "exponential time must be finite".into(),
+        ));
+    }
+    let projection = lanczos_projection(operator, initial, options.krylov_dimension)?;
+    Ok(projected_exponential_action(
+        &projection,
+        time,
+        true,
+        initial.len(),
+    ))
+}
+
+#[derive(Clone, Debug)]
+pub struct ThermalIteration {
+    pub inverse_temperatures: Vec<f64>,
+    pub log_partition: Vec<f64>,
+    pub mean_energy: Vec<f64>,
+    pub krylov_dimension: usize,
+}
+
+fn thermal_lanczos_iteration<O>(
+    operator: &O,
+    initial: &[Complex64],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    if inverse_temperatures.is_empty()
+        || inverse_temperatures
+            .iter()
+            .any(|beta| !beta.is_finite() || *beta < 0.0)
+    {
+        return Err(QuSpinError::InvalidOptions(
+            "inverse temperatures must be nonempty, finite, and nonnegative".into(),
+        ));
+    }
+    let decomposition = lanczos_full(operator, initial, options)?;
+    let size = decomposition.diagonal.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
+    for index in 0..size {
+        tridiagonal[(index, index)] = decomposition.diagonal[index];
+        if index + 1 < size {
+            tridiagonal[(index, index + 1)] = decomposition.off_diagonal[index];
+            tridiagonal[(index + 1, index)] = decomposition.off_diagonal[index];
+        }
+    }
+    let eigensystem = SymmetricEigen::new(tridiagonal);
+    let weights: Vec<_> = (0..size)
+        .map(|index| {
+            decomposition.initial_norm.powi(2) * eigensystem.eigenvectors[(0, index)].powi(2)
+        })
+        .collect();
+    let hilbert_dimension = operator.shape().0 as f64;
+    let minimum_energy = eigensystem
+        .eigenvalues
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let mut log_partition = Vec::with_capacity(inverse_temperatures.len());
+    let mut mean_energy = Vec::with_capacity(inverse_temperatures.len());
+    for &beta in inverse_temperatures {
+        let boltzmann: Vec<_> = eigensystem
+            .eigenvalues
+            .iter()
+            .zip(&weights)
+            .map(|(energy, weight)| weight * (-beta * (*energy - minimum_energy)).exp())
+            .collect();
+        let projected_partition = boltzmann.iter().sum::<f64>();
+        if projected_partition <= f64::EPSILON {
+            return Err(QuSpinError::NonConvergence {
+                iterations: size,
+                residual: projected_partition,
+            });
+        }
+        log_partition.push(
+            (hilbert_dimension / decomposition.initial_norm.powi(2)).ln() - beta * minimum_energy
+                + projected_partition.ln(),
+        );
+        mean_energy.push(
+            boltzmann
+                .iter()
+                .zip(eigensystem.eigenvalues.iter())
+                .map(|(weight, energy)| weight * energy)
+                .sum::<f64>()
+                / projected_partition,
+        );
+    }
+    Ok(ThermalIteration {
+        inverse_temperatures: inverse_temperatures.to_vec(),
+        log_partition,
+        mean_energy,
+        krylov_dimension: size,
+    })
+}
+
+/// One finite-temperature Lanczos random-vector iteration.
+pub fn ftlm_static_iteration<O>(
+    operator: &O,
+    initial: &[Complex64],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    thermal_lanczos_iteration(operator, initial, inverse_temperatures, options)
+}
+
+/// Low-temperature Lanczos iteration using a ground-energy shifted Boltzmann
+/// evaluation for numerical stability.
+pub fn ltlm_static_iteration<O>(
+    operator: &O,
+    initial: &[Complex64],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    thermal_lanczos_iteration(operator, initial, inverse_temperatures, options)
+}
+
+pub fn linear_combination_qt(
+    basis: &[Vec<Complex64>],
+    coefficients: &[Complex64],
+) -> Result<Vec<Complex64>> {
+    if basis.len() != coefficients.len() || basis.is_empty() {
+        return Err(QuSpinError::DimensionMismatch(
+            "basis and coefficient counts must be equal and nonzero".into(),
+        ));
+    }
+    let dimension = basis[0].len();
+    if basis.iter().any(|vector| vector.len() != dimension) {
+        return Err(QuSpinError::DimensionMismatch(
+            "linear-combination basis vectors must have equal lengths".into(),
+        ));
+    }
+    let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+    for (coefficient, vector) in coefficients.iter().zip(basis) {
+        for (value, basis_value) in output.iter_mut().zip(vector) {
+            *value += *coefficient * *basis_value;
+        }
+    }
+    Ok(output)
 }
 
 fn time_derivative<O>(
