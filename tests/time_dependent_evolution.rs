@@ -2,7 +2,8 @@ use approx::assert_abs_diff_eq;
 use quspin::Complex64;
 use quspin::operator::{Dynamic, DynamicComponent, Hamiltonian, MatrixFormat, Operator};
 use quspin::solve::{
-    EvolutionOptions, evolve_batch, evolve_time_dependent, evolve_time_dependent_batch,
+    EvolutionOptions, RhsEvolutionOptions, evolve_batch, evolve_density, evolve_rhs,
+    evolve_time_dependent, evolve_time_dependent_batch,
 };
 
 fn options(times: Vec<f64>) -> EvolutionOptions {
@@ -91,4 +92,54 @@ fn static_and_dynamic_batches_equal_independent_columns() {
         evolve_time_dependent_batch(&sigma_z_drive(), &columns, options(vec![0.0, 0.5])).unwrap();
     assert_abs_diff_eq!(norm(&dynamic_batch.states[1][0]), 1.0, epsilon = 1.0e-12);
     assert_abs_diff_eq!(norm(&dynamic_batch.states[1][1]), 1.0, epsilon = 1.0e-12);
+}
+
+#[test]
+fn callable_rhs_and_density_modes_preserve_their_physical_invariants() {
+    let rhs_options = RhsEvolutionOptions {
+        times: vec![0.0, 0.2, 1.0],
+        max_step: 0.002,
+        max_substeps: 2_000,
+        normalize: false,
+    };
+    let trajectory = evolve_rhs(
+        &[Complex64::new(1.0, 0.0)],
+        0.0,
+        rhs_options.clone(),
+        |_, state, output| {
+            output[0] = Complex64::new(0.0, -2.0) * state[0];
+            Ok(())
+        },
+    )
+    .unwrap();
+    let expected = Complex64::new(0.0, -2.0).exp();
+    assert_abs_diff_eq!(trajectory.states[2][0].re, expected.re, epsilon = 1.0e-11);
+    assert_abs_diff_eq!(trajectory.states[2][0].im, expected.im, epsilon = 1.0e-11);
+
+    let hamiltonian = Operator::from_dense(
+        2,
+        2,
+        vec![
+            Complex64::new(-1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(1.0, 0.0),
+        ],
+    )
+    .unwrap();
+    let density = vec![
+        Complex64::new(0.5, 0.0),
+        Complex64::new(0.5, 0.0),
+        Complex64::new(0.5, 0.0),
+        Complex64::new(0.5, 0.0),
+    ];
+    let evolved = evolve_density(&hamiltonian, &density, rhs_options).unwrap();
+    let final_density = &evolved.states[2];
+    assert_abs_diff_eq!(
+        final_density[0].re + final_density[3].re,
+        1.0,
+        epsilon = 1.0e-11
+    );
+    assert_abs_diff_eq!(final_density[1].re, final_density[2].re, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(final_density[1].im, -final_density[2].im, epsilon = 1.0e-12);
 }

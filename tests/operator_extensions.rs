@@ -5,9 +5,9 @@ use approx::assert_abs_diff_eq;
 use quspin::basis::SpinBasis1D;
 use quspin::operator::{
     Coupling, DynamicTerm, ExpOp, Hamiltonian, LinearOperator, MatrixFormat, Operator,
-    OperatorBuilder, OperatorTerm, QuantumComponent, QuantumOperator, Static,
-    TimeDependentOperator, anticommutator, commutator, is_exp_op, is_hamiltonian,
-    is_quantum_linear_operator, is_quantum_operator,
+    OperatorBuilder, OperatorTerm, QuantumComponent, QuantumLinearOperator, QuantumOperator,
+    Static, TimeDependentOperator, TimeOperator, anticommutator, commutator, is_exp_op,
+    is_hamiltonian, is_quantum_linear_operator, is_quantum_operator,
 };
 use quspin::{Complex64, QuSpinError};
 
@@ -167,9 +167,103 @@ fn runtime_compatibility_predicates_identify_public_operator_families() {
     let hamiltonian = Hamiltonian::<Static>::new(operator.clone()).unwrap();
     let quantum =
         QuantumOperator::new([QuantumComponent::with_default("a", operator, 1.0)]).unwrap();
+    let linear = QuantumLinearOperator::from_operator(
+        Operator::from_dense(1, 1, vec![Complex64::new(1.0, 0.0)]).unwrap(),
+    )
+    .unwrap();
     assert!(is_exp_op(&exp));
     assert!(is_hamiltonian(&hamiltonian));
     assert!(is_quantum_operator(&quantum));
-    assert!(is_quantum_linear_operator(&quantum));
+    assert!(!is_quantum_linear_operator(&quantum));
+    assert!(is_quantum_linear_operator(&linear));
     assert_eq!(quantum.component_names().collect::<Vec<_>>(), vec!["a"]);
+}
+
+#[test]
+fn quantum_linear_operator_applies_and_replaces_its_diagonal_correction() {
+    let base = Operator::from_dense(
+        2,
+        2,
+        vec![
+            Complex64::new(0.0, 0.0),
+            Complex64::new(1.0, 0.0),
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        ],
+    )
+    .unwrap();
+    let mut linear = QuantumLinearOperator::new(
+        base,
+        vec![Complex64::new(0.2, 0.0), Complex64::new(-0.3, 0.0)],
+    )
+    .unwrap();
+    let mut output = vec![Complex64::new(0.0, 0.0); 2];
+    linear
+        .apply(
+            &[Complex64::new(2.0, 0.0), Complex64::new(-1.0, 0.0)],
+            &mut output,
+        )
+        .unwrap();
+    assert_complex_close(output[0], Complex64::new(-0.6, 0.0));
+    assert_complex_close(output[1], Complex64::new(2.3, 0.0));
+    linear
+        .set_diagonal(vec![Complex64::new(0.0, 0.0); 2])
+        .unwrap();
+    assert_eq!(
+        linear.materialize(MatrixFormat::Dense).unwrap().to_dense(),
+        vec![
+            Complex64::new(0.0, 0.0),
+            Complex64::new(1.0, 0.0),
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        ]
+    );
+}
+
+#[test]
+fn time_operator_algebra_matches_materialized_matrix_arithmetic() {
+    let basis = SpinBasis1D::builder(1).pauli(true).build().unwrap();
+    let dynamic = OperatorBuilder::on(&basis)
+        .build_dynamic(
+            [DynamicTerm::new(
+                OperatorTerm::new("x", [Coupling::new(1.0, vec![0])]).unwrap(),
+                |time| Complex64::new(time.sin(), 0.0),
+            )],
+            MatrixFormat::Csc,
+        )
+        .unwrap();
+    let static_h = Hamiltonian::<Static>::new(
+        OperatorBuilder::on(&basis)
+            .term(OperatorTerm::new("z", [Coupling::new(0.3, vec![0])]).unwrap())
+            .build(MatrixFormat::Csc)
+            .unwrap(),
+    )
+    .unwrap();
+    let left = TimeOperator::from_operator(Arc::new(dynamic));
+    let right = TimeOperator::from_operator(Arc::new(static_h));
+    let sum = left.add(&right).unwrap();
+    let product = left.product(&right).unwrap();
+    let commuted = left.commutator(&right).unwrap();
+    for time in [0.0, 0.2, 0.9] {
+        let left_matrix = left.evaluate(time, MatrixFormat::Dense).unwrap();
+        let right_matrix = right.evaluate(time, MatrixFormat::Dense).unwrap();
+        assert_eq!(
+            sum.evaluate(time, MatrixFormat::Dense).unwrap().to_dense(),
+            left_matrix.add(&right_matrix).unwrap().to_dense()
+        );
+        assert_eq!(
+            product
+                .evaluate(time, MatrixFormat::Dense)
+                .unwrap()
+                .to_dense(),
+            left_matrix.product(&right_matrix).unwrap().to_dense()
+        );
+        assert_eq!(
+            commuted
+                .evaluate(time, MatrixFormat::Dense)
+                .unwrap()
+                .to_dense(),
+            commutator(&left_matrix, &right_matrix).unwrap().to_dense()
+        );
+    }
 }

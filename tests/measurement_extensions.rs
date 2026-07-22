@@ -1,10 +1,12 @@
 use approx::assert_abs_diff_eq;
 use quspin::Complex64;
 use quspin::measure::{
-    EntropyOrder, array_to_ints, array_to_states, diagonal_ensemble, ed_density_vs_time,
-    ed_state_vs_time, entanglement_entropy, expectation, ints_to_array, kl_divergence,
-    matrix_element, mean_level_spacing, observables_vs_time, partial_trace, quantum_fluctuation,
-    states_to_array,
+    EntropyOrder, array_to_ints, array_to_states, density_expectation, diagonal_ensemble,
+    diagonal_ensemble_density, diagonal_ensemble_observable, ed_density_vs_time, ed_state_vs_time,
+    energy_window_indices, entanglement_entropy, entanglement_entropy_batch, entanglement_spectrum,
+    entanglement_spectrum_density, expectation, ints_to_array, kl_divergence, matrix_element,
+    mean_level_spacing, observables_vs_time, partial_trace, partial_trace_density,
+    quantum_fluctuation, states_to_array,
 };
 use quspin::operator::Operator;
 use quspin::solve::StateTrajectory;
@@ -151,4 +153,71 @@ fn exact_eigenbasis_evolution_supports_pure_and_mixed_states() {
     let evolved = ed_density_vs_time(&density, &eigenvalues, &eigenvectors, &[0.5]).unwrap();
     assert_abs_diff_eq!(evolved[0][0].re + evolved[0][3].re, 1.0, epsilon = 1.0e-12);
     assert_abs_diff_eq!(evolved[0][1].norm(), 0.5, epsilon = 1.0e-12);
+}
+
+#[test]
+fn mixed_and_batched_measurements_share_the_pure_state_limits() {
+    let amplitude = 1.0 / 2.0_f64.sqrt();
+    let bell = vec![
+        Complex64::new(amplitude, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(amplitude, 0.0),
+    ];
+    let density: Vec<_> = bell
+        .iter()
+        .flat_map(|left| bell.iter().map(move |right| *left * right.conj()))
+        .collect();
+    assert_eq!(
+        partial_trace_density(&density, 2, 2).unwrap(),
+        partial_trace(&bell, 2, 2).unwrap()
+    );
+    let pure_spectrum = entanglement_spectrum(&bell, 2, 2).unwrap();
+    let mixed_spectrum = entanglement_spectrum_density(&density, 2, 2).unwrap();
+    for (actual, expected) in mixed_spectrum.iter().zip(pure_spectrum) {
+        assert_abs_diff_eq!(actual, &expected, epsilon = 1.0e-12);
+    }
+    let product = vec![
+        Complex64::new(1.0, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.0, 0.0),
+    ];
+    let batch =
+        entanglement_entropy_batch(&[bell, product], 2, 2, EntropyOrder::VonNeumann).unwrap();
+    assert_abs_diff_eq!(batch[0], 2.0_f64.ln(), epsilon = 1.0e-12);
+    assert_abs_diff_eq!(batch[1], 0.0, epsilon = 1.0e-12);
+}
+
+#[test]
+fn density_diagonal_ensemble_and_observable_are_consistent() {
+    let eigenvectors = vec![
+        vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
+        vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
+    ];
+    let density = vec![
+        Complex64::new(0.75, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.25, 0.0),
+    ];
+    let ensemble = diagonal_ensemble_density(&[-1.0, 1.0], &eigenvectors, &density).unwrap();
+    assert_eq!(ensemble.probabilities, vec![0.75, 0.25]);
+    let z = sigma_z();
+    assert_abs_diff_eq!(
+        density_expectation(&z, &density).unwrap().re,
+        0.5,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        diagonal_ensemble_observable(&ensemble, &eigenvectors, &z)
+            .unwrap()
+            .re,
+        0.5,
+        epsilon = 1.0e-12
+    );
+    assert_eq!(
+        energy_window_indices(&[-2.0, -0.1, 0.2, 3.0], 0.0, 0.25).unwrap(),
+        vec![1, 2]
+    );
 }

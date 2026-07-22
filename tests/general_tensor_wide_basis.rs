@@ -2,13 +2,15 @@ use approx::assert_abs_diff_eq;
 use quspin::Complex64;
 use quspin::basis::{
     Basis, BasisProjector, BosonBasis1D, ClosureSymmetryMap, GeneralBasis, PhotonBasis,
-    SpinBasis1D, StateStorage, SymmetrySector, TensorBasis, U256, UserBasis,
-    basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and, bitwise_leftshift, bitwise_not,
-    bitwise_or, bitwise_rightshift, bitwise_xor, coherent_state, get_basis_type, photon_hspace_dim,
-    python_int_to_basis_int,
+    SpinBasis1D, SpinfulFermionBasis1D, StateStorage, SymmetrySector, TensorBasis, U256, UserBasis,
+    WideSpinBasis256, basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and,
+    bitwise_leftshift, bitwise_not, bitwise_or, bitwise_rightshift, bitwise_xor, coherent_state,
+    get_basis_type, photon_hspace_dim, python_int_to_basis_int,
 };
 use quspin::measure::project_operator;
 use quspin::operator::{Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn periodic_heisenberg(sites: usize) -> Vec<OperatorTerm> {
     let mut zz = Vec::new();
@@ -84,6 +86,62 @@ fn closure_symmetry_map_reproduces_the_builtin_translation_sector() {
         assert_abs_diff_eq!(actual.re, expected.re, epsilon = 1.0e-12);
         assert_abs_diff_eq!(actual.im, expected.im, epsilon = 1.0e-12);
     }
+}
+
+#[test]
+fn cross_sector_builder_reduces_into_the_target_symmetry_sector() {
+    let translation = || {
+        ClosureSymmetryMap::new(4, |state: u128| {
+            Ok((
+                ((state << 1) & 0b1111) | (state >> 3),
+                Complex64::new(1.0, 0.0),
+            ))
+        })
+        .unwrap()
+    };
+    let source = GeneralBasis::new(
+        SpinBasis1D::builder(4).up(0).build().unwrap(),
+        SymmetrySector::new().with_map(translation(), 0),
+    )
+    .unwrap();
+    let target = GeneralBasis::new(
+        SpinBasis1D::builder(4).up(1).build().unwrap(),
+        SymmetrySector::new().with_map(translation(), 1),
+    )
+    .unwrap();
+    let couplings = (0..4)
+        .map(|site| {
+            Coupling::new(
+                Complex64::from_polar(1.0, -std::f64::consts::TAU * site as f64 / 4.0),
+                vec![site],
+            )
+        })
+        .collect::<Vec<_>>();
+    let term = OperatorTerm::new("+", couplings).unwrap();
+    let reduced = OperatorBuilder::between(&source, &target)
+        .term(term.clone())
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let full = OperatorBuilder::between(source.parent(), target.parent())
+        .term(term)
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let source_projector = BasisProjector::from_general(&source).unwrap();
+    let target_projector = BasisProjector::from_general(&target).unwrap();
+    let mut full_source = vec![Complex64::new(0.0, 0.0); source_projector.source_dimension()];
+    source_projector
+        .apply(&[Complex64::new(1.0, 0.0)], &mut full_source)
+        .unwrap();
+    let mut full_target = vec![Complex64::new(0.0, 0.0); target_projector.source_dimension()];
+    full.apply(&full_source, &mut full_target).unwrap();
+    let mut expected = vec![Complex64::new(0.0, 0.0); target_projector.reduced_dimension()];
+    target_projector
+        .project(&full_target, &mut expected)
+        .unwrap();
+    let actual = reduced.to_dense()[0];
+    assert!(actual.norm() > 1.0);
+    assert_abs_diff_eq!(actual.re, expected[0].re, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(actual.im, expected[0].im, epsilon = 1.0e-12);
 }
 
 #[test]
@@ -181,4 +239,124 @@ fn wide_integer_helpers_and_photon_utilities_cover_python_helper_semantics() {
     assert_eq!(photon_hspace_dim(2, Some(1), Some(2)).unwrap(), 3);
     assert_eq!(photon_hspace_dim(4, None, Some(3)).unwrap(), 64);
     assert_eq!(photon_hspace_dim(8, Some(4), None).unwrap(), 163);
+}
+
+#[test]
+fn user_basis_can_defer_state_enumeration_until_materialization() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = calls.clone();
+    let builder = UserBasis::builder(3)
+        .deferred_states(move || {
+            factory_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0_u128, 1, 2])
+        })
+        .operator('I', |state, _| Ok(Some((state, Complex64::new(1.0, 0.0)))));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let basis = builder.materialize().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(basis.len(), 3);
+}
+
+#[test]
+fn spinful_sector_unions_and_majorana_operators_obey_clifford_algebra() {
+    let union = SpinfulFermionBasis1D::builder(2)
+        .particle_sectors([(1, 0), (0, 1)])
+        .build()
+        .unwrap();
+    assert_eq!(union.len(), 4);
+
+    let basis = SpinfulFermionBasis1D::builder(1).build().unwrap();
+    let x = OperatorBuilder::on(&basis)
+        .term(OperatorTerm::new("x|", [Coupling::new(1.0, vec![0])]).unwrap())
+        .build(MatrixFormat::Dense)
+        .unwrap();
+    let y = OperatorBuilder::on(&basis)
+        .term(OperatorTerm::new("y|", [Coupling::new(1.0, vec![0])]).unwrap())
+        .build(MatrixFormat::Dense)
+        .unwrap();
+    assert_eq!(x.adjoint().unwrap().to_dense(), x.to_dense());
+    assert_eq!(y.adjoint().unwrap().to_dense(), y.to_dense());
+    assert_eq!(
+        x.pow(2).unwrap().diagonal(),
+        vec![Complex64::new(1.0, 0.0); 4]
+    );
+    assert_eq!(
+        y.pow(2).unwrap().diagonal(),
+        vec![Complex64::new(1.0, 0.0); 4]
+    );
+    assert_eq!(
+        x.product(&y)
+            .unwrap()
+            .add(&y.product(&x).unwrap())
+            .unwrap()
+            .nnz(),
+        0
+    );
+}
+
+#[test]
+fn branching_and_parallel_user_basis_paths_preserve_transition_semantics() {
+    let serial = UserBasis::builder(9)
+        .state_filter(|state| state.count_ones() == 2 && state & (state << 1) == 0)
+        .unwrap()
+        .operator('n', |state, site| {
+            Ok(((state >> site) & 1 == 1).then_some((state, Complex64::new(1.0, 0.0))))
+        })
+        .build()
+        .unwrap();
+    let parallel = UserBasis::builder(9)
+        .state_filter_parallel(|state| state.count_ones() == 2 && state & (state << 1) == 0)
+        .unwrap()
+        .operator('n', |state, site| {
+            Ok(((state >> site) & 1 == 1).then_some((state, Complex64::new(1.0, 0.0))))
+        })
+        .build()
+        .unwrap();
+    assert_eq!(serial.len(), parallel.len());
+    for index in 0..serial.len() {
+        assert_eq!(serial.state(index).unwrap(), parallel.state(index).unwrap());
+    }
+
+    let qutrit = UserBasis::builder(1)
+        .states([0_u128, 1, 2])
+        .branching_operator('a', |state, _| {
+            Ok((0_u128..3)
+                .map(|target| (target, Complex64::new((target + 1) as f64, state as f64)))
+                .collect())
+        })
+        .build()
+        .unwrap();
+    let matrix = OperatorBuilder::on(&qutrit)
+        .term(OperatorTerm::new("a", [Coupling::new(1.0, vec![0])]).unwrap())
+        .checks(quspin::operator::AssemblyChecks {
+            hermiticity: false,
+            particle_conservation: false,
+            symmetry_compatibility: true,
+        })
+        .build(MatrixFormat::Csc)
+        .unwrap()
+        .to_dense();
+    for row in 0..3 {
+        for column in 0..3 {
+            assert_eq!(
+                matrix[row * 3 + column],
+                Complex64::new((row + 1) as f64, column as f64)
+            );
+        }
+    }
+}
+
+#[test]
+fn wide_spin_basis_assembles_high_site_actions_without_u128_conversion() {
+    let basis = WideSpinBasis256::new(201, Some(1), false).unwrap();
+    assert_eq!(basis.len(), 201);
+    let high = U256::zero().with_bit(200, true).unwrap();
+    let source = basis.index(high).unwrap();
+    let lowering =
+        OperatorBuilder::between(&basis, &WideSpinBasis256::new(201, Some(0), false).unwrap())
+            .term(OperatorTerm::new("-", [Coupling::new(1.0, vec![200])]).unwrap())
+            .build(MatrixFormat::Csc)
+            .unwrap();
+    assert_eq!(lowering.shape(), (1, 201));
+    assert_eq!(lowering.to_dense()[source], Complex64::new(1.0, 0.0));
 }

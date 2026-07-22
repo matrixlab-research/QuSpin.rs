@@ -4,7 +4,6 @@ use num_complex::Complex64;
 
 use crate::operator::{
     LinearOperator, MatrixFormat, Operator, TimeDependentOperator, check_apply_shape,
-    materialize_dense,
 };
 use crate::{QuSpinError, Result};
 
@@ -77,6 +76,45 @@ impl LinearOperator for BlockOps {
         }
         Ok(())
     }
+
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        let mut entries = Vec::new();
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let Some(block_entries) = block.stored_triplets()? else {
+                return Ok(None);
+            };
+            let offset = self.offsets[block_index];
+            entries.extend(
+                block_entries
+                    .into_iter()
+                    .map(|(row, column, value)| (offset + row, offset + column, value)),
+            );
+        }
+        Ok(Some(entries))
+    }
+}
+
+fn streamed_triplets(
+    operator: &(impl LinearOperator + ?Sized),
+) -> Result<Vec<(usize, usize, Complex64)>> {
+    if let Some(entries) = operator.stored_triplets()? {
+        return Ok(entries);
+    }
+    let shape = operator.shape();
+    let mut input = vec![Complex64::new(0.0, 0.0); shape.1];
+    let mut output = vec![Complex64::new(0.0, 0.0); shape.0];
+    let mut entries = Vec::new();
+    for column in 0..shape.1 {
+        input.fill(Complex64::new(0.0, 0.0));
+        input[column] = Complex64::new(1.0, 0.0);
+        operator.apply(&input, &mut output)?;
+        for (row, value) in output.iter().copied().enumerate() {
+            if value.norm() > f64::EPSILON {
+                entries.push((row, column, value));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 pub fn block_diag_hamiltonian(
@@ -88,17 +126,12 @@ pub fn block_diag_hamiltonian(
     let dimension = offsets.last().copied().unwrap_or_default();
     let mut triplets = Vec::new();
     for (block_index, block) in blocks.iter().enumerate() {
-        let block_dimension = block.shape().0;
-        let dense = materialize_dense(block.as_ref())?;
         let offset = offsets[block_index];
-        for row in 0..block_dimension {
-            for column in 0..block_dimension {
-                let value = dense[row * block_dimension + column];
-                if value.norm() > f64::EPSILON {
-                    triplets.push((offset + row, offset + column, value));
-                }
-            }
-        }
+        triplets.extend(
+            streamed_triplets(block.as_ref())?
+                .into_iter()
+                .map(|(row, column, value)| (offset + row, offset + column, value)),
+        );
     }
     Operator::from_triplets(dimension, dimension, triplets, format)
 }

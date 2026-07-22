@@ -185,6 +185,58 @@ pub fn partial_trace(
     Ok(density)
 }
 
+/// Reduced density matrix of the first factor for a row-major mixed state.
+pub fn partial_trace_density(
+    density: &[Complex64],
+    subsystem_dimension: usize,
+    environment_dimension: usize,
+) -> Result<Vec<Complex64>> {
+    let dimension = subsystem_dimension
+        .checked_mul(environment_dimension)
+        .ok_or_else(|| {
+            QuSpinError::DimensionMismatch("tensor-product dimension overflow".into())
+        })?;
+    if subsystem_dimension == 0
+        || environment_dimension == 0
+        || density.len() != dimension.saturating_mul(dimension)
+    {
+        return Err(QuSpinError::DimensionMismatch(
+            "density shape must match the bipartite Hilbert space".into(),
+        ));
+    }
+    let trace: Complex64 = (0..dimension)
+        .map(|index| density[index * dimension + index])
+        .sum();
+    if trace.im.abs() > 1.0e-10 || !trace.re.is_finite() || trace.re <= f64::EPSILON {
+        return Err(QuSpinError::InvalidOptions(
+            "density matrix must have a positive real trace".into(),
+        ));
+    }
+    for row in 0..dimension {
+        for column in 0..dimension {
+            if (density[row * dimension + column] - density[column * dimension + row].conj()).norm()
+                > 1.0e-10
+            {
+                return Err(QuSpinError::InvalidOptions(
+                    "density matrix must be Hermitian".into(),
+                ));
+            }
+        }
+    }
+    let mut reduced = vec![Complex64::new(0.0, 0.0); subsystem_dimension * subsystem_dimension];
+    for left in 0..subsystem_dimension {
+        for right in 0..subsystem_dimension {
+            for environment in 0..environment_dimension {
+                let row = left * environment_dimension + environment;
+                let column = right * environment_dimension + environment;
+                reduced[left * subsystem_dimension + right] +=
+                    density[row * dimension + column] / trace.re;
+            }
+        }
+    }
+    Ok(reduced)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EntropyOrder {
     VonNeumann,
@@ -232,6 +284,79 @@ pub fn entanglement_entropy(
             .ln()
             / (1.0 - alpha)),
     }
+}
+
+fn density_spectrum(density: Vec<Complex64>, dimension: usize) -> Result<Vec<f64>> {
+    let operator = Operator::from_dense(dimension, dimension, density)?;
+    let spectrum = eigh(&operator)?;
+    let mut probabilities = Vec::with_capacity(dimension);
+    for value in spectrum.eigenvalues {
+        if value < -1.0e-10 {
+            return Err(QuSpinError::InvalidOptions(
+                "density matrix is not positive semidefinite".into(),
+            ));
+        }
+        probabilities.push(value.max(0.0));
+    }
+    Ok(probabilities)
+}
+
+pub fn entanglement_spectrum(
+    state: &[Complex64],
+    subsystem_dimension: usize,
+    environment_dimension: usize,
+) -> Result<Vec<f64>> {
+    density_spectrum(
+        partial_trace(state, subsystem_dimension, environment_dimension)?,
+        subsystem_dimension,
+    )
+}
+
+pub fn entanglement_spectrum_density(
+    density: &[Complex64],
+    subsystem_dimension: usize,
+    environment_dimension: usize,
+) -> Result<Vec<f64>> {
+    density_spectrum(
+        partial_trace_density(density, subsystem_dimension, environment_dimension)?,
+        subsystem_dimension,
+    )
+}
+
+pub fn entanglement_entropy_batch(
+    states: &[Vec<Complex64>],
+    subsystem_dimension: usize,
+    environment_dimension: usize,
+    order: EntropyOrder,
+) -> Result<Vec<f64>> {
+    states
+        .iter()
+        .map(|state| entanglement_entropy(state, subsystem_dimension, environment_dimension, order))
+        .collect()
+}
+
+pub fn density_expectation(
+    operator: &(impl LinearOperator + ?Sized),
+    density: &[Complex64],
+) -> Result<Complex64> {
+    let shape = operator.shape();
+    if shape.0 != shape.1 || density.len() != shape.0.saturating_mul(shape.0) {
+        return Err(QuSpinError::DimensionMismatch(
+            "density expectation requires a square operator and matching density".into(),
+        ));
+    }
+    let dimension = shape.0;
+    let mut column = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut applied = vec![Complex64::new(0.0, 0.0); dimension];
+    let mut trace = Complex64::new(0.0, 0.0);
+    for density_column in 0..dimension {
+        for row in 0..dimension {
+            column[row] = density[row * dimension + density_column];
+        }
+        operator.apply(&column, &mut applied)?;
+        trace += applied[density_column];
+    }
+    Ok(trace)
 }
 
 pub fn observables_vs_time(
@@ -368,34 +493,14 @@ pub struct DiagonalEnsemble {
     pub entropy: f64,
 }
 
-pub fn diagonal_ensemble(
+fn summarize_diagonal_probabilities(
     eigenvalues: &[f64],
-    eigenvectors: &[Vec<Complex64>],
-    initial: &[Complex64],
+    mut probabilities: Vec<f64>,
 ) -> Result<DiagonalEnsemble> {
-    if eigenvalues.len() != eigenvectors.len()
-        || eigenvectors
-            .iter()
-            .any(|vector| vector.len() != initial.len())
-    {
-        return Err(QuSpinError::DimensionMismatch(
-            "eigensystem and initial state dimensions do not match".into(),
-        ));
-    }
-    let initial_norm = inner(initial, initial).re;
-    if !initial_norm.is_finite() || initial_norm <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
-            "initial state must have positive finite norm".into(),
-        ));
-    }
-    let mut probabilities: Vec<_> = eigenvectors
-        .iter()
-        .map(|vector| inner(vector, initial).norm_sqr() / initial_norm)
-        .collect();
     let probability_sum = probabilities.iter().sum::<f64>();
-    if probability_sum <= f64::EPSILON {
+    if probability_sum <= f64::EPSILON || !probability_sum.is_finite() {
         return Err(QuSpinError::InvalidOptions(
-            "eigenvectors have no overlap with the initial state".into(),
+            "eigenvectors have no finite overlap with the initial state".into(),
         ));
     }
     for probability in &mut probabilities {
@@ -422,6 +527,122 @@ pub fn diagonal_ensemble(
         energy_variance,
         entropy,
     })
+}
+
+pub fn diagonal_ensemble(
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<Complex64>],
+    initial: &[Complex64],
+) -> Result<DiagonalEnsemble> {
+    if eigenvalues.len() != eigenvectors.len()
+        || eigenvectors
+            .iter()
+            .any(|vector| vector.len() != initial.len())
+    {
+        return Err(QuSpinError::DimensionMismatch(
+            "eigensystem and initial state dimensions do not match".into(),
+        ));
+    }
+    let initial_norm = inner(initial, initial).re;
+    if !initial_norm.is_finite() || initial_norm <= f64::EPSILON {
+        return Err(QuSpinError::InvalidOptions(
+            "initial state must have positive finite norm".into(),
+        ));
+    }
+    let probabilities: Vec<_> = eigenvectors
+        .iter()
+        .map(|vector| inner(vector, initial).norm_sqr() / initial_norm)
+        .collect();
+    summarize_diagonal_probabilities(eigenvalues, probabilities)
+}
+
+pub fn diagonal_ensemble_density(
+    eigenvalues: &[f64],
+    eigenvectors: &[Vec<Complex64>],
+    initial_density: &[Complex64],
+) -> Result<DiagonalEnsemble> {
+    let dimension = eigenvalues.len();
+    if eigenvectors.len() != dimension
+        || eigenvectors.iter().any(|vector| vector.len() != dimension)
+        || initial_density.len() != dimension.saturating_mul(dimension)
+    {
+        return Err(QuSpinError::DimensionMismatch(
+            "eigensystem and initial density dimensions do not match".into(),
+        ));
+    }
+    let trace: Complex64 = (0..dimension)
+        .map(|index| initial_density[index * dimension + index])
+        .sum();
+    if trace.im.abs() > 1.0e-10 || !trace.re.is_finite() || trace.re <= f64::EPSILON {
+        return Err(QuSpinError::InvalidOptions(
+            "initial density must have a positive real trace".into(),
+        ));
+    }
+    let probabilities = eigenvectors
+        .iter()
+        .map(|vector| {
+            let mut value = Complex64::new(0.0, 0.0);
+            for row in 0..dimension {
+                for column in 0..dimension {
+                    value += vector[row].conj()
+                        * initial_density[row * dimension + column]
+                        * vector[column];
+                }
+            }
+            if value.im.abs() > 1.0e-10 || value.re < -1.0e-10 {
+                Err(QuSpinError::InvalidOptions(
+                    "initial density is not positive in the supplied eigenbasis".into(),
+                ))
+            } else {
+                Ok(value.re.max(0.0) / trace.re)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    summarize_diagonal_probabilities(eigenvalues, probabilities)
+}
+
+pub fn diagonal_ensemble_observable(
+    ensemble: &DiagonalEnsemble,
+    eigenvectors: &[Vec<Complex64>],
+    observable: &(impl LinearOperator + ?Sized),
+) -> Result<Complex64> {
+    if ensemble.probabilities.len() != eigenvectors.len()
+        || eigenvectors.iter().any(|vector| {
+            vector.len() != observable.shape().0 || observable.shape().0 != observable.shape().1
+        })
+    {
+        return Err(QuSpinError::DimensionMismatch(
+            "diagonal ensemble, eigenvectors, and observable do not match".into(),
+        ));
+    }
+    ensemble
+        .probabilities
+        .iter()
+        .zip(eigenvectors)
+        .try_fold(Complex64::new(0.0, 0.0), |total, (probability, vector)| {
+            Ok(total + *probability * expectation(observable, vector)?)
+        })
+}
+
+pub fn energy_window_indices(
+    eigenvalues: &[f64],
+    center: f64,
+    half_width: f64,
+) -> Result<Vec<usize>> {
+    if !center.is_finite()
+        || !half_width.is_finite()
+        || half_width < 0.0
+        || eigenvalues.iter().any(|value| !value.is_finite())
+    {
+        return Err(QuSpinError::InvalidOptions(
+            "energy-window inputs must be finite and the half-width nonnegative".into(),
+        ));
+    }
+    Ok(eigenvalues
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| ((*value - center).abs() <= half_width).then_some(index))
+        .collect())
 }
 
 pub fn kl_divergence(left: &[f64], right: &[f64]) -> Result<f64> {

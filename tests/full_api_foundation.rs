@@ -3,7 +3,10 @@ use quspin::basis::{Basis, SpinBasis1D, SpinlessFermionBasis1D};
 use quspin::operator::{
     Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorTerm,
 };
-use quspin::solve::{EigshOptions, SpectrumTarget, eigh, eigsh};
+use quspin::solve::{
+    EighOptions, EigshOptions, SpectrumTarget, eigh, eigh_with_options, eigsh, eigsh_values,
+    eigsh_with_initial,
+};
 use quspin::{Complex64, QuSpinError};
 
 fn single_site_operator(basis: &SpinBasis1D, operator: &str) -> Vec<Complex64> {
@@ -277,4 +280,32 @@ fn eigsh_covers_magnitude_and_both_end_targets() {
         target_values(&operator, SpectrumTarget::BothEnds, 3),
         vec![-5.0, 3.0, 7.0]
     );
+    let without_vectors = eigh_with_options(
+        &operator,
+        EighOptions {
+            return_eigenvectors: false,
+        },
+    )
+    .unwrap();
+    assert!(without_vectors.eigenvectors.is_empty());
+    assert_eq!(without_vectors.eigenvalues.len(), 5);
+    assert_eq!(
+        eigsh_values(&operator, EigshOptions::smallest_algebraic(2),).unwrap(),
+        vec![-5.0, -2.0]
+    );
+
+    let large = Operator::from_triplets(
+        129,
+        129,
+        (0..129).map(|index| (index, index, Complex64::new(index as f64, 0.0))),
+        MatrixFormat::MatrixFree,
+    )
+    .unwrap();
+    let invalid_initial = eigsh_with_initial(
+        &large,
+        EigshOptions::smallest_algebraic(1),
+        &[Complex64::new(1.0, 0.0); 2],
+    )
+    .unwrap_err();
+    assert!(matches!(invalid_initial, QuSpinError::DimensionMismatch(_)));
 }

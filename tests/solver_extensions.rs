@@ -4,8 +4,9 @@ use approx::assert_abs_diff_eq;
 use quspin::Complex64;
 use quspin::operator::{ExpOp, LinearOperator, Operator};
 use quspin::solve::{
-    ExpmOptions, LanczosOptions, expm_multiply, ftlm_static_iteration, lanczos_full, lanczos_iter,
-    linear_combination_qt, ltlm_static_iteration,
+    ExpmMultiplyParallel, ExpmOptions, LanczosOptions, expm_multiply, ftlm_observable_iteration,
+    ftlm_static_iteration, lanczos_full, lanczos_iter, linear_combination_qt,
+    ltlm_observable_iteration, ltlm_static_iteration,
 };
 
 fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
@@ -148,4 +149,77 @@ fn thermal_lanczos_matches_an_exact_two_level_trace() {
         combined,
         vec![Complex64::new(2.0, 0.0), Complex64::new(0.0, -1.0)]
     );
+
+    let identity = diagonal(&[1.0, 1.0]);
+    let observables: Vec<(String, &dyn LinearOperator)> =
+        vec![("H".to_string(), &operator), ("I".to_string(), &identity)];
+    let observable_options = LanczosOptions {
+        krylov_dimension: 2,
+        tolerance: 1.0e-13,
+    };
+    let ftlm_observables = ftlm_observable_iteration(
+        &operator,
+        &initial,
+        &observables,
+        &[beta],
+        observable_options.clone(),
+    )
+    .unwrap();
+    let ltlm_observables = ltlm_observable_iteration(
+        &operator,
+        &initial,
+        &observables,
+        &[beta],
+        observable_options,
+    )
+    .unwrap();
+    assert_abs_diff_eq!(
+        ftlm_observables.values["I"][0].re,
+        ftlm_observables.identity[0],
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        ftlm_observables.values["H"][0].re / ftlm_observables.identity[0],
+        energy,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        ltlm_observables.values["H"][0].re / ltlm_observables.identity[0],
+        energy,
+        epsilon = 1.0e-12
+    );
+}
+
+#[test]
+fn reusable_exponential_plan_supports_batches_and_coefficient_updates() {
+    let generator = Arc::new(
+        Operator::from_dense(
+            2,
+            2,
+            vec![
+                Complex64::new(0.0, 0.0),
+                Complex64::new(-1.0, 0.0),
+                Complex64::new(1.0, 0.0),
+                Complex64::new(0.0, 0.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let mut plan =
+        ExpmMultiplyParallel::new(generator, Complex64::new(0.25, 0.0), 32, 1.0e-14, 100).unwrap();
+    let batch = plan
+        .apply_batch(&[
+            vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
+            vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
+        ])
+        .unwrap();
+    assert_abs_diff_eq!(batch[0][0].re, 0.25_f64.cos(), epsilon = 1.0e-13);
+    assert_abs_diff_eq!(batch[0][1].re, 0.25_f64.sin(), epsilon = 1.0e-13);
+    assert_abs_diff_eq!(batch[1][0].re, -0.25_f64.sin(), epsilon = 1.0e-13);
+    assert_abs_diff_eq!(batch[1][1].re, 0.25_f64.cos(), epsilon = 1.0e-13);
+    plan.set_coefficient(Complex64::new(0.0, -0.5)).unwrap();
+    let mut state = vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)];
+    plan.apply_in_place(&mut state).unwrap();
+    assert_abs_diff_eq!(state[0].re, 0.5_f64.cosh(), epsilon = 1.0e-12);
+    assert_abs_diff_eq!(state[1].im, -0.5_f64.sinh(), epsilon = 1.0e-12);
 }

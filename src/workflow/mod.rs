@@ -7,9 +7,15 @@ use crate::{QuSpinError, Result};
 
 /// Matrix-free Lindblad generator over column-major vectorized density matrices.
 pub struct LindbladGenerator {
-    hamiltonian: Arc<dyn LinearOperator>,
-    jumps: Vec<Arc<dyn LinearOperator>>,
+    hamiltonian: Vec<Complex64>,
+    jumps: Vec<LindbladJump>,
     dimension: usize,
+}
+
+struct LindbladJump {
+    operator: Vec<Complex64>,
+    adjoint: Vec<Complex64>,
+    product: Vec<Complex64>,
 }
 
 impl LindbladGenerator {
@@ -28,10 +34,25 @@ impl LindbladGenerator {
                 "all Lindblad jumps must match the Hamiltonian".into(),
             ));
         }
+        let dimension = shape.0;
+        let hamiltonian = materialize_dense(hamiltonian.as_ref())?;
+        let jumps = jumps
+            .into_iter()
+            .map(|jump| {
+                let operator = materialize_dense(jump.as_ref())?;
+                let adjoint = adjoint(&operator, dimension);
+                let product = multiply(&adjoint, &operator, dimension);
+                Ok(LindbladJump {
+                    operator,
+                    adjoint,
+                    product,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             hamiltonian,
             jumps,
-            dimension: shape.0,
+            dimension,
         })
     }
 }
@@ -93,25 +114,21 @@ impl LinearOperator for LindbladGenerator {
         check_apply_shape(self.shape(), input, output)?;
         let dimension = self.dimension;
         let density = column_major_to_row_major(input, dimension);
-        let hamiltonian = materialize_dense(self.hamiltonian.as_ref())?;
-        let h_rho = multiply(&hamiltonian, &density, dimension);
-        let rho_h = multiply(&density, &hamiltonian, dimension);
+        let h_rho = multiply(&self.hamiltonian, &density, dimension);
+        let rho_h = multiply(&density, &self.hamiltonian, dimension);
         let mut derivative: Vec<_> = h_rho
             .iter()
             .zip(&rho_h)
             .map(|(left, right)| Complex64::new(0.0, -1.0) * (*left - *right))
             .collect();
         for jump in &self.jumps {
-            let jump = materialize_dense(jump.as_ref())?;
-            let jump_adjoint = adjoint(&jump, dimension);
-            let jump_product = multiply(&jump_adjoint, &jump, dimension);
             let gain = multiply(
-                &multiply(&jump, &density, dimension),
-                &jump_adjoint,
+                &multiply(&jump.operator, &density, dimension),
+                &jump.adjoint,
                 dimension,
             );
-            let loss_left = multiply(&jump_product, &density, dimension);
-            let loss_right = multiply(&density, &jump_product, dimension);
+            let loss_left = multiply(&jump.product, &density, dimension);
+            let loss_right = multiply(&density, &jump.product, dimension);
             for index in 0..derivative.len() {
                 derivative[index] += gain[index] - 0.5 * (loss_left[index] + loss_right[index]);
             }
