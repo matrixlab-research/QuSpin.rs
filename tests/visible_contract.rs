@@ -68,6 +68,40 @@ fn periodic_blockade(state: u128, sites: usize) -> bool {
     })
 }
 
+fn periodic_blockade_states(sites: usize) -> Vec<u128> {
+    fn extend(
+        site: usize,
+        sites: usize,
+        first_occupied: bool,
+        previous_occupied: bool,
+        state: u128,
+        output: &mut Vec<u128>,
+    ) {
+        if site == sites {
+            if !(first_occupied && previous_occupied) {
+                output.push(state);
+            }
+            return;
+        }
+        extend(site + 1, sites, first_occupied, false, state, output);
+        if !previous_occupied {
+            extend(
+                site + 1,
+                sites,
+                first_occupied || site == 0,
+                true,
+                state | (1_u128 << site),
+                output,
+            );
+        }
+    }
+
+    let mut states = Vec::new();
+    extend(0, sites, false, false, 0, &mut states);
+    states.sort_unstable();
+    states
+}
+
 #[test]
 fn error_categories_are_structured() {
     let basis = SpinBasis1D::builder(4).up(2).build().unwrap();
@@ -160,6 +194,162 @@ fn paper_scale_translation_xxz_sector_stays_sparse() {
     )
     .unwrap();
     assert!(result.residuals.iter().all(|residual| *residual < 2.0e-7));
+}
+
+#[test]
+fn paper_scale_xxz_lanczos_quench_preserves_norm() {
+    let sites = 16;
+    let basis = SpinBasis1D::builder(sites).up(8).build().unwrap();
+    assert_eq!(basis.len(), 12_870);
+    let bonds = 0..(sites - 1);
+    let hamiltonian = OperatorBuilder::on(&basis)
+        .terms([
+            OperatorTerm::new(
+                "+-",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(0.5, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "-+",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(0.5, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "zz",
+                bonds.map(|site| Coupling::new(0.8, vec![site, site + 1])),
+            )
+            .unwrap(),
+        ])
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let neel = (0..sites)
+        .step_by(2)
+        .fold(0_u128, |state, site| state | (1_u128 << site));
+    let mut initial = vec![c(0.0); basis.len()];
+    initial[basis.index(neel).unwrap()] = c(1.0);
+    let trajectory = evolve(
+        &hamiltonian,
+        &initial,
+        EvolutionOptions {
+            times: vec![0.7],
+            krylov_dimension: 80,
+            tolerance: 1.0e-10,
+            max_substeps: 100,
+            hamiltonian: true,
+        },
+    )
+    .unwrap();
+    let norm = trajectory.states[0]
+        .iter()
+        .map(Complex64::norm_sqr)
+        .sum::<f64>()
+        .sqrt();
+    assert!((norm - 1.0).abs() < 2.0e-9);
+}
+
+#[test]
+fn paper_scale_pxp_revival_uses_the_universal_user_basis_path() {
+    let sites = 24;
+    let basis = UserBasis::builder(sites)
+        .states(periodic_blockade_states(sites))
+        .operator('x', |state, site| {
+            Ok(Some((state ^ (1_u128 << site), Complex64::new(1.0, 0.0))))
+        })
+        .build()
+        .unwrap();
+    assert_eq!(basis.len(), 103_682);
+    let hamiltonian = OperatorBuilder::on(&basis)
+        .term(
+            OperatorTerm::new("x", (0..sites).map(|site| Coupling::new(1.0, vec![site]))).unwrap(),
+        )
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let neel = (0..sites)
+        .step_by(2)
+        .fold(0_u128, |state, site| state | (1_u128 << site));
+    let mut initial = vec![c(0.0); basis.len()];
+    initial[basis.index(neel).unwrap()] = c(1.0);
+    let trajectory = evolve(
+        &hamiltonian,
+        &initial,
+        EvolutionOptions {
+            times: vec![0.0, 2.4, 4.8, 7.2, 9.6],
+            krylov_dimension: 100,
+            tolerance: 1.0e-9,
+            max_substeps: 100,
+            hamiltonian: true,
+        },
+    )
+    .unwrap();
+    let mut fidelities = Vec::new();
+    for state in &trajectory.states {
+        let norm = state.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 5.0e-8, "evolved norm was {norm}");
+        fidelities.push(state[basis.index(neel).unwrap()].norm_sqr());
+    }
+    assert!(fidelities[2] > fidelities[1]);
+}
+
+#[test]
+fn paper_scale_bose_hubbard_mott_quench_reuses_one_krylov_projection() {
+    let sites = 11;
+    let basis = BosonBasis1D::builder(sites, 3)
+        .particles(sites)
+        .build()
+        .unwrap();
+    assert_eq!(basis.len(), 25_653);
+    let bonds = 0..(sites - 1);
+    let hamiltonian = OperatorBuilder::on(&basis)
+        .terms([
+            OperatorTerm::new(
+                "+-",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(-0.1, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "-+",
+                bonds
+                    .clone()
+                    .map(|site| Coupling::new(-0.1, vec![site, site + 1])),
+            )
+            .unwrap(),
+            OperatorTerm::new(
+                "nn",
+                (0..sites).map(|site| Coupling::new(0.5, vec![site, site])),
+            )
+            .unwrap(),
+            OperatorTerm::new("n", (0..sites).map(|site| Coupling::new(-0.5, vec![site]))).unwrap(),
+        ])
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    let mott = (0..sites).map(|site| 3_u128.pow(site as u32)).sum();
+    let mut initial = vec![c(0.0); basis.len()];
+    initial[basis.index(mott).unwrap()] = c(1.0);
+    let trajectory = evolve(
+        &hamiltonian,
+        &initial,
+        EvolutionOptions {
+            times: vec![0.0, 25.0, 50.0, 100.0, 200.0],
+            krylov_dimension: 100,
+            tolerance: 1.0e-9,
+            max_substeps: 1_000,
+            hamiltonian: true,
+        },
+    )
+    .unwrap();
+    let mut returns = Vec::new();
+    for state in &trajectory.states {
+        let norm = state.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 5.0e-8);
+        returns.push(state[basis.index(mott).unwrap()].norm_sqr());
+    }
+    assert!(returns[1..].iter().copied().fold(1.0_f64, f64::min) < 0.99);
 }
 
 #[test]

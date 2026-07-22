@@ -543,6 +543,126 @@ pub struct StateTrajectory {
     pub states: Vec<Vec<Complex64>>,
 }
 
+struct LanczosProjection {
+    initial_norm: f64,
+    basis: Vec<Vec<Complex64>>,
+    eigenvalues: Vec<f64>,
+    eigenvectors: DMatrix<f64>,
+}
+
+fn lanczos_projection(
+    operator: &(impl LinearOperator + ?Sized),
+    initial: &[Complex64],
+    dimension: usize,
+) -> Result<LanczosProjection> {
+    let initial_norm = vector_norm(initial);
+    if initial_norm <= f64::EPSILON {
+        return Ok(LanczosProjection {
+            initial_norm,
+            basis: Vec::new(),
+            eigenvalues: Vec::new(),
+            eigenvectors: DMatrix::zeros(0, 0),
+        });
+    }
+    let krylov_dimension = dimension.min(initial.len()).max(1);
+    let mut first = initial.to_vec();
+    for value in &mut first {
+        *value /= initial_norm;
+    }
+    let mut basis = Vec::with_capacity(krylov_dimension);
+    basis.push(first);
+    let mut alphas = Vec::with_capacity(krylov_dimension);
+    let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
+    let mut applied = vec![Complex64::new(0.0, 0.0); initial.len()];
+
+    for iteration in 0..krylov_dimension {
+        operator.apply(&basis[iteration], &mut applied)?;
+        let alpha = inner(&basis[iteration], &applied);
+        if alpha.im.abs() > 1.0e-10 {
+            return Err(QuSpinError::NonHermitian);
+        }
+        alphas.push(alpha.re);
+        for (value, basis_value) in applied.iter_mut().zip(&basis[iteration]) {
+            *value -= alpha.re * *basis_value;
+        }
+        if iteration > 0 {
+            for (value, previous) in applied.iter_mut().zip(&basis[iteration - 1]) {
+                *value -= betas[iteration - 1] * *previous;
+            }
+        }
+        // Exponential actions use the Hermitian three-term recurrence. Unlike
+        // the multi-eigenpair solver, they do not need global Ritz-vector
+        // orthogonality, so avoiding O(m^2 n) reorthogonalization is essential
+        // for the 100-step paper workflows.
+        let beta = vector_norm(&applied);
+        if iteration + 1 == krylov_dimension || beta <= 1.0e-14 {
+            break;
+        }
+        betas.push(beta);
+        for value in &mut applied {
+            *value /= beta;
+        }
+        basis.push(applied.clone());
+    }
+
+    let size = basis.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
+    for index in 0..size {
+        tridiagonal[(index, index)] = alphas[index];
+        if index + 1 < size {
+            tridiagonal[(index, index + 1)] = betas[index];
+            tridiagonal[(index + 1, index)] = betas[index];
+        }
+    }
+    let decomposition = SymmetricEigen::new(tridiagonal);
+    Ok(LanczosProjection {
+        initial_norm,
+        basis,
+        eigenvalues: decomposition.eigenvalues.as_slice().to_vec(),
+        eigenvectors: decomposition.eigenvectors,
+    })
+}
+
+fn projected_exponential_action(
+    projection: &LanczosProjection,
+    interval: f64,
+    hamiltonian: bool,
+    ambient_dimension: usize,
+) -> Vec<Complex64> {
+    if projection.basis.is_empty() {
+        return vec![Complex64::new(0.0, 0.0); ambient_dimension];
+    }
+    let size = projection.basis.len();
+    let mut coefficients = vec![Complex64::new(0.0, 0.0); size];
+    for eigen_index in 0..size {
+        let exponent = if hamiltonian {
+            Complex64::new(0.0, -interval * projection.eigenvalues[eigen_index]).exp()
+        } else {
+            Complex64::new(interval * projection.eigenvalues[eigen_index], 0.0).exp()
+        };
+        let weight = projection.initial_norm * projection.eigenvectors[(0, eigen_index)] * exponent;
+        for (basis_index, coefficient) in coefficients.iter_mut().enumerate() {
+            *coefficient += projection.eigenvectors[(basis_index, eigen_index)] * weight;
+        }
+    }
+    let mut output = vec![Complex64::new(0.0, 0.0); ambient_dimension];
+    for (coefficient, vector) in coefficients.iter().zip(&projection.basis) {
+        for (value, basis_value) in output.iter_mut().zip(vector) {
+            *value += *coefficient * *basis_value;
+        }
+    }
+    if hamiltonian {
+        let output_norm = vector_norm(&output);
+        if output_norm > f64::EPSILON && output_norm.is_finite() {
+            let scale = projection.initial_norm / output_norm;
+            for value in &mut output {
+                *value *= scale;
+            }
+        }
+    }
+    output
+}
+
 pub(crate) fn expm_action(
     operator: &(impl LinearOperator + ?Sized),
     initial: &[Complex64],
@@ -558,6 +678,15 @@ pub(crate) fn expm_action(
     if interval == 0.0 {
         return Ok(initial.to_vec());
     }
+    if options.hamiltonian {
+        let projection = lanczos_projection(operator, initial, options.krylov_dimension)?;
+        return Ok(projected_exponential_action(
+            &projection,
+            interval,
+            true,
+            initial.len(),
+        ));
+    }
     let requested_steps = interval.abs().ceil().max(1.0) as usize;
     if requested_steps > options.max_substeps {
         return Err(QuSpinError::NonConvergence {
@@ -566,11 +695,7 @@ pub(crate) fn expm_action(
         });
     }
     let step = interval / requested_steps as f64;
-    let factor = if options.hamiltonian {
-        Complex64::new(0.0, -step)
-    } else {
-        Complex64::new(step, 0.0)
-    };
+    let factor = Complex64::new(step, 0.0);
     let mut state = initial.to_vec();
     let mut applied = vec![Complex64::new(0.0, 0.0); shape.0];
     for _ in 0..requested_steps {
@@ -617,6 +742,21 @@ where
         ));
     }
     let mut states = Vec::with_capacity(options.times.len());
+    if options.hamiltonian {
+        let projection = lanczos_projection(operator, initial, options.krylov_dimension)?;
+        for &time in &options.times {
+            states.push(projected_exponential_action(
+                &projection,
+                time,
+                true,
+                initial.len(),
+            ));
+        }
+        return Ok(StateTrajectory {
+            times: options.times,
+            states,
+        });
+    }
     let mut state = initial.to_vec();
     let mut previous_time = 0.0;
     for &time in &options.times {
