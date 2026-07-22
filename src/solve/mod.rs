@@ -1,16 +1,18 @@
-use std::cmp::Ordering;
-
-use nalgebra::{DMatrix, DVector, SymmetricEigen};
+use nalgebra::{DMatrix, DVector, SymmetricEigen, linalg::Schur};
 use num_complex::Complex64;
 
-use crate::operator::{LinearOperator, ShiftedLinearSolver, materialize_dense};
+use crate::operator::{
+    LinearOperator, ShiftedLinearSolver, TimeDependentOperator, materialize_dense,
+};
 use crate::{QuSpinError, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SpectrumTarget {
     SmallestAlgebraic,
     LargestAlgebraic,
+    SmallestMagnitude,
     LargestMagnitude,
+    BothEnds,
     Shift(f64),
 }
 
@@ -68,9 +70,10 @@ pub struct Eigensystem {
     pub eigenvectors: Vec<Vec<Complex64>>,
     pub residuals: Vec<f64>,
     pub iterations: usize,
+    pub converged: bool,
 }
 
-pub(crate) fn real_symmetric_eigenpairs_all(
+pub(crate) fn hermitian_eigenpairs_all(
     operator: &(impl LinearOperator + ?Sized),
 ) -> Result<(Vec<f64>, Vec<Vec<Complex64>>)> {
     let shape = operator.shape();
@@ -80,34 +83,70 @@ pub(crate) fn real_symmetric_eigenpairs_all(
         ));
     }
     let dense = materialize_dense(operator)?;
-    if dense.iter().any(|value| value.im.abs() > 1.0e-13) {
-        return Err(QuSpinError::UnsupportedBackend(
-            "complex Hermitian eigensystems are not active in the first solver backend".into(),
-        ));
-    }
     let dimension = shape.0;
     for row in 0..dimension {
         for column in 0..dimension {
-            if (dense[row * dimension + column].re - dense[column * dimension + row].re).abs()
+            if (dense[row * dimension + column] - dense[column * dimension + row].conj()).norm()
                 > 1.0e-12
             {
                 return Err(QuSpinError::NonHermitian);
             }
         }
     }
+    if dense.iter().all(|value| value.im.abs() <= 1.0e-14) {
+        let matrix = DMatrix::from_fn(dimension, dimension, |row, column| {
+            dense[row * dimension + column].re
+        });
+        let decomposition = SymmetricEigen::new(matrix);
+        let mut eigenpairs: Vec<(f64, Vec<Complex64>)> = (0..dimension)
+            .map(|column| {
+                (
+                    decomposition.eigenvalues[column],
+                    (0..dimension)
+                        .map(|row| Complex64::new(decomposition.eigenvectors[(row, column)], 0.0))
+                        .collect(),
+                )
+            })
+            .collect();
+        eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+        return Ok(eigenpairs.into_iter().unzip());
+    }
+
     let matrix = DMatrix::from_fn(dimension, dimension, |row, column| {
-        dense[row * dimension + column].re
+        dense[row * dimension + column]
     });
-    let decomposition = SymmetricEigen::new(matrix);
-    let values = decomposition.eigenvalues.as_slice().to_vec();
-    let vectors = (0..dimension)
-        .map(|column| {
-            (0..dimension)
-                .map(|row| Complex64::new(decomposition.eigenvectors[(row, column)], 0.0))
-                .collect()
-        })
-        .collect();
-    Ok((values, vectors))
+    let (vectors, triangular) = Schur::new(matrix).unpack();
+    let mut eigenpairs = Vec::with_capacity(dimension);
+    for column in 0..dimension {
+        let value = triangular[(column, column)];
+        if value.im.abs() > 1.0e-10 {
+            return Err(QuSpinError::NonHermitian);
+        }
+        let vector = (0..dimension).map(|row| vectors[(row, column)]).collect();
+        eigenpairs.push((value.re, vector));
+    }
+    eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+    Ok(eigenpairs.into_iter().unzip())
+}
+
+/// Complete eigendecomposition of a finite Hermitian operator.
+pub fn eigh<O>(operator: &O) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let (eigenvalues, eigenvectors) = hermitian_eigenpairs_all(operator)?;
+    let residuals = eigenvalues
+        .iter()
+        .zip(&eigenvectors)
+        .map(|(&value, vector)| residual_norm(operator, value, vector))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Eigensystem {
+        eigenvalues,
+        eigenvectors,
+        residuals,
+        iterations: 1,
+        converged: true,
+    })
 }
 
 fn residual_norm(
@@ -307,16 +346,34 @@ where
 }
 
 fn select_indices(values: &[f64], target: SpectrumTarget, count: usize) -> Vec<usize> {
+    if target == SpectrumTarget::BothEnds {
+        let mut ordered: Vec<_> = (0..values.len()).collect();
+        ordered.sort_by(|&left, &right| {
+            values[left]
+                .total_cmp(&values[right])
+                .then_with(|| left.cmp(&right))
+        });
+        let lower = count / 2;
+        let upper = count - lower;
+        let mut selected = Vec::with_capacity(count);
+        selected.extend(ordered.iter().take(lower).copied());
+        selected.extend(ordered.iter().rev().take(upper).copied());
+        selected.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
+        return selected;
+    }
     let mut indices: Vec<_> = (0..values.len()).collect();
     indices.sort_by(|&left, &right| {
         let left_value = values[left];
         let right_value = values[right];
         let ordering = match target {
             SpectrumTarget::SmallestAlgebraic => left_value.total_cmp(&right_value),
-            SpectrumTarget::LargestAlgebraic | SpectrumTarget::Shift(_) => {
-                right_value.total_cmp(&left_value)
-            }
+            SpectrumTarget::LargestAlgebraic => right_value.total_cmp(&left_value),
+            SpectrumTarget::SmallestMagnitude => left_value.abs().total_cmp(&right_value.abs()),
             SpectrumTarget::LargestMagnitude => right_value.abs().total_cmp(&left_value.abs()),
+            SpectrumTarget::BothEnds => unreachable!(),
+            SpectrumTarget::Shift(shift) => (left_value - shift)
+                .abs()
+                .total_cmp(&(right_value - shift).abs()),
         };
         ordering.then_with(|| left.cmp(&right))
     });
@@ -438,7 +495,9 @@ where
     candidates.sort_by(|left, right| match options.target {
         SpectrumTarget::SmallestAlgebraic => left.0.total_cmp(&right.0),
         SpectrumTarget::LargestAlgebraic => right.0.total_cmp(&left.0),
+        SpectrumTarget::SmallestMagnitude => left.0.abs().total_cmp(&right.0.abs()),
         SpectrumTarget::LargestMagnitude => right.0.abs().total_cmp(&left.0.abs()),
+        SpectrumTarget::BothEnds => left.0.total_cmp(&right.0),
         SpectrumTarget::Shift(shift) => (left.0 - shift).abs().total_cmp(&(right.0 - shift).abs()),
     });
     let residuals: Vec<_> = candidates.iter().map(|candidate| candidate.2).collect();
@@ -458,6 +517,7 @@ where
             .collect(),
         residuals,
         iterations: size,
+        converged: true,
     })
 }
 
@@ -480,26 +540,21 @@ where
     if shape.0 > 128 {
         return lanczos_eigsh(operator, &options);
     }
-    let (values, vectors) = real_symmetric_eigenpairs_all(operator)?;
-    let mut indices: Vec<_> = (0..values.len()).collect();
-    indices.sort_by(|&left, &right| {
-        let left_value = values[left];
-        let right_value = values[right];
-        let ordering = match options.target {
-            SpectrumTarget::SmallestAlgebraic => left_value.total_cmp(&right_value),
-            SpectrumTarget::LargestAlgebraic => right_value.total_cmp(&left_value),
-            SpectrumTarget::LargestMagnitude => right_value.abs().total_cmp(&left_value.abs()),
-            SpectrumTarget::Shift(shift) => (left_value - shift)
-                .abs()
-                .total_cmp(&(right_value - shift).abs()),
-        };
-        if ordering == Ordering::Equal {
-            left.cmp(&right)
-        } else {
-            ordering
+    let (values, vectors) = hermitian_eigenpairs_all(operator)?;
+    let indices = match options.target {
+        SpectrumTarget::Shift(shift) => {
+            let mut indices: Vec<_> = (0..values.len()).collect();
+            indices.sort_by(|&left, &right| {
+                (values[left] - shift)
+                    .abs()
+                    .total_cmp(&(values[right] - shift).abs())
+                    .then_with(|| left.cmp(&right))
+            });
+            indices.truncate(options.eigenpairs);
+            indices
         }
-    });
-    indices.truncate(options.eigenpairs);
+        _ => select_indices(&values, options.target, options.eigenpairs),
+    };
     let eigenvalues: Vec<_> = indices.iter().map(|&index| values[index]).collect();
     let eigenvectors: Vec<_> = indices
         .iter()
@@ -515,6 +570,7 @@ where
         eigenvectors,
         residuals,
         iterations: 1,
+        converged: true,
     })
 }
 
@@ -554,6 +610,13 @@ impl EvolutionOptions {
 pub struct StateTrajectory {
     pub times: Vec<f64>,
     pub states: Vec<Vec<Complex64>>,
+}
+
+/// Column-oriented batch trajectory: `states[time_index][column_index]`.
+#[derive(Clone, Debug)]
+pub struct StateBatchTrajectory {
+    pub times: Vec<f64>,
+    pub states: Vec<Vec<Vec<Complex64>>>,
 }
 
 struct LanczosProjection {
@@ -801,6 +864,236 @@ where
         previous_time = time;
     }
     Ok(StateTrajectory {
+        times: options.times,
+        states,
+    })
+}
+
+fn time_derivative<O>(
+    operator: &O,
+    time: f64,
+    state: &[Complex64],
+    hamiltonian: bool,
+) -> Result<Vec<Complex64>>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    let mut derivative = vec![Complex64::new(0.0, 0.0); state.len()];
+    operator.apply_at(time, state, &mut derivative)?;
+    if hamiltonian {
+        for value in &mut derivative {
+            *value *= Complex64::new(0.0, -1.0);
+        }
+    }
+    Ok(derivative)
+}
+
+fn rk4_step<O>(
+    operator: &O,
+    time: f64,
+    state: &[Complex64],
+    step: f64,
+    hamiltonian: bool,
+) -> Result<Vec<Complex64>>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    let k1 = time_derivative(operator, time, state, hamiltonian)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k1)
+        .map(|(value, derivative)| *value + 0.5 * step * *derivative)
+        .collect();
+    let k2 = time_derivative(operator, time + 0.5 * step, &stage, hamiltonian)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k2)
+        .map(|(value, derivative)| *value + 0.5 * step * *derivative)
+        .collect();
+    let k3 = time_derivative(operator, time + 0.5 * step, &stage, hamiltonian)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k3)
+        .map(|(value, derivative)| *value + step * *derivative)
+        .collect();
+    let k4 = time_derivative(operator, time + step, &stage, hamiltonian)?;
+    Ok(state
+        .iter()
+        .zip(k1.iter().zip(k2.iter().zip(k3.iter().zip(&k4))))
+        .map(|(value, (first, (second, (third, fourth))))| {
+            *value + step * (*first + 2.0 * *second + 2.0 * *third + *fourth) / 6.0
+        })
+        .collect())
+}
+
+fn adaptive_time_interval<O>(
+    operator: &O,
+    initial_time: f64,
+    initial: &[Complex64],
+    interval: f64,
+    options: &EvolutionOptions,
+) -> Result<Vec<Complex64>>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    if interval == 0.0 {
+        return Ok(initial.to_vec());
+    }
+    let target_time = initial_time + interval;
+    let direction = interval.signum();
+    let mut step = direction * interval.abs().min(0.1);
+    let mut time = initial_time;
+    let mut state = initial.to_vec();
+    let initial_norm = vector_norm(initial);
+    let mut steps = 0;
+    while direction * (target_time - time) > 16.0 * f64::EPSILON * target_time.abs().max(1.0) {
+        if steps >= options.max_substeps {
+            return Err(QuSpinError::NonConvergence {
+                iterations: steps,
+                residual: (target_time - time).abs(),
+            });
+        }
+        if direction * (time + step - target_time) > 0.0 {
+            step = target_time - time;
+        }
+        let full = rk4_step(operator, time, &state, step, options.hamiltonian)?;
+        let first_half = rk4_step(operator, time, &state, 0.5 * step, options.hamiltonian)?;
+        let two_halves = rk4_step(
+            operator,
+            time + 0.5 * step,
+            &first_half,
+            0.5 * step,
+            options.hamiltonian,
+        )?;
+        let error = full
+            .iter()
+            .zip(&two_halves)
+            .map(|(coarse, fine)| (*coarse - *fine).norm_sqr())
+            .sum::<f64>()
+            .sqrt();
+        let scale = vector_norm(&two_halves).max(1.0);
+        let threshold = options.tolerance * scale;
+        if error <= threshold || step.abs() <= f64::EPSILON * time.abs().max(1.0) {
+            state = two_halves;
+            if options.hamiltonian && initial_norm > f64::EPSILON {
+                let norm = vector_norm(&state);
+                if norm > f64::EPSILON && norm.is_finite() {
+                    for value in &mut state {
+                        *value *= initial_norm / norm;
+                    }
+                }
+            }
+            time += step;
+            steps += 1;
+            let growth = if error <= f64::EPSILON {
+                2.0
+            } else {
+                (0.9 * (threshold / error).powf(0.2)).clamp(1.0, 2.0)
+            };
+            step *= growth;
+        } else {
+            let shrink = (0.9 * (threshold / error).powf(0.2)).clamp(0.1, 0.8);
+            step *= shrink;
+        }
+    }
+    Ok(state)
+}
+
+/// Adaptive fourth-order evolution for an explicitly time-dependent operator.
+pub fn evolve_time_dependent<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: EvolutionOptions,
+) -> Result<StateTrajectory>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    options.validate()?;
+    let shape = operator.shape();
+    if shape.0 != shape.1 || initial.len() != shape.0 {
+        return Err(QuSpinError::DimensionMismatch(
+            "time-dependent operator and initial state do not match".into(),
+        ));
+    }
+    let mut states = Vec::with_capacity(options.times.len());
+    let mut state = initial.to_vec();
+    let mut previous_time = 0.0;
+    for &time in &options.times {
+        state = adaptive_time_interval(
+            operator,
+            previous_time,
+            &state,
+            time - previous_time,
+            &options,
+        )?;
+        states.push(state.clone());
+        previous_time = time;
+    }
+    Ok(StateTrajectory {
+        times: options.times,
+        states,
+    })
+}
+
+/// Evolve independent column states without changing their column ordering.
+pub fn evolve_batch<O>(
+    operator: &O,
+    initial_columns: &[Vec<Complex64>],
+    options: EvolutionOptions,
+) -> Result<StateBatchTrajectory>
+where
+    O: LinearOperator + ?Sized,
+{
+    if initial_columns.is_empty() {
+        return Err(QuSpinError::InvalidOptions(
+            "a state batch must contain at least one column".into(),
+        ));
+    }
+    let mut by_column = Vec::with_capacity(initial_columns.len());
+    for initial in initial_columns {
+        by_column.push(evolve(operator, initial, options.clone())?);
+    }
+    let states = (0..options.times.len())
+        .map(|time_index| {
+            by_column
+                .iter()
+                .map(|trajectory| trajectory.states[time_index].clone())
+                .collect()
+        })
+        .collect();
+    Ok(StateBatchTrajectory {
+        times: options.times,
+        states,
+    })
+}
+
+/// Batched counterpart of [`evolve_time_dependent`].
+pub fn evolve_time_dependent_batch<O>(
+    operator: &O,
+    initial_columns: &[Vec<Complex64>],
+    options: EvolutionOptions,
+) -> Result<StateBatchTrajectory>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    if initial_columns.is_empty() {
+        return Err(QuSpinError::InvalidOptions(
+            "a state batch must contain at least one column".into(),
+        ));
+    }
+    let mut by_column = Vec::with_capacity(initial_columns.len());
+    for initial in initial_columns {
+        by_column.push(evolve_time_dependent(operator, initial, options.clone())?);
+    }
+    let states = (0..options.times.len())
+        .map(|time_index| {
+            by_column
+                .iter()
+                .map(|trajectory| trajectory.states[time_index].clone())
+                .collect()
+        })
+        .collect();
+    Ok(StateBatchTrajectory {
         times: options.times,
         states,
     })

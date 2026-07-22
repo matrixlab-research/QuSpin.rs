@@ -5,7 +5,7 @@ use num_complex::Complex64;
 
 use crate::operator::{LinearOperator, MatrixFormat};
 use crate::solve::{
-    EvolutionOptions, expm_action, lanczos_spectral_measure, real_symmetric_eigenpairs_all,
+    EvolutionOptions, expm_action, hermitian_eigenpairs_all, lanczos_spectral_measure,
 };
 use crate::{QuSpinError, Result};
 
@@ -162,7 +162,7 @@ where
     let mut created = vec![Complex64::new(0.0, 0.0); probe_shape.0];
     probe.apply(source, &mut created)?;
     let (energies, weights) = if target_shape.0 <= 128 {
-        let (energies, eigenvectors) = real_symmetric_eigenpairs_all(target_hamiltonian)?;
+        let (energies, eigenvectors) = hermitian_eigenpairs_all(target_hamiltonian)?;
         let weights = eigenvectors
             .iter()
             .map(|vector| {

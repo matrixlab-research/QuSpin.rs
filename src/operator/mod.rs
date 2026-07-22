@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
 use faer::linalg::solvers::Solve;
 use faer::sparse::{SparseColMat, Triplet as FaerTriplet};
@@ -91,6 +93,12 @@ pub trait LinearOperator: Send + Sync {
     fn shifted_solver(&self, _shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
         Ok(None)
     }
+}
+
+/// Narrow waist for operators whose action depends explicitly on time.
+pub trait TimeDependentOperator: Send + Sync {
+    fn shape(&self) -> (usize, usize);
+    fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
 }
 
 /// Reusable factorization of `(A - shift * I)` for interior eigensolvers.
@@ -333,6 +341,129 @@ impl Operator {
                 .count(),
             Storage::MatrixFree(entries) => entries.len(),
         }
+    }
+
+    /// Convert the operator without changing its numerical values.
+    pub fn converted(&self, format: MatrixFormat) -> Result<Self> {
+        if format == self.format {
+            return Ok(self.clone());
+        }
+        let (rows, columns) = self.shape;
+        let dense = self.to_dense();
+        if format == MatrixFormat::Dense {
+            return Self::from_dense(rows, columns, dense);
+        }
+        let triplets = dense.into_iter().enumerate().filter_map(|(index, value)| {
+            (value.norm() > f64::EPSILON).then_some((index / columns, index % columns, value))
+        });
+        Self::from_triplets(rows, columns, triplets, format)
+    }
+
+    pub fn diagonal(&self) -> Vec<Complex64> {
+        let dimension = self.shape.0.min(self.shape.1);
+        (0..dimension)
+            .map(|index| self.value_at(index, index))
+            .collect()
+    }
+
+    pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
+        let coefficient = coefficient.into();
+        if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "operator scale must be finite".into(),
+            ));
+        }
+        let values = self
+            .to_dense()
+            .into_iter()
+            .map(|value| coefficient * value)
+            .collect();
+        Self::from_dense(self.shape.0, self.shape.1, values)?.converted(self.format)
+    }
+
+    pub fn add(&self, right: &Self) -> Result<Self> {
+        self.combine(right, Complex64::new(1.0, 0.0))
+    }
+
+    pub fn subtract(&self, right: &Self) -> Result<Self> {
+        self.combine(right, Complex64::new(-1.0, 0.0))
+    }
+
+    fn combine(&self, right: &Self, right_scale: Complex64) -> Result<Self> {
+        if self.shape != right.shape {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator addition requires equal shapes".into(),
+            ));
+        }
+        let values = self
+            .to_dense()
+            .into_iter()
+            .zip(right.to_dense())
+            .map(|(left, right)| left + right_scale * right)
+            .collect();
+        Self::from_dense(self.shape.0, self.shape.1, values)?.converted(self.format)
+    }
+
+    /// Matrix product `self * right`.
+    pub fn product(&self, right: &Self) -> Result<Self> {
+        if self.shape.1 != right.shape.0 {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator product has incompatible inner dimensions".into(),
+            ));
+        }
+        let left_values = self.to_dense();
+        let right_values = right.to_dense();
+        let mut values = vec![Complex64::new(0.0, 0.0); self.shape.0 * right.shape.1];
+        for row in 0..self.shape.0 {
+            for middle in 0..self.shape.1 {
+                let left = left_values[row * self.shape.1 + middle];
+                if left.norm() <= f64::EPSILON {
+                    continue;
+                }
+                for column in 0..right.shape.1 {
+                    values[row * right.shape.1 + column] +=
+                        left * right_values[middle * right.shape.1 + column];
+                }
+            }
+        }
+        Self::from_dense(self.shape.0, right.shape.1, values)?.converted(self.format)
+    }
+
+    pub fn pow(&self, exponent: u32) -> Result<Self> {
+        if self.shape.0 != self.shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator powers require a square operator".into(),
+            ));
+        }
+        let dimension = self.shape.0;
+        let mut identity = vec![Complex64::new(0.0, 0.0); dimension * dimension];
+        for index in 0..dimension {
+            identity[index * dimension + index] = Complex64::new(1.0, 0.0);
+        }
+        let mut result = Self::from_dense(dimension, dimension, identity)?;
+        let mut base = self.clone();
+        let mut remaining = exponent;
+        while remaining > 0 {
+            if remaining & 1 == 1 {
+                result = result.product(&base)?;
+            }
+            remaining >>= 1;
+            if remaining > 0 {
+                base = base.product(&base)?;
+            }
+        }
+        result.converted(self.format)
+    }
+
+    pub fn adjoint(&self) -> Result<Self> {
+        let dense = self.to_dense();
+        let mut values = vec![Complex64::new(0.0, 0.0); dense.len()];
+        for row in 0..self.shape.0 {
+            for column in 0..self.shape.1 {
+                values[column * self.shape.0 + row] = dense[row * self.shape.1 + column].conj();
+            }
+        }
+        Self::from_dense(self.shape.1, self.shape.0, values)?.converted(self.format)
     }
 
     fn value_at(&self, row: usize, column: usize) -> Complex64 {
@@ -751,21 +882,21 @@ where
             let source_state = self.source.state(column)?;
             for term in &self.terms {
                 for coupling in term.couplings() {
-                    let Some((target_state, local_amplitude)) =
-                        self.source
-                            .apply_local(source_state, term.operator(), &coupling.sites)?
-                    else {
-                        continue;
-                    };
-                    let row = match self.target.index(target_state) {
-                        Ok(index) => index,
-                        Err(QuSpinError::StateNotInBasis) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    *accumulated
-                        .entry((row, column))
-                        .or_insert(Complex64::new(0.0, 0.0)) +=
-                        coupling.coefficient * local_amplitude;
+                    for (target_state, local_amplitude) in self.source.apply_local_transitions(
+                        source_state,
+                        term.operator(),
+                        &coupling.sites,
+                    )? {
+                        let row = match self.target.index(target_state) {
+                            Ok(index) => index,
+                            Err(QuSpinError::StateNotInBasis) => continue,
+                            Err(error) => return Err(error),
+                        };
+                        *accumulated
+                            .entry((row, column))
+                            .or_insert(Complex64::new(0.0, 0.0)) +=
+                            coupling.coefficient * local_amplitude;
+                    }
                 }
             }
         }
@@ -815,4 +946,372 @@ where
         }
         Ok(operator)
     }
+
+    /// Assemble static and driven terms through the same local-action path.
+    pub fn build_dynamic(
+        self,
+        dynamic_terms: impl IntoIterator<Item = DynamicTerm>,
+        format: MatrixFormat,
+    ) -> Result<Hamiltonian<Dynamic>> {
+        let Self {
+            source,
+            target,
+            terms,
+            checks,
+        } = self;
+        if source.len() != target.len() {
+            return Err(QuSpinError::DimensionMismatch(
+                "a Hamiltonian must be square".into(),
+            ));
+        }
+        let static_part = Self {
+            source,
+            target,
+            terms,
+            checks,
+        }
+        .build(format)?;
+        let component_checks = AssemblyChecks {
+            hermiticity: false,
+            particle_conservation: checks.particle_conservation,
+            symmetry_compatibility: checks.symmetry_compatibility,
+        };
+        let mut components = Vec::new();
+        for dynamic_term in dynamic_terms {
+            let (term, drive) = dynamic_term.into_parts();
+            let operator = Self {
+                source,
+                target,
+                terms: vec![term],
+                checks: component_checks,
+            }
+            .build(format)?;
+            components.push(DynamicComponent { operator, drive });
+        }
+        Hamiltonian::<Dynamic>::new(static_part, components)
+    }
+}
+
+type DriveFunction = Arc<dyn Fn(f64) -> Complex64 + Send + Sync>;
+
+/// A parsed local term multiplied by a scalar function of time.
+#[derive(Clone)]
+pub struct DynamicTerm {
+    term: OperatorTerm,
+    drive: DriveFunction,
+}
+
+impl std::fmt::Debug for DynamicTerm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicTerm")
+            .field("term", &self.term)
+            .field("drive", &"<callable>")
+            .finish()
+    }
+}
+
+impl DynamicTerm {
+    pub fn new<F>(term: OperatorTerm, drive: F) -> Self
+    where
+        F: Fn(f64) -> Complex64 + Send + Sync + 'static,
+    {
+        Self {
+            term,
+            drive: Arc::new(drive),
+        }
+    }
+
+    pub fn coefficient_at(&self, time: f64) -> Result<Complex64> {
+        finite_drive_value(time, (self.drive)(time))
+    }
+
+    fn into_parts(self) -> (OperatorTerm, DriveFunction) {
+        (self.term, self.drive)
+    }
+}
+
+#[derive(Clone)]
+pub struct DynamicComponent {
+    operator: Operator,
+    drive: DriveFunction,
+}
+
+impl std::fmt::Debug for DynamicComponent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicComponent")
+            .field("operator", &self.operator)
+            .field("drive", &"<callable>")
+            .finish()
+    }
+}
+
+impl DynamicComponent {
+    pub fn new<F>(operator: Operator, drive: F) -> Self
+    where
+        F: Fn(f64) -> Complex64 + Send + Sync + 'static,
+    {
+        Self {
+            operator,
+            drive: Arc::new(drive),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Static;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Dynamic;
+
+/// Static or explicitly time-dependent Hamiltonian with a type-state marker.
+#[derive(Clone, Debug)]
+pub struct Hamiltonian<Kind = Static> {
+    static_part: Operator,
+    dynamic_parts: Vec<DynamicComponent>,
+    marker: PhantomData<Kind>,
+}
+
+impl Hamiltonian<Static> {
+    pub fn new(operator: Operator) -> Result<Self> {
+        let shape = operator.shape();
+        if shape.0 != shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "a Hamiltonian must be square".into(),
+            ));
+        }
+        Ok(Self {
+            static_part: operator,
+            dynamic_parts: Vec::new(),
+            marker: PhantomData,
+        })
+    }
+
+    pub fn operator(&self) -> &Operator {
+        &self.static_part
+    }
+}
+
+impl Hamiltonian<Dynamic> {
+    pub fn new(static_part: Operator, dynamic_parts: Vec<DynamicComponent>) -> Result<Self> {
+        let shape = static_part.shape();
+        if shape.0 != shape.1
+            || dynamic_parts
+                .iter()
+                .any(|component| component.operator.shape() != shape)
+        {
+            return Err(QuSpinError::DimensionMismatch(
+                "all Hamiltonian components must share one square shape".into(),
+            ));
+        }
+        Ok(Self {
+            static_part,
+            dynamic_parts,
+            marker: PhantomData,
+        })
+    }
+
+    pub fn evaluate(&self, time: f64, format: MatrixFormat) -> Result<Operator> {
+        if !time.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "evaluation time must be finite".into(),
+            ));
+        }
+        let shape = self.static_part.shape();
+        let mut values = self.static_part.to_dense();
+        for component in &self.dynamic_parts {
+            let coefficient = finite_drive_value(time, (component.drive)(time))?;
+            for (value, driven) in values.iter_mut().zip(component.operator.to_dense()) {
+                *value += coefficient * driven;
+            }
+        }
+        Operator::from_dense(shape.0, shape.1, values)?.converted(format)
+    }
+
+    pub fn dynamic_components(&self) -> usize {
+        self.dynamic_parts.len()
+    }
+}
+
+fn finite_drive_value(time: f64, value: Complex64) -> Result<Complex64> {
+    if !time.is_finite() || !value.re.is_finite() || !value.im.is_finite() {
+        return Err(QuSpinError::InvalidOptions(
+            "drive time and coefficient must be finite".into(),
+        ));
+    }
+    Ok(value)
+}
+
+impl LinearOperator for Hamiltonian<Static> {
+    fn shape(&self) -> (usize, usize) {
+        self.static_part.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        self.static_part.format()
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.static_part.apply(input, output)
+    }
+
+    fn shifted_solver(&self, shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
+        self.static_part.shifted_solver(shift)
+    }
+}
+
+impl TimeDependentOperator for Hamiltonian<Static> {
+    fn shape(&self) -> (usize, usize) {
+        self.static_part.shape()
+    }
+
+    fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if !time.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "evaluation time must be finite".into(),
+            ));
+        }
+        self.static_part.apply(input, output)
+    }
+}
+
+impl TimeDependentOperator for Hamiltonian<Dynamic> {
+    fn shape(&self) -> (usize, usize) {
+        self.static_part.shape()
+    }
+
+    fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        check_apply_shape(self.static_part.shape(), input, output)?;
+        self.static_part.apply(input, output)?;
+        let mut driven = vec![Complex64::new(0.0, 0.0); output.len()];
+        for component in &self.dynamic_parts {
+            let coefficient = finite_drive_value(time, (component.drive)(time))?;
+            component.operator.apply(input, &mut driven)?;
+            for (value, contribution) in output.iter_mut().zip(&driven) {
+                *value += coefficient * *contribution;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantumComponent {
+    name: String,
+    operator: Operator,
+    default: Option<Complex64>,
+}
+
+impl QuantumComponent {
+    pub fn required(name: impl Into<String>, operator: Operator) -> Self {
+        Self {
+            name: name.into(),
+            operator,
+            default: None,
+        }
+    }
+
+    pub fn with_default(
+        name: impl Into<String>,
+        operator: Operator,
+        default: impl Into<Complex64>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            operator,
+            default: Some(default.into()),
+        }
+    }
+}
+
+/// Named linear combination of operator components.
+#[derive(Clone, Debug)]
+pub struct QuantumOperator {
+    components: Vec<QuantumComponent>,
+    shape: (usize, usize),
+}
+
+impl QuantumOperator {
+    pub fn new(components: impl IntoIterator<Item = QuantumComponent>) -> Result<Self> {
+        let components: Vec<_> = components.into_iter().collect();
+        let first = components.first().ok_or_else(|| {
+            QuSpinError::InvalidOptions("QuantumOperator requires at least one component".into())
+        })?;
+        let shape = first.operator.shape();
+        let mut names = std::collections::HashSet::new();
+        for component in &components {
+            if component.name.is_empty() || !names.insert(component.name.clone()) {
+                return Err(QuSpinError::InvalidOptions(
+                    "component names must be nonempty and unique".into(),
+                ));
+            }
+            if component.operator.shape() != shape {
+                return Err(QuSpinError::DimensionMismatch(
+                    "all parameterized components must have equal shapes".into(),
+                ));
+            }
+            if component
+                .default
+                .is_some_and(|value| !value.re.is_finite() || !value.im.is_finite())
+            {
+                return Err(QuSpinError::InvalidOptions(
+                    "component defaults must be finite".into(),
+                ));
+            }
+        }
+        Ok(Self { components, shape })
+    }
+
+    pub const fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    pub fn evaluate(
+        &self,
+        parameters: &HashMap<String, Complex64>,
+        format: MatrixFormat,
+    ) -> Result<Operator> {
+        if let Some(name) = parameters.keys().find(|name| {
+            !self
+                .components
+                .iter()
+                .any(|component| &component.name == *name)
+        }) {
+            return Err(QuSpinError::InvalidOptions(format!(
+                "unknown operator parameter {name:?}"
+            )));
+        }
+        let mut values = vec![Complex64::new(0.0, 0.0); self.shape.0 * self.shape.1];
+        for component in &self.components {
+            let coefficient = parameters
+                .get(&component.name)
+                .copied()
+                .or(component.default)
+                .ok_or_else(|| {
+                    QuSpinError::InvalidOptions(format!(
+                        "missing required operator parameter {:?}",
+                        component.name
+                    ))
+                })?;
+            if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+                return Err(QuSpinError::InvalidOptions(format!(
+                    "operator parameter {:?} must be finite",
+                    component.name
+                )));
+            }
+            for (value, basis_value) in values.iter_mut().zip(component.operator.to_dense()) {
+                *value += coefficient * basis_value;
+            }
+        }
+        Operator::from_dense(self.shape.0, self.shape.1, values)?.converted(format)
+    }
+}
+
+pub fn commutator(left: &Operator, right: &Operator) -> Result<Operator> {
+    left.product(right)?.subtract(&right.product(left)?)
+}
+
+pub fn anticommutator(left: &Operator, right: &Operator) -> Result<Operator> {
+    left.product(right)?.add(&right.product(left)?)
 }

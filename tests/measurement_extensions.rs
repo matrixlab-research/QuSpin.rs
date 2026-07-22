@@ -1,0 +1,124 @@
+use approx::assert_abs_diff_eq;
+use quspin::Complex64;
+use quspin::measure::{
+    EntropyOrder, array_to_states, diagonal_ensemble, entanglement_entropy, expectation,
+    kl_divergence, matrix_element, mean_level_spacing, observables_vs_time, partial_trace,
+    quantum_fluctuation, states_to_array,
+};
+use quspin::operator::Operator;
+use quspin::solve::StateTrajectory;
+
+fn sigma_z() -> Operator {
+    Operator::from_dense(
+        2,
+        2,
+        vec![
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(-1.0, 0.0),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn observables_and_fluctuations_match_two_level_anchors() {
+    let operator = sigma_z();
+    let plus = vec![
+        Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+        Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+    ];
+    assert_abs_diff_eq!(
+        expectation(&operator, &plus).unwrap().re,
+        0.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        matrix_element(&plus, &operator, &plus).unwrap().re,
+        0.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        quantum_fluctuation(&operator, &plus).unwrap(),
+        1.0,
+        epsilon = 1.0e-12
+    );
+
+    let trajectory = StateTrajectory {
+        times: vec![0.0, 1.0],
+        states: vec![
+            plus.clone(),
+            vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
+        ],
+    };
+    let values = observables_vs_time(&trajectory, &[("z".to_string(), &operator)]).unwrap();
+    assert_abs_diff_eq!(values["z"][0].re, 0.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(values["z"][1].re, 1.0, epsilon = 1.0e-12);
+}
+
+#[test]
+fn partial_trace_and_entropy_distinguish_product_and_bell_states() {
+    let product = vec![
+        Complex64::new(1.0, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.0, 0.0),
+    ];
+    assert_abs_diff_eq!(
+        entanglement_entropy(&product, 2, 2, EntropyOrder::VonNeumann).unwrap(),
+        0.0,
+        epsilon = 1.0e-12
+    );
+
+    let amplitude = 1.0 / 2.0_f64.sqrt();
+    let bell = vec![
+        Complex64::new(amplitude, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(0.0, 0.0),
+        Complex64::new(amplitude, 0.0),
+    ];
+    let reduced = partial_trace(&bell, 2, 2).unwrap();
+    assert_abs_diff_eq!(reduced[0].re, 0.5, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(reduced[3].re, 0.5, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(
+        entanglement_entropy(&bell, 2, 2, EntropyOrder::VonNeumann).unwrap(),
+        2.0_f64.ln(),
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        entanglement_entropy(&bell, 2, 2, EntropyOrder::Renyi(2.0)).unwrap(),
+        2.0_f64.ln(),
+        epsilon = 1.0e-12
+    );
+}
+
+#[test]
+fn ensemble_statistics_and_state_conversions_are_deterministic() {
+    let eigenvectors = vec![
+        vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
+        vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
+    ];
+    let initial = vec![
+        Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+        Complex64::new(1.0 / 2.0_f64.sqrt(), 0.0),
+    ];
+    let ensemble = diagonal_ensemble(&[-1.0, 1.0], &eigenvectors, &initial).unwrap();
+    assert_abs_diff_eq!(ensemble.mean_energy, 0.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(ensemble.energy_variance, 1.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(ensemble.entropy, 2.0_f64.ln(), epsilon = 1.0e-12);
+    assert_abs_diff_eq!(
+        kl_divergence(&[1.0, 1.0], &[1.0, 1.0]).unwrap(),
+        0.0,
+        epsilon = 1.0e-12
+    );
+    assert_abs_diff_eq!(
+        mean_level_spacing(&[0.0, 1.0, 3.0, 6.0]).unwrap(),
+        (0.5 + 2.0 / 3.0) / 2.0,
+        epsilon = 1.0e-12
+    );
+
+    let states = vec![0_u128, 5, 15];
+    let occupations = states_to_array(&states, 4, 2).unwrap();
+    assert_eq!(array_to_states(&occupations, 2).unwrap(), states);
+}
