@@ -54,6 +54,72 @@ fn state_index(states: &[u128], state: u128) -> Result<usize> {
         .map_err(|_| QuSpinError::StateNotInBasis)
 }
 
+fn rotate_lattice_state(state: u128, shift: usize, sites: usize) -> u128 {
+    if sites == 0 {
+        return state;
+    }
+    let shift = shift % sites;
+    if shift == 0 {
+        return state;
+    }
+    let mask = if sites == 128 {
+        u128::MAX
+    } else {
+        (1_u128 << sites) - 1
+    };
+    ((state << shift) & mask) | (state >> (sites - shift))
+}
+
+fn translation_orbit(state: u128, sites: usize) -> (u128, usize, usize) {
+    let mut representative = state;
+    let mut representative_shift = 0;
+    let mut orbit_length = sites.max(1);
+    for shift in 1..=sites {
+        let translated = rotate_lattice_state(state, shift, sites);
+        if translated < representative {
+            representative = translated;
+            representative_shift = shift;
+        }
+        if translated == state {
+            orbit_length = shift;
+            break;
+        }
+    }
+    let state_from_representative =
+        (orbit_length - representative_shift % orbit_length) % orbit_length;
+    (representative, state_from_representative, orbit_length)
+}
+
+fn translation_sector_states(
+    parent_states: Vec<u128>,
+    sites: usize,
+    momentum: i32,
+) -> Result<(Vec<u128>, Vec<usize>, usize)> {
+    if sites == 0 {
+        return Err(QuSpinError::InvalidSector(
+            "translation sectors require at least one site".into(),
+        ));
+    }
+    let sites_i64 = i64::try_from(sites)
+        .map_err(|_| QuSpinError::UnsupportedBackend("site count is too large".into()))?;
+    let normalized = i64::from(momentum).rem_euclid(sites_i64) as usize;
+    let mut states = Vec::new();
+    let mut orbit_lengths = Vec::new();
+    for state in parent_states {
+        let (representative, _, orbit_length) = translation_orbit(state, sites);
+        if state == representative && normalized * orbit_length % sites == 0 {
+            states.push(state);
+            orbit_lengths.push(orbit_length);
+        }
+    }
+    if states.is_empty() {
+        return Err(QuSpinError::InvalidSector(
+            "the requested momentum sector is empty".into(),
+        ));
+    }
+    Ok((states, orbit_lengths, normalized))
+}
+
 fn checked_site(site: usize, sites: usize) -> Result<()> {
     if site >= sites {
         Err(QuSpinError::InvalidSite { site, sites })
@@ -84,6 +150,8 @@ pub struct SpinBasis1D {
     spin_twice: u16,
     up: Option<usize>,
     pauli: bool,
+    momentum: Option<usize>,
+    orbit_lengths: Vec<usize>,
     states: Vec<u128>,
 }
 
@@ -113,6 +181,10 @@ impl SpinBasis1D {
 
     pub const fn pauli(&self) -> bool {
         self.pauli
+    }
+
+    pub const fn momentum(&self) -> Option<usize> {
+        self.momentum
     }
 }
 
@@ -163,12 +235,20 @@ impl SpinBasisBuilder {
                 "the first backend supports spin one-half only".into(),
             ));
         }
-        if self.momentum.is_some() || self.parity.is_some() {
+        if self.parity.is_some() {
             return Err(QuSpinError::UnsupportedBackend(
-                "translation and parity sectors are not active yet".into(),
+                "parity sectors are not active yet".into(),
             ));
         }
-        let states = fixed_weight_states(self.sites, self.up)?;
+        let parent_states = fixed_weight_states(self.sites, self.up)?;
+        let (states, orbit_lengths, momentum) = if let Some(momentum) = self.momentum {
+            let (states, orbit_lengths, momentum) =
+                translation_sector_states(parent_states, self.sites, momentum)?;
+            (states, orbit_lengths, Some(momentum))
+        } else {
+            let orbit_lengths = vec![1; parent_states.len()];
+            (parent_states, orbit_lengths, None)
+        };
         if states.is_empty() {
             return Err(QuSpinError::InvalidSector("empty spin sector".into()));
         }
@@ -177,6 +257,8 @@ impl SpinBasisBuilder {
             spin_twice: self.spin_twice,
             up: self.up,
             pauli: self.pauli,
+            momentum,
+            orbit_lengths,
             states,
         })
     }
@@ -206,6 +288,7 @@ impl Basis for SpinBasis1D {
         operator: &str,
         sites: &[usize],
     ) -> Result<Option<(Self::State, Complex64)>> {
+        let source_state = state;
         let chars = operator_chars(operator, sites)?;
         let mut amplitude = Complex64::new(1.0, 0.0);
         for (&site, op) in sites.iter().zip(chars).rev() {
@@ -238,6 +321,18 @@ impl Basis for SpinBasis1D {
                 }
                 _ => return Err(QuSpinError::InvalidOperator(op.to_string())),
             }
+        }
+        if let Some(momentum) = self.momentum {
+            let source_index = self.index(source_state)?;
+            let source_orbit = self.orbit_lengths[source_index];
+            let (representative, shift, target_orbit) = translation_orbit(state, self.sites);
+            if momentum * target_orbit % self.sites != 0 {
+                return Ok(None);
+            }
+            let angle = std::f64::consts::TAU * (momentum * shift) as f64 / self.sites as f64;
+            amplitude *=
+                Complex64::from_polar((source_orbit as f64 / target_orbit as f64).sqrt(), angle);
+            state = representative;
         }
         Ok(Some((state, amplitude)))
     }

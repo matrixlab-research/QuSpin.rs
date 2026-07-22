@@ -241,18 +241,141 @@ impl Operator {
         }
     }
 
+    fn value_at(&self, row: usize, column: usize) -> Complex64 {
+        match &self.storage {
+            Storage::Dense(values) => values[row * self.shape.1 + column],
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => {
+                let range = column_offsets[column]..column_offsets[column + 1];
+                row_indices[range.clone()]
+                    .binary_search(&row)
+                    .map_or(Complex64::new(0.0, 0.0), |position| {
+                        values[range.start + position]
+                    })
+            }
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => {
+                let range = row_offsets[row]..row_offsets[row + 1];
+                column_indices[range.clone()]
+                    .binary_search(&column)
+                    .map_or(Complex64::new(0.0, 0.0), |position| {
+                        values[range.start + position]
+                    })
+            }
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => {
+                let offset = row as isize - column as isize;
+                offsets
+                    .binary_search(&offset)
+                    .map_or(Complex64::new(0.0, 0.0), |diagonal| {
+                        values_by_row[diagonal * self.shape.0 + row]
+                    })
+            }
+            Storage::MatrixFree(entries) => entries
+                .binary_search_by_key(&(row, column), |entry| (entry.row, entry.column))
+                .map_or(Complex64::new(0.0, 0.0), |position| entries[position].value),
+        }
+    }
+
+    fn entry_is_hermitian(
+        &self,
+        row: usize,
+        column: usize,
+        value: Complex64,
+        tolerance: f64,
+    ) -> bool {
+        (value - self.value_at(column, row).conj()).norm() <= tolerance
+    }
+
     pub fn is_hermitian(&self, tolerance: f64) -> bool {
         if self.shape.0 != self.shape.1 {
             return false;
         }
-        let dense = self.to_dense();
-        let dimension = self.shape.0;
-        for row in 0..dimension {
-            for column in 0..dimension {
-                let difference =
-                    dense[row * dimension + column] - dense[column * dimension + row].conj();
-                if difference.norm() > tolerance {
-                    return false;
+        match &self.storage {
+            Storage::Dense(values) => {
+                for row in 0..self.shape.0 {
+                    for column in 0..self.shape.1 {
+                        if !self.entry_is_hermitian(
+                            row,
+                            column,
+                            values[row * self.shape.1 + column],
+                            tolerance,
+                        ) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => {
+                for column in 0..self.shape.1 {
+                    for position in column_offsets[column]..column_offsets[column + 1] {
+                        if !self.entry_is_hermitian(
+                            row_indices[position],
+                            column,
+                            values[position],
+                            tolerance,
+                        ) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => {
+                for row in 0..self.shape.0 {
+                    for position in row_offsets[row]..row_offsets[row + 1] {
+                        if !self.entry_is_hermitian(
+                            row,
+                            column_indices[position],
+                            values[position],
+                            tolerance,
+                        ) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => {
+                for (diagonal, &offset) in offsets.iter().enumerate() {
+                    for row in 0..self.shape.0 {
+                        let value = values_by_row[diagonal * self.shape.0 + row];
+                        if value.norm() <= f64::EPSILON {
+                            continue;
+                        }
+                        let Some(column) = row.checked_add_signed(-offset) else {
+                            continue;
+                        };
+                        if column < self.shape.1
+                            && !self.entry_is_hermitian(row, column, value, tolerance)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            Storage::MatrixFree(entries) => {
+                for entry in entries {
+                    if !self.entry_is_hermitian(entry.row, entry.column, entry.value, tolerance) {
+                        return false;
+                    }
                 }
             }
         }
