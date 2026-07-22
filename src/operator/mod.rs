@@ -588,12 +588,10 @@ impl LinearOperator for Operator {
                 "could not construct sparse shifted matrix: {error}"
             ))
         })?;
-        let factorization = matrix
-            .sp_lu()
-            .map_err(|_| QuSpinError::NonConvergence {
-                iterations: 0,
-                residual: f64::INFINITY,
-            })?;
+        let factorization = matrix.sp_lu().map_err(|_| QuSpinError::NonConvergence {
+            iterations: 0,
+            residual: f64::INFINITY,
+        })?;
         Ok(Some(Box::new(FaerShiftedSolver {
             factorization,
             dimension,
