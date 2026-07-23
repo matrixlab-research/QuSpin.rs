@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
 use faer::linalg::solvers::Solve;
 use faer::sparse::{SparseColMat, Triplet as FaerTriplet};
@@ -88,8 +90,261 @@ pub trait LinearOperator: Send + Sync {
     fn format(&self) -> MatrixFormat;
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
 
+    /// Apply the algebraic transpose without conjugating either operand.
+    ///
+    /// Stored operators use their canonical triplets directly. A genuinely
+    /// matrix-free implementation may override this method; the default falls
+    /// back to column actions without ever retaining a full square matrix.
+    fn apply_transpose(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        let (rows, columns) = self.shape();
+        if input.len() != rows || output.len() != columns {
+            return Err(QuSpinError::DimensionMismatch(format!(
+                "transpose of shape ({rows}, {columns}) requires input length {rows} and output length {columns}"
+            )));
+        }
+        output.fill(Complex64::new(0.0, 0.0));
+        if let Some(entries) = self.stored_triplets()? {
+            for (row, column, value) in entries {
+                output[column] += value * input[row];
+            }
+            return Ok(());
+        }
+
+        let mut basis_vector = vec![Complex64::new(0.0, 0.0); columns];
+        let mut column_values = vec![Complex64::new(0.0, 0.0); rows];
+        for column in 0..columns {
+            basis_vector.fill(Complex64::new(0.0, 0.0));
+            basis_vector[column] = Complex64::new(1.0, 0.0);
+            self.apply(&basis_vector, &mut column_values)?;
+            output[column] = column_values
+                .iter()
+                .zip(input.iter())
+                .map(|(value, input_value)| *value * *input_value)
+                .sum();
+        }
+        Ok(())
+    }
+
+    /// Apply the conjugate transpose.
+    fn apply_adjoint(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        let conjugated_input: Vec<_> = input.iter().map(|value| value.conj()).collect();
+        self.apply_transpose(&conjugated_input, output)?;
+        for value in output {
+            *value = value.conj();
+        }
+        Ok(())
+    }
+
+    /// Return canonical stored nonzeros when the representation already owns them.
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        Ok(None)
+    }
+
     fn shifted_solver(&self, _shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
         Ok(None)
+    }
+}
+
+/// Narrow waist for operators whose action depends explicitly on time.
+pub trait TimeDependentOperator: Send + Sync {
+    fn shape(&self) -> (usize, usize);
+    fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
+}
+
+type TimedApply = Arc<dyn Fn(f64, &[Complex64], &mut [Complex64]) -> Result<()> + Send + Sync>;
+
+/// Composable explicitly time-dependent linear map.
+#[derive(Clone)]
+pub struct TimeOperator {
+    shape: (usize, usize),
+    action: TimedApply,
+}
+
+impl std::fmt::Debug for TimeOperator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TimeOperator")
+            .field("shape", &self.shape)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TimeOperator {
+    pub fn new<F>(shape: (usize, usize), action: F) -> Result<Self>
+    where
+        F: Fn(f64, &[Complex64], &mut [Complex64]) -> Result<()> + Send + Sync + 'static,
+    {
+        if shape.0 == 0 || shape.1 == 0 {
+            return Err(QuSpinError::DimensionMismatch(
+                "time-dependent operator dimensions must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            shape,
+            action: Arc::new(action),
+        })
+    }
+
+    pub fn from_operator<O>(operator: Arc<O>) -> Self
+    where
+        O: TimeDependentOperator + 'static,
+    {
+        let shape = operator.shape();
+        Self {
+            shape,
+            action: Arc::new(move |time, input, output| operator.apply_at(time, input, output)),
+        }
+    }
+
+    pub fn evaluate(&self, time: f64, format: MatrixFormat) -> Result<Operator> {
+        if !time.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "evaluation time must be finite".into(),
+            ));
+        }
+        let mut input = vec![Complex64::new(0.0, 0.0); self.shape.1];
+        let mut output = vec![Complex64::new(0.0, 0.0); self.shape.0];
+        let mut triplets = Vec::new();
+        for column in 0..self.shape.1 {
+            input.fill(Complex64::new(0.0, 0.0));
+            input[column] = Complex64::new(1.0, 0.0);
+            self.apply_at(time, &input, &mut output)?;
+            for (row, value) in output.iter().copied().enumerate() {
+                if value.norm() > f64::EPSILON {
+                    triplets.push((row, column, value));
+                }
+            }
+        }
+        Operator::from_triplets(self.shape.0, self.shape.1, triplets, format)
+    }
+
+    pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
+        let coefficient = coefficient.into();
+        if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "time-operator scale must be finite".into(),
+            ));
+        }
+        let operator = self.clone();
+        Self::new(self.shape, move |time, input, output| {
+            operator.apply_at(time, input, output)?;
+            for value in output {
+                *value *= coefficient;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn add(&self, right: &Self) -> Result<Self> {
+        if self.shape != right.shape {
+            return Err(QuSpinError::DimensionMismatch(
+                "time-dependent sums require equal shapes".into(),
+            ));
+        }
+        let left = self.clone();
+        let right = right.clone();
+        Self::new(self.shape, move |time, input, output| {
+            left.apply_at(time, input, output)?;
+            let mut contribution = vec![Complex64::new(0.0, 0.0); output.len()];
+            right.apply_at(time, input, &mut contribution)?;
+            for (value, addition) in output.iter_mut().zip(contribution) {
+                *value += addition;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn subtract(&self, right: &Self) -> Result<Self> {
+        self.add(&right.scaled(-1.0)?)
+    }
+
+    pub fn product(&self, right: &Self) -> Result<Self> {
+        if self.shape.1 != right.shape.0 {
+            return Err(QuSpinError::DimensionMismatch(
+                "time-dependent product inner dimensions do not match".into(),
+            ));
+        }
+        let left = self.clone();
+        let right = right.clone();
+        Self::new((self.shape.0, right.shape.1), move |time, input, output| {
+            let mut intermediate = vec![Complex64::new(0.0, 0.0); right.shape.0];
+            right.apply_at(time, input, &mut intermediate)?;
+            left.apply_at(time, &intermediate, output)
+        })
+    }
+
+    pub fn commutator(&self, right: &Self) -> Result<Self> {
+        self.product(right)?.subtract(&right.product(self)?)
+    }
+
+    pub fn anticommutator(&self, right: &Self) -> Result<Self> {
+        self.product(right)?.add(&right.product(self)?)
+    }
+
+    pub fn pow(&self, exponent: u32) -> Result<Self> {
+        if self.shape.0 != self.shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "time-dependent powers require a square operator".into(),
+            ));
+        }
+        if exponent == 0 {
+            let dimension = self.shape.0;
+            return Self::new(self.shape, move |_time, input, output| {
+                check_apply_shape((dimension, dimension), input, output)?;
+                output.copy_from_slice(input);
+                Ok(())
+            });
+        }
+        let mut result = self.clone();
+        for _ in 1..exponent {
+            result = result.product(self)?;
+        }
+        Ok(result)
+    }
+
+    pub fn rotated(&self, unitary: &Operator, tolerance: f64) -> Result<Self> {
+        if self.shape.0 != self.shape.1 || unitary.shape() != self.shape {
+            return Err(QuSpinError::DimensionMismatch(
+                "time-dependent rotation needs equal square shapes".into(),
+            ));
+        }
+        let adjoint = unitary.adjoint()?;
+        let identity = adjoint.product(unitary)?;
+        for row in 0..self.shape.0 {
+            for column in 0..self.shape.1 {
+                let expected = if row == column { 1.0 } else { 0.0 };
+                if (identity.value_at(row, column) - expected).norm() > tolerance {
+                    return Err(QuSpinError::InvalidOptions(
+                        "rotation matrix must be unitary".into(),
+                    ));
+                }
+            }
+        }
+        let operator = self.clone();
+        let unitary = unitary.clone();
+        Self::new(self.shape, move |time, input, output| {
+            let mut rotated_input = vec![Complex64::new(0.0, 0.0); input.len()];
+            let mut applied = vec![Complex64::new(0.0, 0.0); output.len()];
+            unitary.apply(input, &mut rotated_input)?;
+            operator.apply_at(time, &rotated_input, &mut applied)?;
+            adjoint.apply(&applied, output)
+        })
+    }
+}
+
+impl TimeDependentOperator for TimeOperator {
+    fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if !time.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "time-dependent operator time must be finite".into(),
+            ));
+        }
+        check_apply_shape(self.shape, input, output)?;
+        (self.action)(time, input, output)
     }
 }
 
@@ -320,6 +575,52 @@ impl Operator {
         dense
     }
 
+    pub fn conjugated(&self) -> Result<Self> {
+        Self::from_triplets(
+            self.shape.0,
+            self.shape.1,
+            self.triplets()
+                .into_iter()
+                .map(|(row, column, value)| (row, column, value.conj())),
+            self.format,
+        )
+    }
+
+    /// Row-vector action `inputᵀ A` without conjugating the input.
+    pub fn right_apply(&self, input: &[Complex64]) -> Result<Vec<Complex64>> {
+        if input.len() != self.shape.0 {
+            return Err(QuSpinError::DimensionMismatch(
+                "right-apply input must match the operator row count".into(),
+            ));
+        }
+        let mut output = vec![Complex64::new(0.0, 0.0); self.shape.1];
+        self.apply_transpose(input, &mut output)?;
+        Ok(output)
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        let complex = std::mem::size_of::<Complex64>();
+        let index = std::mem::size_of::<usize>();
+        match &self.storage {
+            Storage::Dense(values) => values.len() * complex,
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => column_offsets.len() * index + row_indices.len() * index + values.len() * complex,
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => row_offsets.len() * index + column_indices.len() * index + values.len() * complex,
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => offsets.len() * std::mem::size_of::<isize>() + values_by_row.len() * complex,
+            Storage::MatrixFree(entries) => entries.len() * std::mem::size_of::<Triplet>(),
+        }
+    }
+
     pub fn nnz(&self) -> usize {
         match &self.storage {
             Storage::Dense(values) => values
@@ -333,6 +634,243 @@ impl Operator {
                 .count(),
             Storage::MatrixFree(entries) => entries.len(),
         }
+    }
+
+    /// Canonical nonzero `(row, column, value)` entries without dense materialization.
+    pub fn triplets(&self) -> Vec<(usize, usize, Complex64)> {
+        let mut entries = match &self.storage {
+            Storage::Dense(values) => values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    (value.norm() > f64::EPSILON).then_some((
+                        index / self.shape.1,
+                        index % self.shape.1,
+                        *value,
+                    ))
+                })
+                .collect(),
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => {
+                let mut entries = Vec::with_capacity(values.len());
+                for column in 0..self.shape.1 {
+                    for position in column_offsets[column]..column_offsets[column + 1] {
+                        entries.push((row_indices[position], column, values[position]));
+                    }
+                }
+                entries
+            }
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => {
+                let mut entries = Vec::with_capacity(values.len());
+                for row in 0..self.shape.0 {
+                    for position in row_offsets[row]..row_offsets[row + 1] {
+                        entries.push((row, column_indices[position], values[position]));
+                    }
+                }
+                entries
+            }
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => {
+                let mut entries = Vec::new();
+                for (diagonal, &offset) in offsets.iter().enumerate() {
+                    for row in 0..self.shape.0 {
+                        let Some(column) = row.checked_add_signed(-offset) else {
+                            continue;
+                        };
+                        if column < self.shape.1 {
+                            let value = values_by_row[diagonal * self.shape.0 + row];
+                            if value.norm() > f64::EPSILON {
+                                entries.push((row, column, value));
+                            }
+                        }
+                    }
+                }
+                entries
+            }
+            Storage::MatrixFree(entries) => entries
+                .iter()
+                .map(|entry| (entry.row, entry.column, entry.value))
+                .collect(),
+        };
+        entries.sort_by_key(|(row, column, _)| (*row, *column));
+        entries
+    }
+
+    /// Convert the operator without changing its numerical values.
+    pub fn converted(&self, format: MatrixFormat) -> Result<Self> {
+        if format == self.format {
+            return Ok(self.clone());
+        }
+        Self::from_triplets(self.shape.0, self.shape.1, self.triplets(), format)
+    }
+
+    pub fn diagonal(&self) -> Vec<Complex64> {
+        let dimension = self.shape.0.min(self.shape.1);
+        (0..dimension)
+            .map(|index| self.value_at(index, index))
+            .collect()
+    }
+
+    pub fn trace(&self) -> Result<Complex64> {
+        if self.shape.0 != self.shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator trace requires a square operator".into(),
+            ));
+        }
+        Ok(self.diagonal().into_iter().sum())
+    }
+
+    pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
+        let coefficient = coefficient.into();
+        if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "operator scale must be finite".into(),
+            ));
+        }
+        Self::from_triplets(
+            self.shape.0,
+            self.shape.1,
+            self.triplets()
+                .into_iter()
+                .map(|(row, column, value)| (row, column, coefficient * value)),
+            self.format,
+        )
+    }
+
+    pub fn add(&self, right: &Self) -> Result<Self> {
+        self.combine(right, Complex64::new(1.0, 0.0))
+    }
+
+    pub fn subtract(&self, right: &Self) -> Result<Self> {
+        self.combine(right, Complex64::new(-1.0, 0.0))
+    }
+
+    fn combine(&self, right: &Self, right_scale: Complex64) -> Result<Self> {
+        if self.shape != right.shape {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator addition requires equal shapes".into(),
+            ));
+        }
+        let entries = self.triplets().into_iter().chain(
+            right
+                .triplets()
+                .into_iter()
+                .map(|(row, column, value)| (row, column, right_scale * value)),
+        );
+        Self::from_triplets(self.shape.0, self.shape.1, entries, self.format)
+    }
+
+    /// Matrix product `self * right`.
+    pub fn product(&self, right: &Self) -> Result<Self> {
+        if self.shape.1 != right.shape.0 {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator product has incompatible inner dimensions".into(),
+            ));
+        }
+        let mut right_by_row = vec![Vec::new(); right.shape.0];
+        for (row, column, value) in right.triplets() {
+            right_by_row[row].push((column, value));
+        }
+        let mut accumulated = HashMap::new();
+        for (row, middle, left_value) in self.triplets() {
+            for &(column, right_value) in &right_by_row[middle] {
+                *accumulated
+                    .entry((row, column))
+                    .or_insert(Complex64::new(0.0, 0.0)) += left_value * right_value;
+            }
+        }
+        Self::from_triplets(
+            self.shape.0,
+            right.shape.1,
+            accumulated
+                .into_iter()
+                .map(|((row, column), value)| (row, column, value)),
+            self.format,
+        )
+    }
+
+    pub fn pow(&self, exponent: u32) -> Result<Self> {
+        if self.shape.0 != self.shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator powers require a square operator".into(),
+            ));
+        }
+        let dimension = self.shape.0;
+        let mut result = Self::from_triplets(
+            dimension,
+            dimension,
+            (0..dimension).map(|index| (index, index, Complex64::new(1.0, 0.0))),
+            self.format,
+        )?;
+        let mut base = self.clone();
+        let mut remaining = exponent;
+        while remaining > 0 {
+            if remaining & 1 == 1 {
+                result = result.product(&base)?;
+            }
+            remaining >>= 1;
+            if remaining > 0 {
+                base = base.product(&base)?;
+            }
+        }
+        result.converted(self.format)
+    }
+
+    pub fn adjoint(&self) -> Result<Self> {
+        Self::from_triplets(
+            self.shape.1,
+            self.shape.0,
+            self.triplets()
+                .into_iter()
+                .map(|(row, column, value)| (column, row, value.conj())),
+            self.format,
+        )
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        Self::from_triplets(
+            self.shape.1,
+            self.shape.0,
+            self.triplets()
+                .into_iter()
+                .map(|(row, column, value)| (column, row, value)),
+            self.format,
+        )
+    }
+
+    /// Similarity rotation `U† A U` after validating unitarity.
+    pub fn rotated(&self, unitary: &Self, tolerance: f64) -> Result<Self> {
+        if self.shape.0 != self.shape.1 || unitary.shape != self.shape {
+            return Err(QuSpinError::DimensionMismatch(
+                "operator rotation requires equal square shapes".into(),
+            ));
+        }
+        if !tolerance.is_finite() || tolerance <= 0.0 {
+            return Err(QuSpinError::InvalidOptions(
+                "unitarity tolerance must be positive".into(),
+            ));
+        }
+        let identity = unitary.adjoint()?.product(unitary)?;
+        for row in 0..self.shape.0 {
+            for column in 0..self.shape.1 {
+                let expected = if row == column { 1.0 } else { 0.0 };
+                if (identity.value_at(row, column) - expected).norm() > tolerance {
+                    return Err(QuSpinError::InvalidOptions(
+                        "rotation matrix must be unitary".into(),
+                    ));
+                }
+            }
+        }
+        unitary.adjoint()?.product(self)?.product(unitary)
     }
 
     fn value_at(&self, row: usize, column: usize) -> Complex64 {
@@ -545,6 +1083,10 @@ impl LinearOperator for Operator {
         Ok(())
     }
 
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        Ok(Some(self.triplets()))
+    }
+
     fn shifted_solver(&self, shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
         if self.shape.0 != self.shape.1 || !shift.is_finite() {
             return Err(QuSpinError::InvalidOptions(
@@ -689,6 +1231,263 @@ pub(crate) fn materialize_dense(
     Ok(dense)
 }
 
+/// Shared scaled matrix-vector adapter corresponding to QuSpin's low-level
+/// `matvec` helper. When `overwrite` is false the result is accumulated into
+/// the existing output buffer.
+pub fn matvec(
+    operator: &(impl LinearOperator + ?Sized),
+    input: &[Complex64],
+    output: &mut [Complex64],
+    coefficient: Complex64,
+    overwrite: bool,
+) -> Result<()> {
+    if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+        return Err(QuSpinError::InvalidOptions(
+            "matvec coefficient must be finite".into(),
+        ));
+    }
+    if overwrite {
+        operator.apply(input, output)?;
+        for value in output {
+            *value *= coefficient;
+        }
+        return Ok(());
+    }
+
+    let mut contribution = vec![Complex64::new(0.0, 0.0); output.len()];
+    operator.apply(input, &mut contribution)?;
+    for (value, addition) in output.iter_mut().zip(contribution) {
+        *value += coefficient * addition;
+    }
+    Ok(())
+}
+
+/// Apply an operator to a column batch without constructing a dense matrix.
+pub fn matmat(
+    operator: &(impl LinearOperator + ?Sized),
+    columns: &[Vec<Complex64>],
+) -> Result<Vec<Vec<Complex64>>> {
+    let (rows, input_dimension) = operator.shape();
+    columns
+        .iter()
+        .map(|column| {
+            if column.len() != input_dimension {
+                return Err(QuSpinError::DimensionMismatch(
+                    "matrix column does not match the operator input dimension".into(),
+                ));
+            }
+            let mut output = vec![Complex64::new(0.0, 0.0); rows];
+            operator.apply(column, &mut output)?;
+            Ok(output)
+        })
+        .collect()
+}
+
+/// Row-vector action through the transpose narrow waist.
+pub fn rmatvec(
+    operator: &(impl LinearOperator + ?Sized),
+    input: &[Complex64],
+) -> Result<Vec<Complex64>> {
+    let mut output = vec![Complex64::new(0.0, 0.0); operator.shape().1];
+    operator.apply_transpose(input, &mut output)?;
+    Ok(output)
+}
+
+pub fn rmatmat(
+    operator: &(impl LinearOperator + ?Sized),
+    rows: &[Vec<Complex64>],
+) -> Result<Vec<Vec<Complex64>>> {
+    rows.iter().map(|row| rmatvec(operator, row)).collect()
+}
+
+/// Reusable owned matrix-vector plan for callback-driven algorithms.
+#[derive(Clone)]
+pub struct MatVecPlan {
+    operator: Arc<dyn LinearOperator>,
+}
+
+impl std::fmt::Debug for MatVecPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MatVecPlan")
+            .field("shape", &self.operator.shape())
+            .finish()
+    }
+}
+
+impl MatVecPlan {
+    pub fn new(operator: Arc<dyn LinearOperator>) -> Self {
+        Self { operator }
+    }
+
+    pub fn apply(
+        &self,
+        input: &[Complex64],
+        output: &mut [Complex64],
+        coefficient: Complex64,
+        overwrite: bool,
+    ) -> Result<()> {
+        matvec(
+            self.operator.as_ref(),
+            input,
+            output,
+            coefficient,
+            overwrite,
+        )
+    }
+
+    pub fn operator(&self) -> &Arc<dyn LinearOperator> {
+        &self.operator
+    }
+}
+
+pub fn get_matvec_function(operator: Arc<dyn LinearOperator>) -> MatVecPlan {
+    MatVecPlan::new(operator)
+}
+
+/// Matrix-free algebraic transpose view of an owned linear operator.
+#[derive(Clone)]
+pub struct TransposedLinearOperator {
+    operator: Arc<dyn LinearOperator>,
+}
+
+impl TransposedLinearOperator {
+    pub fn new(operator: Arc<dyn LinearOperator>) -> Self {
+        Self { operator }
+    }
+}
+
+impl std::fmt::Debug for TransposedLinearOperator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransposedLinearOperator")
+            .field("shape", &self.shape())
+            .finish()
+    }
+}
+
+impl LinearOperator for TransposedLinearOperator {
+    fn shape(&self) -> (usize, usize) {
+        let (rows, columns) = self.operator.shape();
+        (columns, rows)
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.operator.apply_transpose(input, output)
+    }
+
+    fn apply_transpose(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.operator.apply(input, output)
+    }
+
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        Ok(self.operator.stored_triplets()?.map(|entries| {
+            entries
+                .into_iter()
+                .map(|(row, column, value)| (column, row, value))
+                .collect()
+        }))
+    }
+}
+
+/// Matrix-free elementwise-conjugate view of an owned linear operator.
+#[derive(Clone)]
+pub struct ConjugatedLinearOperator {
+    operator: Arc<dyn LinearOperator>,
+}
+
+impl ConjugatedLinearOperator {
+    pub fn new(operator: Arc<dyn LinearOperator>) -> Self {
+        Self { operator }
+    }
+}
+
+impl std::fmt::Debug for ConjugatedLinearOperator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConjugatedLinearOperator")
+            .field("shape", &self.shape())
+            .finish()
+    }
+}
+
+impl LinearOperator for ConjugatedLinearOperator {
+    fn shape(&self) -> (usize, usize) {
+        self.operator.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        let conjugated_input: Vec<_> = input.iter().map(|value| value.conj()).collect();
+        self.operator.apply(&conjugated_input, output)?;
+        for value in output {
+            *value = value.conj();
+        }
+        Ok(())
+    }
+
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        Ok(self.operator.stored_triplets()?.map(|entries| {
+            entries
+                .into_iter()
+                .map(|(row, column, value)| (row, column, value.conj()))
+                .collect()
+        }))
+    }
+}
+
+/// Matrix-free conjugate-transpose view of an owned linear operator.
+#[derive(Clone)]
+pub struct AdjointLinearOperator {
+    operator: Arc<dyn LinearOperator>,
+}
+
+impl AdjointLinearOperator {
+    pub fn new(operator: Arc<dyn LinearOperator>) -> Self {
+        Self { operator }
+    }
+}
+
+impl std::fmt::Debug for AdjointLinearOperator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdjointLinearOperator")
+            .field("shape", &self.shape())
+            .finish()
+    }
+}
+
+impl LinearOperator for AdjointLinearOperator {
+    fn shape(&self) -> (usize, usize) {
+        let (rows, columns) = self.operator.shape();
+        (columns, rows)
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.operator.apply_adjoint(input, output)
+    }
+
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        Ok(self.operator.stored_triplets()?.map(|entries| {
+            entries
+                .into_iter()
+                .map(|(row, column, value)| (column, row, value.conj()))
+                .collect()
+        }))
+    }
+}
+
 /// Universal square or cross-sector operator builder.
 pub struct OperatorBuilder<'a, Source, Target>
 where
@@ -746,26 +1545,46 @@ where
 
     pub fn build(self, format: MatrixFormat) -> Result<Operator> {
         let shape = (self.target.len(), self.source.len());
+        if self.checks.particle_conservation {
+            for term in &self.terms {
+                if !self
+                    .source
+                    .operator_preserves_particle_sector(term.operator())?
+                    || !self
+                        .target
+                        .operator_preserves_particle_sector(term.operator())?
+                {
+                    return Err(QuSpinError::InvalidSector(format!(
+                        "operator {:?} does not preserve the selected particle sector",
+                        term.operator()
+                    )));
+                }
+            }
+        }
         let mut accumulated: HashMap<(usize, usize), Complex64> = HashMap::new();
         for column in 0..self.source.len() {
             let source_state = self.source.state(column)?;
+            let source_orbit_size = self.source.transition_orbit_size(source_state)?;
             for term in &self.terms {
                 for coupling in term.couplings() {
-                    let Some((target_state, local_amplitude)) =
-                        self.source
-                            .apply_local(source_state, term.operator(), &coupling.sites)?
-                    else {
-                        continue;
-                    };
-                    let row = match self.target.index(target_state) {
-                        Ok(index) => index,
-                        Err(QuSpinError::StateNotInBasis) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    *accumulated
-                        .entry((row, column))
-                        .or_insert(Complex64::new(0.0, 0.0)) +=
-                        coupling.coefficient * local_amplitude;
+                    self.source.visit_local_unreduced_transitions(
+                        source_state,
+                        term.operator(),
+                        &coupling.sites,
+                        |unreduced_target, local_amplitude| {
+                            let Some((row, reduction_amplitude)) = self
+                                .target
+                                .index_transition(unreduced_target, source_orbit_size)?
+                            else {
+                                return Ok(());
+                            };
+                            *accumulated
+                                .entry((row, column))
+                                .or_insert(Complex64::new(0.0, 0.0)) +=
+                                coupling.coefficient * local_amplitude * reduction_amplitude;
+                            Ok(())
+                        },
+                    )?;
                 }
             }
         }
@@ -815,4 +1634,1085 @@ where
         }
         Ok(operator)
     }
+
+    /// Assemble static and driven terms through the same local-action path.
+    pub fn build_dynamic(
+        self,
+        dynamic_terms: impl IntoIterator<Item = DynamicTerm>,
+        format: MatrixFormat,
+    ) -> Result<Hamiltonian<Dynamic>> {
+        let Self {
+            source,
+            target,
+            terms,
+            checks,
+        } = self;
+        if source.len() != target.len() {
+            return Err(QuSpinError::DimensionMismatch(
+                "a Hamiltonian must be square".into(),
+            ));
+        }
+        let static_part = Self {
+            source,
+            target,
+            terms,
+            checks,
+        }
+        .build(format)?;
+        let component_checks = AssemblyChecks {
+            hermiticity: false,
+            particle_conservation: checks.particle_conservation,
+            symmetry_compatibility: checks.symmetry_compatibility,
+        };
+        let mut components = Vec::new();
+        for dynamic_term in dynamic_terms {
+            let (term, drive) = dynamic_term.into_parts();
+            let operator = Self {
+                source,
+                target,
+                terms: vec![term],
+                checks: component_checks,
+            }
+            .build(format)?;
+            components.push(DynamicComponent { operator, drive });
+        }
+        Hamiltonian::<Dynamic>::new(static_part, components)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BraKetTransition<State> {
+    pub bra: State,
+    pub ket: State,
+    pub matrix_element: Complex64,
+}
+
+/// Raw local transition table, including branching callbacks and fermionic signs.
+pub fn bra_ket_transitions<B>(
+    basis: &B,
+    operator: &str,
+    sites: &[usize],
+    coefficient: impl Into<Complex64>,
+    kets: impl IntoIterator<Item = B::State>,
+) -> Result<Vec<BraKetTransition<B::State>>>
+where
+    B: Basis,
+{
+    let coefficient = coefficient.into();
+    if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+        return Err(QuSpinError::InvalidCoupling(
+            "transition-table coefficient must be finite".into(),
+        ));
+    }
+    let mut transitions = Vec::new();
+    for ket in kets {
+        basis.visit_local_unreduced_transitions(ket, operator, sites, |bra, amplitude| {
+            let matrix_element = coefficient * amplitude;
+            if matrix_element.norm() > f64::EPSILON {
+                transitions.push(BraKetTransition {
+                    bra,
+                    ket,
+                    matrix_element,
+                });
+            }
+            Ok(())
+        })?;
+    }
+    Ok(transitions)
+}
+
+/// Apply parsed terms directly between sectors without materializing a matrix.
+pub fn apply_sector_shift<Source, Target>(
+    source: &Source,
+    target: &Target,
+    terms: &[OperatorTerm],
+    input: &[Complex64],
+    output: &mut [Complex64],
+) -> Result<()>
+where
+    Source: Basis,
+    Target: Basis<State = Source::State>,
+{
+    if input.len() != source.len() || output.len() != target.len() {
+        return Err(QuSpinError::DimensionMismatch(
+            "sector-shift state dimensions do not match source and target bases".into(),
+        ));
+    }
+    output.fill(Complex64::new(0.0, 0.0));
+    for (column, input_value) in input.iter().copied().enumerate() {
+        if input_value.norm() <= f64::EPSILON {
+            continue;
+        }
+        let source_state = source.state(column)?;
+        let source_orbit_size = source.transition_orbit_size(source_state)?;
+        for term in terms {
+            for coupling in term.couplings() {
+                source.visit_local_unreduced_transitions(
+                    source_state,
+                    term.operator(),
+                    &coupling.sites,
+                    |unreduced_target, local_amplitude| {
+                        let Some((row, reduction_amplitude)) =
+                            target.index_transition(unreduced_target, source_orbit_size)?
+                        else {
+                            return Ok(());
+                        };
+                        output[row] += input_value
+                            * coupling.coefficient
+                            * local_amplitude
+                            * reduction_amplitude;
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+type DriveFunction = Arc<dyn Fn(f64) -> Complex64 + Send + Sync>;
+
+/// A parsed local term multiplied by a scalar function of time.
+#[derive(Clone)]
+pub struct DynamicTerm {
+    term: OperatorTerm,
+    drive: DriveFunction,
+}
+
+impl std::fmt::Debug for DynamicTerm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicTerm")
+            .field("term", &self.term)
+            .field("drive", &"<callable>")
+            .finish()
+    }
+}
+
+impl DynamicTerm {
+    pub fn new<F>(term: OperatorTerm, drive: F) -> Self
+    where
+        F: Fn(f64) -> Complex64 + Send + Sync + 'static,
+    {
+        Self {
+            term,
+            drive: Arc::new(drive),
+        }
+    }
+
+    pub fn coefficient_at(&self, time: f64) -> Result<Complex64> {
+        finite_drive_value(time, (self.drive)(time))
+    }
+
+    fn into_parts(self) -> (OperatorTerm, DriveFunction) {
+        (self.term, self.drive)
+    }
+}
+
+#[derive(Clone)]
+pub struct DynamicComponent {
+    operator: Operator,
+    drive: DriveFunction,
+}
+
+impl std::fmt::Debug for DynamicComponent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicComponent")
+            .field("operator", &self.operator)
+            .field("drive", &"<callable>")
+            .finish()
+    }
+}
+
+impl DynamicComponent {
+    pub fn new<F>(operator: Operator, drive: F) -> Self
+    where
+        F: Fn(f64) -> Complex64 + Send + Sync + 'static,
+    {
+        Self {
+            operator,
+            drive: Arc::new(drive),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Static;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Dynamic;
+
+/// Static or explicitly time-dependent Hamiltonian with a type-state marker.
+#[derive(Clone, Debug)]
+pub struct Hamiltonian<Kind = Static> {
+    static_part: Operator,
+    dynamic_parts: Vec<DynamicComponent>,
+    marker: PhantomData<Kind>,
+}
+
+impl Hamiltonian<Static> {
+    pub fn new(operator: Operator) -> Result<Self> {
+        let shape = operator.shape();
+        if shape.0 != shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "a Hamiltonian must be square".into(),
+            ));
+        }
+        Ok(Self {
+            static_part: operator,
+            dynamic_parts: Vec::new(),
+            marker: PhantomData,
+        })
+    }
+
+    pub fn operator(&self) -> &Operator {
+        &self.static_part
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        Self::new(self.static_part.transpose()?)
+    }
+
+    pub fn conjugated(&self) -> Result<Self> {
+        Self::new(self.static_part.conjugated()?)
+    }
+
+    pub fn adjoint(&self) -> Result<Self> {
+        Self::new(self.static_part.adjoint()?)
+    }
+
+    pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
+        Self::new(self.static_part.scaled(coefficient)?)
+    }
+}
+
+impl Hamiltonian<Dynamic> {
+    pub fn new(static_part: Operator, dynamic_parts: Vec<DynamicComponent>) -> Result<Self> {
+        let shape = static_part.shape();
+        if shape.0 != shape.1
+            || dynamic_parts
+                .iter()
+                .any(|component| component.operator.shape() != shape)
+        {
+            return Err(QuSpinError::DimensionMismatch(
+                "all Hamiltonian components must share one square shape".into(),
+            ));
+        }
+        Ok(Self {
+            static_part,
+            dynamic_parts,
+            marker: PhantomData,
+        })
+    }
+
+    pub fn evaluate(&self, time: f64, format: MatrixFormat) -> Result<Operator> {
+        if !time.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "evaluation time must be finite".into(),
+            ));
+        }
+        let shape = self.static_part.shape();
+        let mut entries = self.static_part.triplets();
+        for component in &self.dynamic_parts {
+            let coefficient = finite_drive_value(time, (component.drive)(time))?;
+            entries.extend(
+                component
+                    .operator
+                    .triplets()
+                    .into_iter()
+                    .map(|(row, column, value)| (row, column, coefficient * value)),
+            );
+        }
+        Operator::from_triplets(shape.0, shape.1, entries, format)
+    }
+
+    pub fn dynamic_components(&self) -> usize {
+        self.dynamic_parts.len()
+    }
+
+    pub fn static_part(&self) -> &Operator {
+        &self.static_part
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        Self::new(
+            self.static_part.transpose()?,
+            self.dynamic_parts
+                .iter()
+                .map(|component| {
+                    Ok(DynamicComponent {
+                        operator: component.operator.transpose()?,
+                        drive: component.drive.clone(),
+                    })
+                })
+                .collect::<Result<_>>()?,
+        )
+    }
+
+    pub fn conjugated(&self) -> Result<Self> {
+        Self::new(
+            self.static_part.conjugated()?,
+            self.dynamic_parts
+                .iter()
+                .map(|component| {
+                    let drive = component.drive.clone();
+                    Ok(DynamicComponent {
+                        operator: component.operator.conjugated()?,
+                        drive: Arc::new(move |time| drive(time).conj()),
+                    })
+                })
+                .collect::<Result<_>>()?,
+        )
+    }
+
+    pub fn adjoint(&self) -> Result<Self> {
+        Self::new(
+            self.static_part.adjoint()?,
+            self.dynamic_parts
+                .iter()
+                .map(|component| {
+                    let drive = component.drive.clone();
+                    Ok(DynamicComponent {
+                        operator: component.operator.adjoint()?,
+                        drive: Arc::new(move |time| drive(time).conj()),
+                    })
+                })
+                .collect::<Result<_>>()?,
+        )
+    }
+
+    pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
+        let coefficient = coefficient.into();
+        if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "Hamiltonian scale must be finite".into(),
+            ));
+        }
+        Self::new(
+            self.static_part.scaled(coefficient)?,
+            self.dynamic_parts
+                .iter()
+                .map(|component| DynamicComponent {
+                    operator: component.operator.clone(),
+                    drive: {
+                        let drive = component.drive.clone();
+                        Arc::new(move |time| coefficient * drive(time))
+                    },
+                })
+                .collect(),
+        )
+    }
+}
+
+fn finite_drive_value(time: f64, value: Complex64) -> Result<Complex64> {
+    if !time.is_finite() || !value.re.is_finite() || !value.im.is_finite() {
+        return Err(QuSpinError::InvalidOptions(
+            "drive time and coefficient must be finite".into(),
+        ));
+    }
+    Ok(value)
+}
+
+impl LinearOperator for Hamiltonian<Static> {
+    fn shape(&self) -> (usize, usize) {
+        self.static_part.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        self.static_part.format()
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.static_part.apply(input, output)
+    }
+
+    fn apply_transpose(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.static_part.apply_transpose(input, output)
+    }
+
+    fn apply_adjoint(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.static_part.apply_adjoint(input, output)
+    }
+
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        self.static_part.stored_triplets()
+    }
+
+    fn shifted_solver(&self, shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
+        self.static_part.shifted_solver(shift)
+    }
+}
+
+impl TimeDependentOperator for Hamiltonian<Static> {
+    fn shape(&self) -> (usize, usize) {
+        self.static_part.shape()
+    }
+
+    fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if !time.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "evaluation time must be finite".into(),
+            ));
+        }
+        self.static_part.apply(input, output)
+    }
+}
+
+impl TimeDependentOperator for Hamiltonian<Dynamic> {
+    fn shape(&self) -> (usize, usize) {
+        self.static_part.shape()
+    }
+
+    fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        check_apply_shape(self.static_part.shape(), input, output)?;
+        self.static_part.apply(input, output)?;
+        let mut driven = vec![Complex64::new(0.0, 0.0); output.len()];
+        for component in &self.dynamic_parts {
+            let coefficient = finite_drive_value(time, (component.drive)(time))?;
+            component.operator.apply(input, &mut driven)?;
+            for (value, contribution) in output.iter_mut().zip(&driven) {
+                *value += coefficient * *contribution;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantumComponent {
+    name: String,
+    operator: Operator,
+    default: Option<Complex64>,
+}
+
+impl QuantumComponent {
+    pub fn required(name: impl Into<String>, operator: Operator) -> Self {
+        Self {
+            name: name.into(),
+            operator,
+            default: None,
+        }
+    }
+
+    pub fn with_default(
+        name: impl Into<String>,
+        operator: Operator,
+        default: impl Into<Complex64>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            operator,
+            default: Some(default.into()),
+        }
+    }
+
+    /// Python-compatible parameter component: an omitted parameter equals one.
+    pub fn parameter(name: impl Into<String>, operator: Operator) -> Self {
+        Self::with_default(name, operator, Complex64::new(1.0, 0.0))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn operator(&self) -> &Operator {
+        &self.operator
+    }
+
+    pub const fn default(&self) -> Option<Complex64> {
+        self.default
+    }
+}
+
+/// Named linear combination of operator components.
+#[derive(Clone, Debug)]
+pub struct QuantumOperator {
+    components: Vec<QuantumComponent>,
+    shape: (usize, usize),
+}
+
+impl QuantumOperator {
+    pub fn new(components: impl IntoIterator<Item = QuantumComponent>) -> Result<Self> {
+        let components: Vec<_> = components.into_iter().collect();
+        let first = components.first().ok_or_else(|| {
+            QuSpinError::InvalidOptions("QuantumOperator requires at least one component".into())
+        })?;
+        let shape = first.operator.shape();
+        let mut names = std::collections::HashSet::new();
+        for component in &components {
+            if component.name.is_empty() || !names.insert(component.name.clone()) {
+                return Err(QuSpinError::InvalidOptions(
+                    "component names must be nonempty and unique".into(),
+                ));
+            }
+            if component.operator.shape() != shape {
+                return Err(QuSpinError::DimensionMismatch(
+                    "all parameterized components must have equal shapes".into(),
+                ));
+            }
+            if component
+                .default
+                .is_some_and(|value| !value.re.is_finite() || !value.im.is_finite())
+            {
+                return Err(QuSpinError::InvalidOptions(
+                    "component defaults must be finite".into(),
+                ));
+            }
+        }
+        Ok(Self { components, shape })
+    }
+
+    pub const fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    pub fn component_names(&self) -> impl Iterator<Item = &str> {
+        self.components
+            .iter()
+            .map(|component| component.name.as_str())
+    }
+
+    pub fn components(&self) -> &[QuantumComponent] {
+        &self.components
+    }
+
+    pub fn component(&self, name: &str) -> Result<&Operator> {
+        self.components
+            .iter()
+            .find(|component| component.name == name)
+            .map(|component| &component.operator)
+            .ok_or_else(|| {
+                QuSpinError::InvalidOptions(format!("unknown operator component {name:?}"))
+            })
+    }
+
+    pub fn evaluate(
+        &self,
+        parameters: &HashMap<String, Complex64>,
+        format: MatrixFormat,
+    ) -> Result<Operator> {
+        if let Some(name) = parameters.keys().find(|name| {
+            !self
+                .components
+                .iter()
+                .any(|component| &component.name == *name)
+        }) {
+            return Err(QuSpinError::InvalidOptions(format!(
+                "unknown operator parameter {name:?}"
+            )));
+        }
+        let mut entries = Vec::new();
+        for component in &self.components {
+            let coefficient = parameters
+                .get(&component.name)
+                .copied()
+                .or(component.default)
+                .ok_or_else(|| {
+                    QuSpinError::InvalidOptions(format!(
+                        "missing required operator parameter {:?}",
+                        component.name
+                    ))
+                })?;
+            if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
+                return Err(QuSpinError::InvalidOptions(format!(
+                    "operator parameter {:?} must be finite",
+                    component.name
+                )));
+            }
+            entries.extend(
+                component
+                    .operator
+                    .triplets()
+                    .into_iter()
+                    .map(|(row, column, value)| (row, column, coefficient * value)),
+            );
+        }
+        Operator::from_triplets(self.shape.0, self.shape.1, entries, format)
+    }
+
+    pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
+        let coefficient = coefficient.into();
+        let mut components = Vec::with_capacity(self.components.len());
+        for component in &self.components {
+            components.push(QuantumComponent {
+                name: component.name.clone(),
+                operator: component.operator.scaled(coefficient)?,
+                default: component.default,
+            });
+        }
+        Self::new(components)
+    }
+
+    pub fn conjugated(&self) -> Result<Self> {
+        let mut components = Vec::with_capacity(self.components.len());
+        for component in &self.components {
+            components.push(QuantumComponent {
+                name: component.name.clone(),
+                operator: component.operator.conjugated()?,
+                default: component.default.map(|value| value.conj()),
+            });
+        }
+        Self::new(components)
+    }
+
+    pub fn add(&self, right: &Self) -> Result<Self> {
+        if self.shape != right.shape {
+            return Err(QuSpinError::DimensionMismatch(
+                "parameterized operators must have equal shapes".into(),
+            ));
+        }
+        let mut components = self.components.clone();
+        for right_component in &right.components {
+            if let Some(left_component) = components
+                .iter_mut()
+                .find(|component| component.name == right_component.name)
+            {
+                left_component.operator = left_component.operator.add(&right_component.operator)?;
+                if left_component.default != right_component.default {
+                    left_component.default = None;
+                }
+            } else {
+                components.push(right_component.clone());
+            }
+        }
+        Self::new(components)
+    }
+
+    pub fn adjoint(&self) -> Result<Self> {
+        let mut components = Vec::with_capacity(self.components.len());
+        for component in &self.components {
+            components.push(QuantumComponent {
+                name: component.name.clone(),
+                operator: component.operator.adjoint()?,
+                default: component.default.map(|value| value.conj()),
+            });
+        }
+        Self::new(components)
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        let mut components = Vec::with_capacity(self.components.len());
+        for component in &self.components {
+            components.push(QuantumComponent {
+                name: component.name.clone(),
+                operator: component.operator.transpose()?,
+                default: component.default,
+            });
+        }
+        Self::new(components)
+    }
+}
+
+/// Fixed matrix-free operator with a mutable diagonal correction.
+#[derive(Clone, Debug)]
+pub struct QuantumLinearOperator {
+    operator: Operator,
+    diagonal: Vec<Complex64>,
+}
+
+impl QuantumLinearOperator {
+    pub fn new(operator: Operator, diagonal: Vec<Complex64>) -> Result<Self> {
+        let shape = operator.shape();
+        if shape.0 != shape.1 || diagonal.len() != shape.0 {
+            return Err(QuSpinError::DimensionMismatch(
+                "QuantumLinearOperator needs a square operator and one diagonal value per row"
+                    .into(),
+            ));
+        }
+        if diagonal
+            .iter()
+            .any(|value| !value.re.is_finite() || !value.im.is_finite())
+        {
+            return Err(QuSpinError::InvalidOptions(
+                "QuantumLinearOperator diagonal values must be finite".into(),
+            ));
+        }
+        Ok(Self { operator, diagonal })
+    }
+
+    pub fn from_operator(operator: Operator) -> Result<Self> {
+        let dimension = operator.shape().0;
+        Self::new(operator, vec![Complex64::new(0.0, 0.0); dimension])
+    }
+
+    pub fn operator(&self) -> &Operator {
+        &self.operator
+    }
+
+    pub fn diagonal_correction(&self) -> &[Complex64] {
+        &self.diagonal
+    }
+
+    pub fn set_diagonal(&mut self, diagonal: Vec<Complex64>) -> Result<()> {
+        if diagonal.len() != self.diagonal.len()
+            || diagonal
+                .iter()
+                .any(|value| !value.re.is_finite() || !value.im.is_finite())
+        {
+            return Err(QuSpinError::DimensionMismatch(
+                "replacement diagonal has the wrong length or non-finite values".into(),
+            ));
+        }
+        self.diagonal = diagonal;
+        Ok(())
+    }
+
+    pub fn materialize(&self, format: MatrixFormat) -> Result<Operator> {
+        let dimension = self.diagonal.len();
+        let entries = self.operator.triplets().into_iter().chain(
+            self.diagonal
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    (value.norm() > f64::EPSILON).then_some((index, index, value))
+                }),
+        );
+        Operator::from_triplets(dimension, dimension, entries, format)
+    }
+
+    pub fn adjoint(&self) -> Result<Self> {
+        Self::new(
+            self.operator.adjoint()?,
+            self.diagonal.iter().map(|value| value.conj()).collect(),
+        )
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        Self::new(self.operator.transpose()?, self.diagonal.clone())
+    }
+
+    pub fn conjugated(&self) -> Result<Self> {
+        Self::new(
+            self.operator.conjugated()?,
+            self.diagonal.iter().map(|value| value.conj()).collect(),
+        )
+    }
+
+    pub fn right_apply(&self, input: &[Complex64]) -> Result<Vec<Complex64>> {
+        let mut output = vec![Complex64::new(0.0, 0.0); self.shape().1];
+        self.apply_transpose(input, &mut output)?;
+        Ok(output)
+    }
+}
+
+impl LinearOperator for QuantumLinearOperator {
+    fn shape(&self) -> (usize, usize) {
+        self.operator.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.operator.apply(input, output)?;
+        for ((value, diagonal), input_value) in output.iter_mut().zip(&self.diagonal).zip(input) {
+            *value += *diagonal * *input_value;
+        }
+        Ok(())
+    }
+
+    fn apply_transpose(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.operator.apply_transpose(input, output)?;
+        for ((value, diagonal), input_value) in output.iter_mut().zip(&self.diagonal).zip(input) {
+            *value += *diagonal * *input_value;
+        }
+        Ok(())
+    }
+
+    fn stored_triplets(&self) -> Result<Option<Vec<(usize, usize, Complex64)>>> {
+        Ok(Some(self.materialize(MatrixFormat::Csc)?.triplets()))
+    }
+
+    fn shifted_solver(&self, shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
+        self.materialize(MatrixFormat::Csc)?.shifted_solver(shift)
+    }
+}
+
+pub fn commutator(left: &Operator, right: &Operator) -> Result<Operator> {
+    left.product(right)?.subtract(&right.product(left)?)
+}
+
+pub fn anticommutator(left: &Operator, right: &Operator) -> Result<Operator> {
+    left.product(right)?.add(&right.product(left)?)
+}
+
+/// Immutable real grid multiplying an [`ExpOp`] exponent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpGrid {
+    pub start: f64,
+    pub stop: f64,
+    pub points: usize,
+    pub endpoint: bool,
+}
+
+impl ExpGrid {
+    pub fn new(start: f64, stop: f64, points: usize, endpoint: bool) -> Result<Self> {
+        if !start.is_finite() || !stop.is_finite() || points == 0 {
+            return Err(QuSpinError::InvalidOptions(
+                "exponential grid endpoints must be finite and points must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            start,
+            stop,
+            points,
+            endpoint,
+        })
+    }
+
+    pub fn values(&self) -> Vec<f64> {
+        if self.points == 1 {
+            return vec![self.start];
+        }
+        let intervals = if self.endpoint {
+            self.points - 1
+        } else {
+            self.points
+        };
+        let step = (self.stop - self.start) / intervals as f64;
+        (0..self.points)
+            .map(|index| self.start + index as f64 * step)
+            .collect()
+    }
+}
+
+/// Lazy state iterator over an exponential grid.
+pub struct ExpOpGridIter {
+    operator: ExpOp,
+    input: Vec<Complex64>,
+    scales: std::vec::IntoIter<f64>,
+}
+
+impl Iterator for ExpOpGridIter {
+    type Item = Result<Vec<Complex64>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.scales.next().map(|scale| {
+            let mut operator = self.operator.clone();
+            operator.set_exponent(scale * self.operator.exponent)?;
+            let mut output = vec![Complex64::new(0.0, 0.0); self.input.len()];
+            operator.apply(&self.input, &mut output)?;
+            Ok(output)
+        })
+    }
+}
+
+/// Matrix-free exponential `exp(exponent * A)`.
+#[derive(Clone)]
+pub struct ExpOp {
+    operator: Arc<dyn LinearOperator>,
+    exponent: Complex64,
+    krylov_dimension: usize,
+    tolerance: f64,
+    max_substeps: usize,
+}
+
+impl std::fmt::Debug for ExpOp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExpOp")
+            .field("shape", &self.operator.shape())
+            .field("exponent", &self.exponent)
+            .field("krylov_dimension", &self.krylov_dimension)
+            .field("tolerance", &self.tolerance)
+            .field("max_substeps", &self.max_substeps)
+            .finish()
+    }
+}
+
+impl ExpOp {
+    pub fn new(
+        operator: Arc<dyn LinearOperator>,
+        exponent: Complex64,
+        krylov_dimension: usize,
+        tolerance: f64,
+        max_substeps: usize,
+    ) -> Result<Self> {
+        let shape = operator.shape();
+        if shape.0 != shape.1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "ExpOp requires a square operator".into(),
+            ));
+        }
+        if !exponent.re.is_finite()
+            || !exponent.im.is_finite()
+            || krylov_dimension == 0
+            || !tolerance.is_finite()
+            || tolerance <= 0.0
+            || max_substeps == 0
+        {
+            return Err(QuSpinError::InvalidOptions(
+                "invalid ExpOp coefficient or numerical controls".into(),
+            ));
+        }
+        Ok(Self {
+            operator,
+            exponent,
+            krylov_dimension,
+            tolerance,
+            max_substeps,
+        })
+    }
+
+    pub const fn exponent(&self) -> Complex64 {
+        self.exponent
+    }
+
+    pub fn generator(&self) -> &Arc<dyn LinearOperator> {
+        &self.operator
+    }
+
+    pub fn set_exponent(&mut self, exponent: Complex64) -> Result<()> {
+        if !exponent.re.is_finite() || !exponent.im.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "ExpOp coefficient must be finite".into(),
+            ));
+        }
+        self.exponent = exponent;
+        Ok(())
+    }
+
+    pub fn sandwich(&self, state: &[Complex64]) -> Result<Complex64> {
+        let mut output = vec![Complex64::new(0.0, 0.0); state.len()];
+        self.apply(state, &mut output)?;
+        Ok(state
+            .iter()
+            .zip(output)
+            .map(|(left, right)| left.conj() * right)
+            .sum())
+    }
+
+    pub fn matrix(&self, format: MatrixFormat) -> Result<Operator> {
+        let shape = self.shape();
+        let mut input = vec![Complex64::new(0.0, 0.0); shape.1];
+        let mut output = vec![Complex64::new(0.0, 0.0); shape.0];
+        let mut triplets = Vec::new();
+        for column in 0..shape.1 {
+            input.fill(Complex64::new(0.0, 0.0));
+            input[column] = Complex64::new(1.0, 0.0);
+            self.apply(&input, &mut output)?;
+            for (row, value) in output.iter().copied().enumerate() {
+                if value.norm() > f64::EPSILON {
+                    triplets.push((row, column, value));
+                }
+            }
+        }
+        Operator::from_triplets(shape.0, shape.1, triplets, format)
+    }
+
+    pub fn iter_grid(&self, input: &[Complex64], grid: ExpGrid) -> Result<ExpOpGridIter> {
+        if input.len() != self.shape().1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "ExpOp grid input must match the operator dimension".into(),
+            ));
+        }
+        Ok(ExpOpGridIter {
+            operator: self.clone(),
+            input: input.to_vec(),
+            scales: grid.values().into_iter(),
+        })
+    }
+
+    pub fn apply_grid(&self, input: &[Complex64], grid: ExpGrid) -> Result<Vec<Vec<Complex64>>> {
+        self.iter_grid(input, grid)?.collect()
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        Self::new(
+            Arc::new(TransposedLinearOperator::new(self.operator.clone())),
+            self.exponent,
+            self.krylov_dimension,
+            self.tolerance,
+            self.max_substeps,
+        )
+    }
+
+    pub fn conjugated(&self) -> Result<Self> {
+        Self::new(
+            Arc::new(ConjugatedLinearOperator::new(self.operator.clone())),
+            self.exponent.conj(),
+            self.krylov_dimension,
+            self.tolerance,
+            self.max_substeps,
+        )
+    }
+
+    pub fn adjoint(&self) -> Result<Self> {
+        Self::new(
+            Arc::new(AdjointLinearOperator::new(self.operator.clone())),
+            self.exponent.conj(),
+            self.krylov_dimension,
+            self.tolerance,
+            self.max_substeps,
+        )
+    }
+
+    pub fn right_apply(&self, input: &[Complex64]) -> Result<Vec<Complex64>> {
+        if input.len() != self.shape().0 {
+            return Err(QuSpinError::DimensionMismatch(
+                "ExpOp right-apply input must match the operator dimension".into(),
+            ));
+        }
+        let mut output = vec![Complex64::new(0.0, 0.0); self.shape().1];
+        self.apply_transpose(input, &mut output)?;
+        Ok(output)
+    }
+}
+
+impl LinearOperator for ExpOp {
+    fn shape(&self) -> (usize, usize) {
+        self.operator.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        check_apply_shape(self.shape(), input, output)?;
+        let result = crate::solve::expm_action_complex(
+            self.operator.as_ref(),
+            input,
+            self.exponent,
+            self.krylov_dimension,
+            self.tolerance,
+            self.max_substeps,
+        )?;
+        output.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn apply_transpose(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        check_apply_shape((self.shape().1, self.shape().0), input, output)?;
+        let transpose = TransposedLinearOperator::new(self.operator.clone());
+        let result = crate::solve::expm_action_complex(
+            &transpose,
+            input,
+            self.exponent,
+            self.krylov_dimension,
+            self.tolerance,
+            self.max_substeps,
+        )?;
+        output.copy_from_slice(&result);
+        Ok(())
+    }
+}
+
+pub fn is_exp_op(value: &dyn std::any::Any) -> bool {
+    value.is::<ExpOp>()
+}
+
+pub fn is_hamiltonian(value: &dyn std::any::Any) -> bool {
+    value.is::<Hamiltonian<Static>>() || value.is::<Hamiltonian<Dynamic>>()
+}
+
+pub fn is_quantum_operator(value: &dyn std::any::Any) -> bool {
+    value.is::<QuantumOperator>()
+}
+
+pub fn is_quantum_linear_operator(value: &dyn std::any::Any) -> bool {
+    value.is::<QuantumLinearOperator>()
 }

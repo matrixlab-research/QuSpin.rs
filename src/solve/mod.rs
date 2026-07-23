@@ -1,16 +1,91 @@
-use std::cmp::Ordering;
+use std::sync::Arc;
 
-use nalgebra::{DMatrix, DVector, SymmetricEigen};
+use nalgebra::{DMatrix, DVector, SymmetricEigen, linalg::Schur};
 use num_complex::Complex64;
 
-use crate::operator::{LinearOperator, ShiftedLinearSolver, materialize_dense};
+use crate::operator::{
+    ExpOp, LinearOperator, MatrixFormat, ShiftedLinearSolver, TimeDependentOperator,
+    materialize_dense,
+};
 use crate::{QuSpinError, Result};
+
+/// Reusable exponential-action plan for vectors and batches.
+#[derive(Clone, Debug)]
+pub struct ExpmMultiplyParallel {
+    inner: ExpOp,
+}
+
+impl ExpmMultiplyParallel {
+    pub fn new(
+        operator: Arc<dyn LinearOperator>,
+        coefficient: Complex64,
+        krylov_dimension: usize,
+        tolerance: f64,
+        max_substeps: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: ExpOp::new(
+                operator,
+                coefficient,
+                krylov_dimension,
+                tolerance,
+                max_substeps,
+            )?,
+        })
+    }
+
+    pub const fn coefficient(&self) -> Complex64 {
+        self.inner.exponent()
+    }
+
+    pub fn set_coefficient(&mut self, coefficient: Complex64) -> Result<()> {
+        self.inner.set_exponent(coefficient)
+    }
+
+    pub fn apply_in_place(&self, state: &mut [Complex64]) -> Result<()> {
+        let input = state.to_vec();
+        self.inner.apply(&input, state)
+    }
+
+    pub fn apply_batch(&self, states: &[Vec<Complex64>]) -> Result<Vec<Vec<Complex64>>> {
+        let dimension = self.inner.shape().1;
+        states
+            .iter()
+            .map(|state| {
+                if state.len() != dimension {
+                    return Err(QuSpinError::DimensionMismatch(
+                        "exponential batch column has the wrong length".into(),
+                    ));
+                }
+                let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+                self.inner.apply(state, &mut output)?;
+                Ok(output)
+            })
+            .collect()
+    }
+}
+
+impl LinearOperator for ExpmMultiplyParallel {
+    fn shape(&self) -> (usize, usize) {
+        self.inner.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.inner.apply(input, output)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SpectrumTarget {
     SmallestAlgebraic,
     LargestAlgebraic,
+    SmallestMagnitude,
     LargestMagnitude,
+    BothEnds,
     Shift(f64),
 }
 
@@ -68,9 +143,23 @@ pub struct Eigensystem {
     pub eigenvectors: Vec<Vec<Complex64>>,
     pub residuals: Vec<f64>,
     pub iterations: usize,
+    pub converged: bool,
 }
 
-pub(crate) fn real_symmetric_eigenpairs_all(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EighOptions {
+    pub return_eigenvectors: bool,
+}
+
+impl Default for EighOptions {
+    fn default() -> Self {
+        Self {
+            return_eigenvectors: true,
+        }
+    }
+}
+
+pub(crate) fn hermitian_eigenpairs_all(
     operator: &(impl LinearOperator + ?Sized),
 ) -> Result<(Vec<f64>, Vec<Vec<Complex64>>)> {
     let shape = operator.shape();
@@ -80,34 +169,81 @@ pub(crate) fn real_symmetric_eigenpairs_all(
         ));
     }
     let dense = materialize_dense(operator)?;
-    if dense.iter().any(|value| value.im.abs() > 1.0e-13) {
-        return Err(QuSpinError::UnsupportedBackend(
-            "complex Hermitian eigensystems are not active in the first solver backend".into(),
-        ));
-    }
     let dimension = shape.0;
     for row in 0..dimension {
         for column in 0..dimension {
-            if (dense[row * dimension + column].re - dense[column * dimension + row].re).abs()
+            if (dense[row * dimension + column] - dense[column * dimension + row].conj()).norm()
                 > 1.0e-12
             {
                 return Err(QuSpinError::NonHermitian);
             }
         }
     }
+    if dense.iter().all(|value| value.im.abs() <= 1.0e-14) {
+        let matrix = DMatrix::from_fn(dimension, dimension, |row, column| {
+            dense[row * dimension + column].re
+        });
+        let decomposition = SymmetricEigen::new(matrix);
+        let mut eigenpairs: Vec<(f64, Vec<Complex64>)> = (0..dimension)
+            .map(|column| {
+                (
+                    decomposition.eigenvalues[column],
+                    (0..dimension)
+                        .map(|row| Complex64::new(decomposition.eigenvectors[(row, column)], 0.0))
+                        .collect(),
+                )
+            })
+            .collect();
+        eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+        return Ok(eigenpairs.into_iter().unzip());
+    }
+
     let matrix = DMatrix::from_fn(dimension, dimension, |row, column| {
-        dense[row * dimension + column].re
+        dense[row * dimension + column]
     });
-    let decomposition = SymmetricEigen::new(matrix);
-    let values = decomposition.eigenvalues.as_slice().to_vec();
-    let vectors = (0..dimension)
-        .map(|column| {
-            (0..dimension)
-                .map(|row| Complex64::new(decomposition.eigenvectors[(row, column)], 0.0))
-                .collect()
-        })
-        .collect();
-    Ok((values, vectors))
+    let (vectors, triangular) = Schur::new(matrix).unpack();
+    let mut eigenpairs = Vec::with_capacity(dimension);
+    for column in 0..dimension {
+        let value = triangular[(column, column)];
+        if value.im.abs() > 1.0e-10 {
+            return Err(QuSpinError::NonHermitian);
+        }
+        let vector = (0..dimension).map(|row| vectors[(row, column)]).collect();
+        eigenpairs.push((value.re, vector));
+    }
+    eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+    Ok(eigenpairs.into_iter().unzip())
+}
+
+/// Complete eigendecomposition of a finite Hermitian operator.
+pub fn eigh<O>(operator: &O) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let (eigenvalues, eigenvectors) = hermitian_eigenpairs_all(operator)?;
+    let residuals = eigenvalues
+        .iter()
+        .zip(&eigenvectors)
+        .map(|(&value, vector)| residual_norm(operator, value, vector))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Eigensystem {
+        eigenvalues,
+        eigenvectors,
+        residuals,
+        iterations: 1,
+        converged: true,
+    })
+}
+
+pub fn eigh_with_options<O>(operator: &O, options: EighOptions) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let mut result = eigh(operator)?;
+    if !options.return_eigenvectors {
+        result.eigenvectors.clear();
+    }
+    Ok(result)
 }
 
 fn residual_norm(
@@ -277,6 +413,102 @@ where
     })
 }
 
+/// Reusable action of `(A - shift I)^{-1}`. Stored CSC operators cache one
+/// sparse factorization; other operators reuse the plan and solve with
+/// restarted GMRES without materializing `A`.
+pub struct ShiftInvertPlan {
+    operator: Arc<dyn LinearOperator>,
+    shift: f64,
+    tolerance: f64,
+    max_iterations: usize,
+    factorization: Option<Box<dyn ShiftedLinearSolver>>,
+}
+
+impl std::fmt::Debug for ShiftInvertPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShiftInvertPlan")
+            .field("shape", &self.operator.shape())
+            .field("shift", &self.shift)
+            .field("tolerance", &self.tolerance)
+            .field("max_iterations", &self.max_iterations)
+            .field("factorized", &self.factorization.is_some())
+            .finish()
+    }
+}
+
+impl ShiftInvertPlan {
+    pub fn new(
+        operator: Arc<dyn LinearOperator>,
+        shift: f64,
+        tolerance: f64,
+        max_iterations: usize,
+    ) -> Result<Self> {
+        let shape = operator.shape();
+        if shape.0 != shape.1
+            || !shift.is_finite()
+            || !tolerance.is_finite()
+            || tolerance <= 0.0
+            || max_iterations == 0
+        {
+            return Err(QuSpinError::InvalidOptions(
+                "shift-invert needs a square operator, finite shift, positive tolerance, and positive iteration cap"
+                    .into(),
+            ));
+        }
+        let factorization = operator.shifted_solver(shift)?;
+        Ok(Self {
+            operator,
+            shift,
+            tolerance,
+            max_iterations,
+            factorization,
+        })
+    }
+
+    pub const fn shift(&self) -> f64 {
+        self.shift
+    }
+
+    pub const fn is_factorized(&self) -> bool {
+        self.factorization.is_some()
+    }
+
+    pub fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if input.len() != self.operator.shape().0 || output.len() != input.len() {
+            return Err(QuSpinError::DimensionMismatch(
+                "shift-invert input and output must match the operator dimension".into(),
+            ));
+        }
+        if let Some(factorization) = &self.factorization {
+            return factorization.solve(input, output);
+        }
+        let solved = gmres_shift_invert(
+            self.operator.as_ref(),
+            self.shift,
+            input,
+            self.tolerance,
+            self.max_iterations,
+        )?;
+        output.copy_from_slice(&solved);
+        Ok(())
+    }
+}
+
+impl LinearOperator for ShiftInvertPlan {
+    fn shape(&self) -> (usize, usize) {
+        self.operator.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.solve(input, output)
+    }
+}
+
 fn transformed_apply<O>(
     operator: &O,
     options: &EigshOptions,
@@ -307,16 +539,34 @@ where
 }
 
 fn select_indices(values: &[f64], target: SpectrumTarget, count: usize) -> Vec<usize> {
+    if target == SpectrumTarget::BothEnds {
+        let mut ordered: Vec<_> = (0..values.len()).collect();
+        ordered.sort_by(|&left, &right| {
+            values[left]
+                .total_cmp(&values[right])
+                .then_with(|| left.cmp(&right))
+        });
+        let lower = count / 2;
+        let upper = count - lower;
+        let mut selected = Vec::with_capacity(count);
+        selected.extend(ordered.iter().take(lower).copied());
+        selected.extend(ordered.iter().rev().take(upper).copied());
+        selected.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
+        return selected;
+    }
     let mut indices: Vec<_> = (0..values.len()).collect();
     indices.sort_by(|&left, &right| {
         let left_value = values[left];
         let right_value = values[right];
         let ordering = match target {
             SpectrumTarget::SmallestAlgebraic => left_value.total_cmp(&right_value),
-            SpectrumTarget::LargestAlgebraic | SpectrumTarget::Shift(_) => {
-                right_value.total_cmp(&left_value)
-            }
+            SpectrumTarget::LargestAlgebraic => right_value.total_cmp(&left_value),
+            SpectrumTarget::SmallestMagnitude => left_value.abs().total_cmp(&right_value.abs()),
             SpectrumTarget::LargestMagnitude => right_value.abs().total_cmp(&left_value.abs()),
+            SpectrumTarget::BothEnds => unreachable!(),
+            SpectrumTarget::Shift(shift) => (left_value - shift)
+                .abs()
+                .total_cmp(&(right_value - shift).abs()),
         };
         ordering.then_with(|| left.cmp(&right))
     });
@@ -324,7 +574,11 @@ fn select_indices(values: &[f64], target: SpectrumTarget, count: usize) -> Vec<u
     indices
 }
 
-fn lanczos_eigsh<O>(operator: &O, options: &EigshOptions) -> Result<Eigensystem>
+fn lanczos_eigsh<O>(
+    operator: &O,
+    options: &EigshOptions,
+    initial: Option<&[Complex64]>,
+) -> Result<Eigensystem>
 where
     O: LinearOperator + ?Sized,
 {
@@ -342,7 +596,18 @@ where
     }
 
     let mut basis = Vec::with_capacity(krylov_dimension);
-    basis.push(deterministic_start(dimension, options.seed)?);
+    basis.push(if let Some(initial) = initial {
+        if initial.len() != dimension {
+            return Err(QuSpinError::DimensionMismatch(
+                "eigsh initial vector does not match the operator".into(),
+            ));
+        }
+        let mut initial = initial.to_vec();
+        normalize(&mut initial)?;
+        initial
+    } else {
+        deterministic_start(dimension, options.seed)?
+    });
     let mut alphas = Vec::with_capacity(krylov_dimension);
     let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
     let mut output = vec![Complex64::new(0.0, 0.0); dimension];
@@ -438,7 +703,9 @@ where
     candidates.sort_by(|left, right| match options.target {
         SpectrumTarget::SmallestAlgebraic => left.0.total_cmp(&right.0),
         SpectrumTarget::LargestAlgebraic => right.0.total_cmp(&left.0),
+        SpectrumTarget::SmallestMagnitude => left.0.abs().total_cmp(&right.0.abs()),
         SpectrumTarget::LargestMagnitude => right.0.abs().total_cmp(&left.0.abs()),
+        SpectrumTarget::BothEnds => left.0.total_cmp(&right.0),
         SpectrumTarget::Shift(shift) => (left.0 - shift).abs().total_cmp(&(right.0 - shift).abs()),
     });
     let residuals: Vec<_> = candidates.iter().map(|candidate| candidate.2).collect();
@@ -458,6 +725,7 @@ where
             .collect(),
         residuals,
         iterations: size,
+        converged: true,
     })
 }
 
@@ -478,28 +746,23 @@ where
     }
     options.validate(shape.0)?;
     if shape.0 > 128 {
-        return lanczos_eigsh(operator, &options);
+        return lanczos_eigsh(operator, &options, None);
     }
-    let (values, vectors) = real_symmetric_eigenpairs_all(operator)?;
-    let mut indices: Vec<_> = (0..values.len()).collect();
-    indices.sort_by(|&left, &right| {
-        let left_value = values[left];
-        let right_value = values[right];
-        let ordering = match options.target {
-            SpectrumTarget::SmallestAlgebraic => left_value.total_cmp(&right_value),
-            SpectrumTarget::LargestAlgebraic => right_value.total_cmp(&left_value),
-            SpectrumTarget::LargestMagnitude => right_value.abs().total_cmp(&left_value.abs()),
-            SpectrumTarget::Shift(shift) => (left_value - shift)
-                .abs()
-                .total_cmp(&(right_value - shift).abs()),
-        };
-        if ordering == Ordering::Equal {
-            left.cmp(&right)
-        } else {
-            ordering
+    let (values, vectors) = hermitian_eigenpairs_all(operator)?;
+    let indices = match options.target {
+        SpectrumTarget::Shift(shift) => {
+            let mut indices: Vec<_> = (0..values.len()).collect();
+            indices.sort_by(|&left, &right| {
+                (values[left] - shift)
+                    .abs()
+                    .total_cmp(&(values[right] - shift).abs())
+                    .then_with(|| left.cmp(&right))
+            });
+            indices.truncate(options.eigenpairs);
+            indices
         }
-    });
-    indices.truncate(options.eigenpairs);
+        _ => select_indices(&values, options.target, options.eigenpairs),
+    };
     let eigenvalues: Vec<_> = indices.iter().map(|&index| values[index]).collect();
     let eigenvectors: Vec<_> = indices
         .iter()
@@ -515,7 +778,36 @@ where
         eigenvectors,
         residuals,
         iterations: 1,
+        converged: true,
     })
+}
+
+pub fn eigsh_with_initial<O>(
+    operator: &O,
+    options: EigshOptions,
+    initial: &[Complex64],
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let shape = operator.shape();
+    if shape.0 != shape.1 {
+        return Err(QuSpinError::DimensionMismatch(
+            "eigsh requires a square operator".into(),
+        ));
+    }
+    options.validate(shape.0)?;
+    if shape.0 <= 128 {
+        return eigsh(operator, options);
+    }
+    lanczos_eigsh(operator, &options, Some(initial))
+}
+
+pub fn eigsh_values<O>(operator: &O, options: EigshOptions) -> Result<Vec<f64>>
+where
+    O: LinearOperator + ?Sized,
+{
+    Ok(eigsh(operator, options)?.eigenvalues)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -554,6 +846,197 @@ impl EvolutionOptions {
 pub struct StateTrajectory {
     pub times: Vec<f64>,
     pub states: Vec<Vec<Complex64>>,
+}
+
+/// Column-oriented batch trajectory: `states[time_index][column_index]`.
+#[derive(Clone, Debug)]
+pub struct StateBatchTrajectory {
+    pub times: Vec<f64>,
+    pub states: Vec<Vec<Vec<Complex64>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LanczosOptions {
+    pub krylov_dimension: usize,
+    pub tolerance: f64,
+}
+
+impl LanczosOptions {
+    fn validate(&self) -> Result<()> {
+        if self.krylov_dimension == 0 || !self.tolerance.is_finite() || self.tolerance <= 0.0 {
+            return Err(QuSpinError::InvalidOptions(
+                "Lanczos dimension and tolerance must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LanczosVector {
+    pub index: usize,
+    pub vector: Vec<Complex64>,
+    pub diagonal: f64,
+    pub next_off_diagonal: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LanczosDecomposition {
+    pub initial_norm: f64,
+    pub basis: Vec<Vec<Complex64>>,
+    pub diagonal: Vec<f64>,
+    pub off_diagonal: Vec<f64>,
+}
+
+pub struct LanczosIter<'a, O>
+where
+    O: LinearOperator + ?Sized,
+{
+    operator: &'a O,
+    options: LanczosOptions,
+    index: usize,
+    previous: Option<Vec<Complex64>>,
+    current: Option<Vec<Complex64>>,
+    previous_beta: f64,
+    history: Vec<Vec<Complex64>>,
+    failed: bool,
+}
+
+impl<O> Iterator for LanczosIter<'_, O>
+where
+    O: LinearOperator + ?Sized,
+{
+    type Item = Result<LanczosVector>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.index >= self.options.krylov_dimension {
+            return None;
+        }
+        let current = self.current.take()?;
+        let mut applied = vec![Complex64::new(0.0, 0.0); current.len()];
+        if let Err(error) = self.operator.apply(&current, &mut applied) {
+            self.failed = true;
+            return Some(Err(error));
+        }
+        let alpha = inner(&current, &applied);
+        if alpha.im.abs() > self.options.tolerance.max(1.0e-10) {
+            self.failed = true;
+            return Some(Err(QuSpinError::NonHermitian));
+        }
+        for (value, basis_value) in applied.iter_mut().zip(&current) {
+            *value -= alpha.re * *basis_value;
+        }
+        if let Some(previous) = &self.previous {
+            for (value, basis_value) in applied.iter_mut().zip(previous) {
+                *value -= self.previous_beta * *basis_value;
+            }
+        }
+        // Two-pass full reorthogonalization keeps the public basis usable for
+        // degenerate and long Krylov runs, not only for tridiagonal scalars.
+        for _ in 0..2 {
+            for basis_vector in self.history.iter().chain(std::iter::once(&current)) {
+                let correction = inner(basis_vector, &applied);
+                for (value, basis_value) in applied.iter_mut().zip(basis_vector) {
+                    *value -= correction * *basis_value;
+                }
+            }
+        }
+        let beta = vector_norm(&applied);
+        let output = LanczosVector {
+            index: self.index,
+            vector: current.clone(),
+            diagonal: alpha.re,
+            next_off_diagonal: beta,
+        };
+        self.index += 1;
+        self.history.push(current.clone());
+        if self.index < self.options.krylov_dimension && beta > self.options.tolerance {
+            for value in &mut applied {
+                *value /= beta;
+            }
+            self.previous = Some(current);
+            self.current = Some(applied);
+            self.previous_beta = beta;
+        } else {
+            self.current = None;
+        }
+        Some(Ok(output))
+    }
+}
+
+pub fn lanczos_iter<'a, O>(
+    operator: &'a O,
+    initial: &'a [Complex64],
+    options: LanczosOptions,
+) -> Result<LanczosIter<'a, O>>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    let shape = operator.shape();
+    if shape.0 != shape.1 || initial.len() != shape.0 {
+        return Err(QuSpinError::DimensionMismatch(
+            "Lanczos operator and initial vector do not match".into(),
+        ));
+    }
+    let mut current = initial.to_vec();
+    normalize(&mut current)?;
+    let capacity = options.krylov_dimension;
+    Ok(LanczosIter {
+        operator,
+        options,
+        index: 0,
+        previous: None,
+        current: Some(current),
+        previous_beta: 0.0,
+        history: Vec::with_capacity(capacity),
+        failed: false,
+    })
+}
+
+pub fn lanczos_full<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: LanczosOptions,
+) -> Result<LanczosDecomposition>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    let initial_norm = vector_norm(initial);
+    let vectors: Vec<_> = lanczos_iter(operator, initial, options)?.collect::<Result<_>>()?;
+    let off_diagonal = vectors
+        .iter()
+        .take(vectors.len().saturating_sub(1))
+        .map(|vector| vector.next_off_diagonal)
+        .collect();
+    Ok(LanczosDecomposition {
+        initial_norm,
+        basis: vectors.iter().map(|vector| vector.vector.clone()).collect(),
+        diagonal: vectors.iter().map(|vector| vector.diagonal).collect(),
+        off_diagonal,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpmOptions {
+    pub times: Vec<f64>,
+    pub krylov_dimension: usize,
+    pub tolerance: f64,
+    pub max_substeps: usize,
+    pub hamiltonian: bool,
+}
+
+impl From<ExpmOptions> for EvolutionOptions {
+    fn from(options: ExpmOptions) -> Self {
+        Self {
+            times: options.times,
+            krylov_dimension: options.krylov_dimension,
+            tolerance: options.tolerance,
+            max_substeps: options.max_substeps,
+            hamiltonian: options.hamiltonian,
+        }
+    }
 }
 
 struct LanczosProjection {
@@ -723,21 +1206,59 @@ pub(crate) fn expm_action(
             initial.len(),
         ));
     }
-    let requested_steps = interval.abs().ceil().max(1.0) as usize;
-    if requested_steps > options.max_substeps {
+    let exponent = Complex64::new(interval, 0.0);
+    expm_action_complex(
+        operator,
+        initial,
+        exponent,
+        options.krylov_dimension,
+        options.tolerance,
+        options.max_substeps,
+    )
+}
+
+pub(crate) fn expm_action_complex(
+    operator: &(impl LinearOperator + ?Sized),
+    initial: &[Complex64],
+    exponent: Complex64,
+    krylov_dimension: usize,
+    tolerance: f64,
+    max_substeps: usize,
+) -> Result<Vec<Complex64>> {
+    let shape = operator.shape();
+    if shape.0 != shape.1 || initial.len() != shape.0 {
+        return Err(QuSpinError::DimensionMismatch(
+            "exponential action requires a square operator matching the state".into(),
+        ));
+    }
+    if !exponent.re.is_finite()
+        || !exponent.im.is_finite()
+        || krylov_dimension == 0
+        || !tolerance.is_finite()
+        || tolerance <= 0.0
+        || max_substeps == 0
+    {
+        return Err(QuSpinError::InvalidOptions(
+            "invalid exponential coefficient or numerical controls".into(),
+        ));
+    }
+    if exponent.norm() <= f64::EPSILON {
+        return Ok(initial.to_vec());
+    }
+    let requested_steps = exponent.norm().ceil().max(1.0) as usize;
+    if requested_steps > max_substeps {
         return Err(QuSpinError::NonConvergence {
-            iterations: options.max_substeps,
-            residual: interval.abs(),
+            iterations: max_substeps,
+            residual: exponent.norm(),
         });
     }
-    let step = interval / requested_steps as f64;
-    let factor = Complex64::new(step, 0.0);
+    let factor = exponent / requested_steps as f64;
     let mut state = initial.to_vec();
     let mut applied = vec![Complex64::new(0.0, 0.0); shape.0];
     for _ in 0..requested_steps {
         let mut sum = state.clone();
         let mut term = state.clone();
-        for order in 1..=options.krylov_dimension {
+        for order in 1..=krylov_dimension {
             operator.apply(&term, &mut applied)?;
             let scale = factor / order as f64;
             for (next, value) in term.iter_mut().zip(&applied) {
@@ -746,10 +1267,10 @@ pub(crate) fn expm_action(
             for (total, value) in sum.iter_mut().zip(&term) {
                 *total += *value;
             }
-            if vector_norm(&term) <= options.tolerance * vector_norm(&sum).max(1.0) {
+            if vector_norm(&term) <= tolerance * vector_norm(&sum).max(1.0) {
                 break;
             }
-            if order == options.krylov_dimension {
+            if order == krylov_dimension {
                 return Err(QuSpinError::NonConvergence {
                     iterations: order,
                     residual: vector_norm(&term),
@@ -803,5 +1324,768 @@ where
     Ok(StateTrajectory {
         times: options.times,
         states,
+    })
+}
+
+/// Exponential action over a time grid. Hermitian Hamiltonians use one
+/// reusable Lanczos projection for the complete grid.
+pub fn expm_multiply<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: ExpmOptions,
+) -> Result<StateTrajectory>
+where
+    O: LinearOperator + ?Sized,
+{
+    evolve(operator, initial, options.into())
+}
+
+pub fn expm_lanczos<O>(
+    operator: &O,
+    initial: &[Complex64],
+    time: f64,
+    options: LanczosOptions,
+) -> Result<Vec<Complex64>>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    if !time.is_finite() {
+        return Err(QuSpinError::InvalidOptions(
+            "exponential time must be finite".into(),
+        ));
+    }
+    let projection = lanczos_projection(operator, initial, options.krylov_dimension)?;
+    Ok(projected_exponential_action(
+        &projection,
+        time,
+        true,
+        initial.len(),
+    ))
+}
+
+#[derive(Clone, Debug)]
+pub struct ThermalIteration {
+    pub inverse_temperatures: Vec<f64>,
+    pub log_partition: Vec<f64>,
+    pub mean_energy: Vec<f64>,
+    pub krylov_dimension: usize,
+}
+
+fn thermal_lanczos_iteration<O>(
+    operator: &O,
+    initial: &[Complex64],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    options.validate()?;
+    if inverse_temperatures.is_empty()
+        || inverse_temperatures
+            .iter()
+            .any(|beta| !beta.is_finite() || *beta < 0.0)
+    {
+        return Err(QuSpinError::InvalidOptions(
+            "inverse temperatures must be nonempty, finite, and nonnegative".into(),
+        ));
+    }
+    let decomposition = lanczos_full(operator, initial, options)?;
+    let size = decomposition.diagonal.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
+    for index in 0..size {
+        tridiagonal[(index, index)] = decomposition.diagonal[index];
+        if index + 1 < size {
+            tridiagonal[(index, index + 1)] = decomposition.off_diagonal[index];
+            tridiagonal[(index + 1, index)] = decomposition.off_diagonal[index];
+        }
+    }
+    let eigensystem = SymmetricEigen::new(tridiagonal);
+    let weights: Vec<_> = (0..size)
+        .map(|index| {
+            decomposition.initial_norm.powi(2) * eigensystem.eigenvectors[(0, index)].powi(2)
+        })
+        .collect();
+    let hilbert_dimension = operator.shape().0 as f64;
+    let minimum_energy = eigensystem
+        .eigenvalues
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let mut log_partition = Vec::with_capacity(inverse_temperatures.len());
+    let mut mean_energy = Vec::with_capacity(inverse_temperatures.len());
+    for &beta in inverse_temperatures {
+        let boltzmann: Vec<_> = eigensystem
+            .eigenvalues
+            .iter()
+            .zip(&weights)
+            .map(|(energy, weight)| weight * (-beta * (*energy - minimum_energy)).exp())
+            .collect();
+        let projected_partition = boltzmann.iter().sum::<f64>();
+        if projected_partition <= f64::EPSILON {
+            return Err(QuSpinError::NonConvergence {
+                iterations: size,
+                residual: projected_partition,
+            });
+        }
+        log_partition.push(
+            (hilbert_dimension / decomposition.initial_norm.powi(2)).ln() - beta * minimum_energy
+                + projected_partition.ln(),
+        );
+        mean_energy.push(
+            boltzmann
+                .iter()
+                .zip(eigensystem.eigenvalues.iter())
+                .map(|(weight, energy)| weight * energy)
+                .sum::<f64>()
+                / projected_partition,
+        );
+    }
+    Ok(ThermalIteration {
+        inverse_temperatures: inverse_temperatures.to_vec(),
+        log_partition,
+        mean_energy,
+        krylov_dimension: size,
+    })
+}
+
+/// One finite-temperature Lanczos random-vector iteration.
+pub fn ftlm_static_iteration<O>(
+    operator: &O,
+    initial: &[Complex64],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    thermal_lanczos_iteration(operator, initial, inverse_temperatures, options)
+}
+
+/// Low-temperature Lanczos iteration using a ground-energy shifted Boltzmann
+/// evaluation for numerical stability.
+pub fn ltlm_static_iteration<O>(
+    operator: &O,
+    initial: &[Complex64],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    thermal_lanczos_iteration(operator, initial, inverse_temperatures, options)
+}
+
+#[derive(Clone, Debug)]
+pub struct ThermalObservableIteration {
+    pub inverse_temperatures: Vec<f64>,
+    pub values: std::collections::HashMap<String, Vec<Complex64>>,
+    pub identity: Vec<f64>,
+}
+
+fn lanczos_ritz_data<O>(
+    hamiltonian: &O,
+    initial: &[Complex64],
+    options: LanczosOptions,
+) -> Result<(LanczosDecomposition, SymmetricEigen<f64, nalgebra::Dyn>)>
+where
+    O: LinearOperator + ?Sized,
+{
+    let decomposition = lanczos_full(hamiltonian, initial, options)?;
+    let size = decomposition.diagonal.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
+    for index in 0..size {
+        tridiagonal[(index, index)] = decomposition.diagonal[index];
+        if index + 1 < size {
+            tridiagonal[(index, index + 1)] = decomposition.off_diagonal[index];
+            tridiagonal[(index + 1, index)] = decomposition.off_diagonal[index];
+        }
+    }
+    Ok((decomposition, SymmetricEigen::new(tridiagonal)))
+}
+
+fn validate_thermal_observables(
+    observables: &[(String, &dyn LinearOperator)],
+    dimension: usize,
+    inverse_temperatures: &[f64],
+) -> Result<()> {
+    if observables.is_empty()
+        || inverse_temperatures.is_empty()
+        || inverse_temperatures
+            .iter()
+            .any(|beta| !beta.is_finite() || *beta < 0.0)
+    {
+        return Err(QuSpinError::InvalidOptions(
+            "thermal observables and inverse temperatures must be nonempty and valid".into(),
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    for (name, observable) in observables {
+        if name.is_empty() || !names.insert(name) || observable.shape() != (dimension, dimension) {
+            return Err(QuSpinError::DimensionMismatch(
+                "thermal observables require unique names and matching square shapes".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// QuSpin-compatible one-sided FTLM observable estimates.
+pub fn ftlm_observable_iteration<O>(
+    hamiltonian: &O,
+    initial: &[Complex64],
+    observables: &[(String, &dyn LinearOperator)],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalObservableIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    validate_thermal_observables(observables, initial.len(), inverse_temperatures)?;
+    let (decomposition, ritz) = lanczos_ritz_data(hamiltonian, initial, options)?;
+    let size = decomposition.basis.len();
+    let identity = inverse_temperatures
+        .iter()
+        .map(|beta| {
+            (0..size)
+                .map(|eigen| {
+                    ritz.eigenvectors[(0, eigen)].powi(2) * (-beta * ritz.eigenvalues[eigen]).exp()
+                })
+                .sum()
+        })
+        .collect();
+    let mut values = std::collections::HashMap::new();
+    for (name, observable) in observables {
+        let mut applied = vec![Complex64::new(0.0, 0.0); initial.len()];
+        observable.apply(&decomposition.basis[0], &mut applied)?;
+        let overlaps: Vec<_> = decomposition
+            .basis
+            .iter()
+            .map(|vector| inner(vector, &applied))
+            .collect();
+        let estimates = inverse_temperatures
+            .iter()
+            .map(|beta| {
+                (0..size)
+                    .map(|row| {
+                        let coefficient = (0..size)
+                            .map(|eigen| {
+                                ritz.eigenvectors[(row, eigen)]
+                                    * ritz.eigenvectors[(0, eigen)]
+                                    * (-beta * ritz.eigenvalues[eigen]).exp()
+                            })
+                            .sum::<f64>();
+                        overlaps[row] * coefficient
+                    })
+                    .sum()
+            })
+            .collect();
+        values.insert(name.clone(), estimates);
+    }
+    Ok(ThermalObservableIteration {
+        inverse_temperatures: inverse_temperatures.to_vec(),
+        values,
+        identity,
+    })
+}
+
+/// Symmetric low-temperature Lanczos observable estimates.
+pub fn ltlm_observable_iteration<O>(
+    hamiltonian: &O,
+    initial: &[Complex64],
+    observables: &[(String, &dyn LinearOperator)],
+    inverse_temperatures: &[f64],
+    options: LanczosOptions,
+) -> Result<ThermalObservableIteration>
+where
+    O: LinearOperator + ?Sized,
+{
+    validate_thermal_observables(observables, initial.len(), inverse_temperatures)?;
+    let (decomposition, ritz) = lanczos_ritz_data(hamiltonian, initial, options)?;
+    let size = decomposition.basis.len();
+    let identity = inverse_temperatures
+        .iter()
+        .map(|beta| {
+            (0..size)
+                .map(|eigen| {
+                    ritz.eigenvectors[(0, eigen)].powi(2) * (-beta * ritz.eigenvalues[eigen]).exp()
+                })
+                .sum()
+        })
+        .collect();
+    let mut values = std::collections::HashMap::new();
+    for (name, observable) in observables {
+        let mut matrix_elements = vec![Complex64::new(0.0, 0.0); size * size];
+        let mut applied = vec![Complex64::new(0.0, 0.0); initial.len()];
+        for row in 0..size {
+            observable.apply(&decomposition.basis[row], &mut applied)?;
+            for column in 0..size {
+                matrix_elements[row * size + column] =
+                    inner(&decomposition.basis[column], &applied);
+            }
+        }
+        let estimates = inverse_temperatures
+            .iter()
+            .map(|beta| {
+                let weights: Vec<_> = (0..size)
+                    .map(|eigen| {
+                        ritz.eigenvectors[(0, eigen)]
+                            * (-0.5 * beta * ritz.eigenvalues[eigen]).exp()
+                    })
+                    .collect();
+                let mut estimate = Complex64::new(0.0, 0.0);
+                for left in 0..size {
+                    for right in 0..size {
+                        let mut projected = Complex64::new(0.0, 0.0);
+                        for row in 0..size {
+                            for column in 0..size {
+                                projected += ritz.eigenvectors[(row, left)]
+                                    * matrix_elements[row * size + column]
+                                    * ritz.eigenvectors[(column, right)];
+                            }
+                        }
+                        estimate += weights[left] * projected * weights[right];
+                    }
+                }
+                estimate
+            })
+            .collect();
+        values.insert(name.clone(), estimates);
+    }
+    Ok(ThermalObservableIteration {
+        inverse_temperatures: inverse_temperatures.to_vec(),
+        values,
+        identity,
+    })
+}
+
+pub fn linear_combination_qt(
+    basis: &[Vec<Complex64>],
+    coefficients: &[Complex64],
+) -> Result<Vec<Complex64>> {
+    if basis.len() != coefficients.len() || basis.is_empty() {
+        return Err(QuSpinError::DimensionMismatch(
+            "basis and coefficient counts must be equal and nonzero".into(),
+        ));
+    }
+    let dimension = basis[0].len();
+    if basis.iter().any(|vector| vector.len() != dimension) {
+        return Err(QuSpinError::DimensionMismatch(
+            "linear-combination basis vectors must have equal lengths".into(),
+        ));
+    }
+    let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+    for (coefficient, vector) in coefficients.iter().zip(basis) {
+        for (value, basis_value) in output.iter_mut().zip(vector) {
+            *value += *coefficient * *basis_value;
+        }
+    }
+    Ok(output)
+}
+
+fn time_derivative<O>(
+    operator: &O,
+    time: f64,
+    state: &[Complex64],
+    hamiltonian: bool,
+) -> Result<Vec<Complex64>>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    let mut derivative = vec![Complex64::new(0.0, 0.0); state.len()];
+    operator.apply_at(time, state, &mut derivative)?;
+    if hamiltonian {
+        for value in &mut derivative {
+            *value *= Complex64::new(0.0, -1.0);
+        }
+    }
+    Ok(derivative)
+}
+
+fn rk4_step<O>(
+    operator: &O,
+    time: f64,
+    state: &[Complex64],
+    step: f64,
+    hamiltonian: bool,
+) -> Result<Vec<Complex64>>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    let k1 = time_derivative(operator, time, state, hamiltonian)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k1)
+        .map(|(value, derivative)| *value + 0.5 * step * *derivative)
+        .collect();
+    let k2 = time_derivative(operator, time + 0.5 * step, &stage, hamiltonian)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k2)
+        .map(|(value, derivative)| *value + 0.5 * step * *derivative)
+        .collect();
+    let k3 = time_derivative(operator, time + 0.5 * step, &stage, hamiltonian)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k3)
+        .map(|(value, derivative)| *value + step * *derivative)
+        .collect();
+    let k4 = time_derivative(operator, time + step, &stage, hamiltonian)?;
+    Ok(state
+        .iter()
+        .zip(k1.iter().zip(k2.iter().zip(k3.iter().zip(&k4))))
+        .map(|(value, (first, (second, (third, fourth))))| {
+            *value + step * (*first + 2.0 * *second + 2.0 * *third + *fourth) / 6.0
+        })
+        .collect())
+}
+
+fn adaptive_time_interval<O>(
+    operator: &O,
+    initial_time: f64,
+    initial: &[Complex64],
+    interval: f64,
+    options: &EvolutionOptions,
+) -> Result<Vec<Complex64>>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    if interval == 0.0 {
+        return Ok(initial.to_vec());
+    }
+    let target_time = initial_time + interval;
+    let direction = interval.signum();
+    let mut step = direction * interval.abs().min(0.1);
+    let mut time = initial_time;
+    let mut state = initial.to_vec();
+    let initial_norm = vector_norm(initial);
+    let mut steps = 0;
+    while direction * (target_time - time) > 16.0 * f64::EPSILON * target_time.abs().max(1.0) {
+        if steps >= options.max_substeps {
+            return Err(QuSpinError::NonConvergence {
+                iterations: steps,
+                residual: (target_time - time).abs(),
+            });
+        }
+        if direction * (time + step - target_time) > 0.0 {
+            step = target_time - time;
+        }
+        let full = rk4_step(operator, time, &state, step, options.hamiltonian)?;
+        let first_half = rk4_step(operator, time, &state, 0.5 * step, options.hamiltonian)?;
+        let two_halves = rk4_step(
+            operator,
+            time + 0.5 * step,
+            &first_half,
+            0.5 * step,
+            options.hamiltonian,
+        )?;
+        let error = full
+            .iter()
+            .zip(&two_halves)
+            .map(|(coarse, fine)| (*coarse - *fine).norm_sqr())
+            .sum::<f64>()
+            .sqrt();
+        let scale = vector_norm(&two_halves).max(1.0);
+        let threshold = options.tolerance * scale;
+        if error <= threshold || step.abs() <= f64::EPSILON * time.abs().max(1.0) {
+            state = two_halves;
+            if options.hamiltonian && initial_norm > f64::EPSILON {
+                let norm = vector_norm(&state);
+                if norm > f64::EPSILON && norm.is_finite() {
+                    for value in &mut state {
+                        *value *= initial_norm / norm;
+                    }
+                }
+            }
+            time += step;
+            steps += 1;
+            let growth = if error <= f64::EPSILON {
+                2.0
+            } else {
+                (0.9 * (threshold / error).powf(0.2)).clamp(1.0, 2.0)
+            };
+            step *= growth;
+        } else {
+            let shrink = (0.9 * (threshold / error).powf(0.2)).clamp(0.1, 0.8);
+            step *= shrink;
+        }
+    }
+    Ok(state)
+}
+
+/// Adaptive fourth-order evolution for an explicitly time-dependent operator.
+pub fn evolve_time_dependent<O>(
+    operator: &O,
+    initial: &[Complex64],
+    options: EvolutionOptions,
+) -> Result<StateTrajectory>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    options.validate()?;
+    let shape = operator.shape();
+    if shape.0 != shape.1 || initial.len() != shape.0 {
+        return Err(QuSpinError::DimensionMismatch(
+            "time-dependent operator and initial state do not match".into(),
+        ));
+    }
+    let mut states = Vec::with_capacity(options.times.len());
+    let mut state = initial.to_vec();
+    let mut previous_time = 0.0;
+    for &time in &options.times {
+        state = adaptive_time_interval(
+            operator,
+            previous_time,
+            &state,
+            time - previous_time,
+            &options,
+        )?;
+        states.push(state.clone());
+        previous_time = time;
+    }
+    Ok(StateTrajectory {
+        times: options.times,
+        states,
+    })
+}
+
+/// Evolve independent column states without changing their column ordering.
+pub fn evolve_batch<O>(
+    operator: &O,
+    initial_columns: &[Vec<Complex64>],
+    options: EvolutionOptions,
+) -> Result<StateBatchTrajectory>
+where
+    O: LinearOperator + ?Sized,
+{
+    if initial_columns.is_empty() {
+        return Err(QuSpinError::InvalidOptions(
+            "a state batch must contain at least one column".into(),
+        ));
+    }
+    let mut by_column = Vec::with_capacity(initial_columns.len());
+    for initial in initial_columns {
+        by_column.push(evolve(operator, initial, options.clone())?);
+    }
+    let states = (0..options.times.len())
+        .map(|time_index| {
+            by_column
+                .iter()
+                .map(|trajectory| trajectory.states[time_index].clone())
+                .collect()
+        })
+        .collect();
+    Ok(StateBatchTrajectory {
+        times: options.times,
+        states,
+    })
+}
+
+/// Batched counterpart of [`evolve_time_dependent`].
+pub fn evolve_time_dependent_batch<O>(
+    operator: &O,
+    initial_columns: &[Vec<Complex64>],
+    options: EvolutionOptions,
+) -> Result<StateBatchTrajectory>
+where
+    O: TimeDependentOperator + ?Sized,
+{
+    if initial_columns.is_empty() {
+        return Err(QuSpinError::InvalidOptions(
+            "a state batch must contain at least one column".into(),
+        ));
+    }
+    let mut by_column = Vec::with_capacity(initial_columns.len());
+    for initial in initial_columns {
+        by_column.push(evolve_time_dependent(operator, initial, options.clone())?);
+    }
+    let states = (0..options.times.len())
+        .map(|time_index| {
+            by_column
+                .iter()
+                .map(|trajectory| trajectory.states[time_index].clone())
+                .collect()
+        })
+        .collect();
+    Ok(StateBatchTrajectory {
+        times: options.times,
+        states,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RhsEvolutionOptions {
+    pub times: Vec<f64>,
+    pub max_step: f64,
+    pub max_substeps: usize,
+    pub normalize: bool,
+}
+
+impl RhsEvolutionOptions {
+    fn validate(&self, initial_time: f64) -> Result<()> {
+        if !initial_time.is_finite()
+            || self.times.is_empty()
+            || self.times.iter().any(|time| !time.is_finite())
+            || self.times.windows(2).any(|pair| pair[0] > pair[1])
+            || self.times[0] < initial_time
+            || !self.max_step.is_finite()
+            || self.max_step <= 0.0
+            || self.max_substeps == 0
+        {
+            return Err(QuSpinError::InvalidOptions(
+                "invalid callable-RHS time grid or integration controls".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn rhs_rk4_step<F>(
+    derivative: &F,
+    time: f64,
+    state: &[Complex64],
+    step: f64,
+) -> Result<Vec<Complex64>>
+where
+    F: Fn(f64, &[Complex64], &mut [Complex64]) -> Result<()>,
+{
+    let dimension = state.len();
+    let mut k1 = vec![Complex64::new(0.0, 0.0); dimension];
+    derivative(time, state, &mut k1)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k1)
+        .map(|(value, slope)| *value + 0.5 * step * *slope)
+        .collect();
+    let mut k2 = vec![Complex64::new(0.0, 0.0); dimension];
+    derivative(time + 0.5 * step, &stage, &mut k2)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k2)
+        .map(|(value, slope)| *value + 0.5 * step * *slope)
+        .collect();
+    let mut k3 = vec![Complex64::new(0.0, 0.0); dimension];
+    derivative(time + 0.5 * step, &stage, &mut k3)?;
+    let stage: Vec<_> = state
+        .iter()
+        .zip(&k3)
+        .map(|(value, slope)| *value + step * *slope)
+        .collect();
+    let mut k4 = vec![Complex64::new(0.0, 0.0); dimension];
+    derivative(time + step, &stage, &mut k4)?;
+    Ok(state
+        .iter()
+        .zip(k1.iter().zip(k2.iter().zip(k3.iter().zip(&k4))))
+        .map(|(value, (first, (second, (third, fourth))))| {
+            *value + step * (*first + 2.0 * *second + 2.0 * *third + *fourth) / 6.0
+        })
+        .collect())
+}
+
+/// Integrate an arbitrary complex right-hand side `dstate/dt = f(t, state)`.
+pub fn evolve_rhs<F>(
+    initial: &[Complex64],
+    initial_time: f64,
+    options: RhsEvolutionOptions,
+    derivative: F,
+) -> Result<StateTrajectory>
+where
+    F: Fn(f64, &[Complex64], &mut [Complex64]) -> Result<()>,
+{
+    options.validate(initial_time)?;
+    if initial.is_empty() {
+        return Err(QuSpinError::DimensionMismatch(
+            "callable-RHS state must be nonempty".into(),
+        ));
+    }
+    let mut state = initial.to_vec();
+    let normalization = vector_norm(initial);
+    let mut current_time = initial_time;
+    let mut used_steps = 0_usize;
+    let mut states = Vec::with_capacity(options.times.len());
+    for &target_time in &options.times {
+        let interval = target_time - current_time;
+        let steps = (interval.abs() / options.max_step).ceil().max(1.0) as usize;
+        if used_steps.saturating_add(steps) > options.max_substeps {
+            return Err(QuSpinError::NonConvergence {
+                iterations: used_steps,
+                residual: interval.abs(),
+            });
+        }
+        let step = interval / steps as f64;
+        for _ in 0..steps {
+            state = rhs_rk4_step(&derivative, current_time, &state, step)?;
+            current_time += step;
+        }
+        if options.normalize && normalization > f64::EPSILON {
+            let norm = vector_norm(&state);
+            if norm <= f64::EPSILON || !norm.is_finite() {
+                return Err(QuSpinError::NonConvergence {
+                    iterations: used_steps + steps,
+                    residual: norm,
+                });
+            }
+            for value in &mut state {
+                *value *= normalization / norm;
+            }
+        }
+        used_steps += steps;
+        current_time = target_time;
+        states.push(state.clone());
+    }
+    Ok(StateTrajectory {
+        times: options.times,
+        states,
+    })
+}
+
+/// Liouville-von Neumann evolution of a row-major density matrix under a
+/// Hermitian static Hamiltonian.
+pub fn evolve_density<O>(
+    hamiltonian: &O,
+    initial_density: &[Complex64],
+    mut options: RhsEvolutionOptions,
+) -> Result<StateTrajectory>
+where
+    O: LinearOperator + ?Sized,
+{
+    let shape = hamiltonian.shape();
+    if shape.0 != shape.1 || initial_density.len() != shape.0.saturating_mul(shape.0) {
+        return Err(QuSpinError::DimensionMismatch(
+            "density evolution requires a square Hamiltonian and density matrix".into(),
+        ));
+    }
+    let dimension = shape.0;
+    options.normalize = false;
+    evolve_rhs(initial_density, 0.0, options, |_, density, output| {
+        let mut column = vec![Complex64::new(0.0, 0.0); dimension];
+        let mut applied = vec![Complex64::new(0.0, 0.0); dimension];
+        let mut h_rho = vec![Complex64::new(0.0, 0.0); density.len()];
+        let mut rho_h = vec![Complex64::new(0.0, 0.0); density.len()];
+        for column_index in 0..dimension {
+            for row in 0..dimension {
+                column[row] = density[row * dimension + column_index];
+            }
+            hamiltonian.apply(&column, &mut applied)?;
+            for row in 0..dimension {
+                h_rho[row * dimension + column_index] = applied[row];
+            }
+        }
+        // For Hermitian H, conjugating a row turns right multiplication by H
+        // into the same column action used above.
+        for row in 0..dimension {
+            for column_index in 0..dimension {
+                column[column_index] = density[row * dimension + column_index].conj();
+            }
+            hamiltonian.apply(&column, &mut applied)?;
+            for column_index in 0..dimension {
+                rho_h[row * dimension + column_index] = applied[column_index].conj();
+            }
+        }
+        for index in 0..output.len() {
+            output[index] = Complex64::new(0.0, -1.0) * (h_rho[index] - rho_h[index]);
+        }
+        Ok(())
     })
 }

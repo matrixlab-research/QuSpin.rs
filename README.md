@@ -1,23 +1,84 @@
 # QuSpin.rs
 
-`quspin` is a Rust-native exact-diagonalization toolkit being built from real
-many-body workflows rather than by transliterating Python or Julia syntax.
+`quspin` is a Rust-native exact-diagonalization toolkit derived from real
+many-body workflows. It preserves the physical capabilities of Python QuSpin
+without copying Python's class layout: a basis defines states and local
+transitions, and every stored or matrix-free map implements one rectangular
+`LinearOperator` interface.
 
-The frozen clean-room task documents are published separately:
+## Implemented capability surface
+
+- Spin, boson, spinless/spinful fermion, arbitrary finite-symmetry, tensor,
+  photon, callback-defined, and fixed-width wide-state bases.
+- Higher spin, translation/parity sectors, fermionic momentum sectors,
+  multi-sector spinful spaces, Majorana operators, branching user actions,
+  projectors with leakage checks, and streamed source-to-target sector changes.
+- Dense, CSC, CSR, DIA, and matrix-free operators; static, driven, and named
+  parameterized Hamiltonians; nonzero-driven sparse algebra; reusable
+  exponential grid/right action and low-level matvec plans; and safe versioned
+  dense/sparse archives.
+- Dense and selected Hermitian eigensolvers, shift-invert, fully
+  reorthogonalized Lanczos, static/callable/batched/density evolution,
+  FTLM/LTLM, reusable exponential plans, and cached shift-invert plans.
+- Floquet systems, block operators, spectral and dynamical response,
+  expectation values, arbitrary-site partial traces, pure/mixed entanglement,
+  diagonal ensembles, level statistics, subspace tracking, and Lindblad
+  generators.
+
+The four fixed-width state types (`U256`, `U1024`, `U4096`, `U16384`) are
+available independently of the small-system `u128` path and round-trip through
+arbitrary-precision `BigUint` values. Optimized assembly is selected by
+mathematical capabilities such as stored transitions or finite orbits, never
+by model names. Fixed-particle basis enumeration scales with the requested
+sector dimension instead of scanning the full parent Hilbert space.
+
+## Minimal example
+
+```rust
+use quspin::basis::SpinBasis1D;
+use quspin::operator::{Coupling, MatrixFormat, OperatorBuilder, OperatorTerm};
+use quspin::solve::{eigsh, EigshOptions};
+
+let basis = SpinBasis1D::builder(12).up(6).momentum(0).build()?;
+let bonds = (0..12).map(|site| Coupling::new(1.0, vec![site, (site + 1) % 12]));
+let hamiltonian = OperatorBuilder::on(&basis)
+    .term(OperatorTerm::new("zz", bonds)?)
+    .build(MatrixFormat::Csc)?;
+let low_energy = eigsh(&hamiltonian, EigshOptions::smallest_algebraic(4))?;
+# Ok::<(), quspin::QuSpinError>(())
+```
+
+The same `OperatorBuilder::between(source, target)` path constructs a
+rectangular probe between particle-number or symmetry sectors. The same
+operator can be converted among stored formats or consumed matrix-free by
+Krylov algorithms.
+
+## Verification boundary
+
+The public suite contains deterministic numerical properties and regressions.
+The private verification repository adds held-out numerical oracles and twelve
+medium-size workflows derived from published many-body calculations. These
+are reported separately:
+
+1. public surface and properties;
+2. independent numerical oracles;
+3. complete paper-workflow composition;
+4. representative sparse and symmetry-reduced scale.
+
+A green API-presence test alone is not treated as parity. The complete design
+and acceptance criteria are maintained in the private verifier's
+`rust/full-taskdoc/` documents. The original frozen clean-room task for the
+23-symbol workflow core remains available separately:
 
 - [motivation](https://github.com/matrixlab-research/quspin-rust-task/blob/main/MOTIVATION.md)
 - [API contract](https://github.com/matrixlab-research/quspin-rust-task/blob/main/CONTRACT.md)
 - [visible examples](https://github.com/matrixlab-research/quspin-rust-task/blob/main/TESTS.md)
 
-The implementation follows one narrow waist: bases define physical state and
-local-operator semantics, while stored and matrix-free linear maps expose the
-same rectangular `shape + apply` interface. This supports square Hamiltonians,
-cross-sector probes, and open-system generators without model-specific solver
-paths.
+## Local gates
 
-Status: the public release-mode gate executes all 12 frozen paper workflows,
-including symmetry reduction, sparse shift-invert, Floquet evolution,
-open-system dynamics, and cross-sector spectroscopy. API presence and this
-public regression suite are still not, by themselves, a claim of Python/Julia
-parity; independent numerical observations and benchmark records remain the
-responsibility of the private paper-workflow verifier.
+```bash
+cargo fmt --check
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --release --test visible_contract -- --ignored --test-threads=1
+```
