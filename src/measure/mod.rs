@@ -925,7 +925,7 @@ pub fn mean_level_spacing(eigenvalues: &[f64]) -> Result<f64> {
         .windows(2)
         .map(|pair| pair[1] - pair[0])
         .collect();
-    if gaps.iter().any(|gap| *gap == 0.0) {
+    if gaps.contains(&0.0) {
         return Ok(f64::NAN);
     }
     Ok(gaps
