@@ -574,6 +574,181 @@ fn select_indices(values: &[f64], target: SpectrumTarget, count: usize) -> Vec<u
     indices
 }
 
+fn real_inner(left: &[f64], right: &[f64]) -> f64 {
+    left.iter()
+        .zip(right)
+        .map(|(left_value, right_value)| left_value * right_value)
+        .sum()
+}
+
+fn real_vector_norm(vector: &[f64]) -> f64 {
+    real_inner(vector, vector).sqrt()
+}
+
+fn normalize_real(vector: &mut [f64]) -> Result<()> {
+    let norm = real_vector_norm(vector);
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(QuSpinError::NonConvergence {
+            iterations: 0,
+            residual: norm,
+        });
+    }
+    for value in vector {
+        *value /= norm;
+    }
+    Ok(())
+}
+
+fn lanczos_eigsh_real<O>(
+    operator: &O,
+    options: &EigshOptions,
+    initial: Option<&[Complex64]>,
+) -> Result<Eigensystem>
+where
+    O: LinearOperator + ?Sized,
+{
+    let dimension = operator.shape().0;
+    let requested_dimension = options
+        .krylov_dimension
+        .unwrap_or_else(|| (4 * options.eigenpairs + 24).max(48));
+    let krylov_dimension = requested_dimension
+        .min(options.max_iterations)
+        .min(dimension);
+    if krylov_dimension <= options.eigenpairs {
+        return Err(QuSpinError::InvalidOptions(
+            "the effective Krylov dimension must exceed eigenpairs".into(),
+        ));
+    }
+
+    let first = if let Some(initial) = initial {
+        if initial.len() != dimension {
+            return Err(QuSpinError::DimensionMismatch(
+                "eigsh initial vector does not match the operator".into(),
+            ));
+        }
+        let mut first: Vec<_> = initial.iter().map(|value| value.re).collect();
+        normalize_real(&mut first)?;
+        first
+    } else {
+        deterministic_start(dimension, options.seed)?
+            .into_iter()
+            .map(|value| value.re)
+            .collect()
+    };
+    let mut basis = Vec::with_capacity(krylov_dimension);
+    basis.push(first);
+    let mut alphas = Vec::with_capacity(krylov_dimension);
+    let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
+    let mut output = vec![0.0; dimension];
+
+    for iteration in 0..krylov_dimension {
+        operator.apply_real(&basis[iteration], &mut output)?;
+        let alpha = real_inner(&basis[iteration], &output);
+        alphas.push(alpha);
+        for (value, basis_value) in output.iter_mut().zip(&basis[iteration]) {
+            *value -= alpha * *basis_value;
+        }
+        if iteration > 0 {
+            let beta = betas[iteration - 1];
+            for (value, previous) in output.iter_mut().zip(&basis[iteration - 1]) {
+                *value -= beta * *previous;
+            }
+        }
+
+        for vector in &basis {
+            let overlap = real_inner(vector, &output);
+            for (value, basis_value) in output.iter_mut().zip(vector) {
+                *value -= overlap * *basis_value;
+            }
+        }
+        let beta = real_vector_norm(&output);
+        if iteration + 1 == krylov_dimension || beta <= 1.0e-14 {
+            break;
+        }
+        betas.push(beta);
+        for value in &mut output {
+            *value /= beta;
+        }
+        basis.push(output.clone());
+    }
+
+    if basis.len() <= options.eigenpairs {
+        return Err(QuSpinError::NonConvergence {
+            iterations: basis.len(),
+            residual: f64::INFINITY,
+        });
+    }
+    let size = basis.len();
+    let mut tridiagonal = DMatrix::<f64>::zeros(size, size);
+    for index in 0..size {
+        tridiagonal[(index, index)] = alphas[index];
+        if index + 1 < size {
+            tridiagonal[(index, index + 1)] = betas[index];
+            tridiagonal[(index + 1, index)] = betas[index];
+        }
+    }
+    let decomposition = SymmetricEigen::new(tridiagonal);
+    let indices = select_indices(
+        decomposition.eigenvalues.as_slice(),
+        options.target,
+        options.eigenpairs,
+    );
+
+    let mut candidates = Vec::with_capacity(options.eigenpairs);
+    for index in indices {
+        let mut vector = vec![0.0; dimension];
+        for (basis_index, basis_vector) in basis.iter().enumerate() {
+            let coefficient = decomposition.eigenvectors[(basis_index, index)];
+            for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+                *value += coefficient * *basis_value;
+            }
+        }
+        normalize_real(&mut vector)?;
+        operator.apply_real(&vector, &mut output)?;
+        let eigenvalue = real_inner(&vector, &output);
+        let residual = output
+            .iter()
+            .zip(&vector)
+            .map(|(actual, component)| (actual - eigenvalue * component).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        candidates.push((eigenvalue, vector, residual));
+    }
+    candidates.sort_by(|left, right| match options.target {
+        SpectrumTarget::SmallestAlgebraic => left.0.total_cmp(&right.0),
+        SpectrumTarget::LargestAlgebraic => right.0.total_cmp(&left.0),
+        SpectrumTarget::SmallestMagnitude => left.0.abs().total_cmp(&right.0.abs()),
+        SpectrumTarget::LargestMagnitude => right.0.abs().total_cmp(&left.0.abs()),
+        SpectrumTarget::BothEnds => left.0.total_cmp(&right.0),
+        SpectrumTarget::Shift(_) => unreachable!("shift-invert uses the complex backend"),
+    });
+    let residuals: Vec<_> = candidates.iter().map(|candidate| candidate.2).collect();
+    let failure_residual = residuals.iter().copied().fold(0.0_f64, f64::max);
+    let accepted_residual = options.tolerance.max(1.0e-7);
+    if failure_residual > accepted_residual {
+        return Err(QuSpinError::NonConvergence {
+            iterations: size,
+            residual: failure_residual,
+        });
+    }
+    Ok(Eigensystem {
+        eigenvalues: candidates.iter().map(|candidate| candidate.0).collect(),
+        eigenvectors: candidates
+            .into_iter()
+            .map(|candidate| {
+                candidate
+                    .1
+                    .into_iter()
+                    .map(|value| Complex64::new(value, 0.0))
+                    .collect()
+            })
+            .collect(),
+        residuals,
+        iterations: size,
+        converged: true,
+    })
+}
+
 fn lanczos_eigsh<O>(
     operator: &O,
     options: &EigshOptions,
@@ -582,6 +757,12 @@ fn lanczos_eigsh<O>(
 where
     O: LinearOperator + ?Sized,
 {
+    if !matches!(options.target, SpectrumTarget::Shift(_))
+        && operator.is_real()
+        && initial.is_none_or(|vector| vector.iter().all(|value| value.im.abs() <= 1.0e-14))
+    {
+        return lanczos_eigsh_real(operator, options, initial);
+    }
     let dimension = operator.shape().0;
     let requested_dimension = options
         .krylov_dimension
