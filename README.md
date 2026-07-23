@@ -53,6 +53,17 @@ rectangular probe between particle-number or symmetry sectors. The same
 operator can be converted among stored formats or consumed matrix-free by
 Krylov algorithms.
 
+## Numerical backend boundary
+
+Physics-facing basis and operator types depend only on the `LinearOperator`
+contract. Dense eigendecomposition, matrix products, and sparse shifted
+factorization are isolated in an internal backend module. The boundary is
+coarse grained: Krylov iterations remain Rust-native and call one reusable
+factorization or dense kernel rather than dispatching inside element or
+matvec loops. Real CSC Hamiltonians retain real arithmetic through both the
+factorization and shift-invert Lanczos path; complex operators use the same
+public solver contract.
+
 ## Verification boundary
 
 The public suite contains deterministic numerical properties and regressions.

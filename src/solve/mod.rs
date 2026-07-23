@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use nalgebra::{DMatrix, DVector, SymmetricEigen, linalg::Schur};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use num_complex::Complex64;
 
+use crate::backend;
 use crate::operator::{
     ExpOp, LinearOperator, MatrixFormat, ShiftedLinearSolver, TimeDependentOperator,
     materialize_dense,
@@ -179,40 +180,8 @@ pub(crate) fn hermitian_eigenpairs_all(
             }
         }
     }
-    if dense.iter().all(|value| value.im.abs() <= 1.0e-14) {
-        let matrix = DMatrix::from_fn(dimension, dimension, |row, column| {
-            dense[row * dimension + column].re
-        });
-        let decomposition = SymmetricEigen::new(matrix);
-        let mut eigenpairs: Vec<(f64, Vec<Complex64>)> = (0..dimension)
-            .map(|column| {
-                (
-                    decomposition.eigenvalues[column],
-                    (0..dimension)
-                        .map(|row| Complex64::new(decomposition.eigenvectors[(row, column)], 0.0))
-                        .collect(),
-                )
-            })
-            .collect();
-        eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
-        return Ok(eigenpairs.into_iter().unzip());
-    }
-
-    let matrix = DMatrix::from_fn(dimension, dimension, |row, column| {
-        dense[row * dimension + column]
-    });
-    let (vectors, triangular) = Schur::new(matrix).unpack();
-    let mut eigenpairs = Vec::with_capacity(dimension);
-    for column in 0..dimension {
-        let value = triangular[(column, column)];
-        if value.im.abs() > 1.0e-10 {
-            return Err(QuSpinError::NonHermitian);
-        }
-        let vector = (0..dimension).map(|row| vectors[(row, column)]).collect();
-        eigenpairs.push((value.re, vector));
-    }
-    eigenpairs.sort_by(|left, right| left.0.total_cmp(&right.0));
-    Ok(eigenpairs.into_iter().unzip())
+    let eigensystem = backend::hermitian_eigenpairs(&dense, dimension)?;
+    Ok((eigensystem.eigenvalues, eigensystem.eigenvectors))
 }
 
 /// Complete eigendecomposition of a finite Hermitian operator.
@@ -538,6 +507,28 @@ where
     }
 }
 
+fn transformed_apply_real<O>(
+    operator: &O,
+    options: &EigshOptions,
+    shifted_solver: Option<&dyn ShiftedLinearSolver>,
+    input: &[f64],
+    output: &mut [f64],
+) -> Result<()>
+where
+    O: LinearOperator + ?Sized,
+{
+    match options.target {
+        SpectrumTarget::Shift(_) => shifted_solver
+            .ok_or_else(|| {
+                QuSpinError::UnsupportedBackend(
+                    "real shift-invert requires a reusable real factorization".into(),
+                )
+            })?
+            .solve_real(input, output),
+        _ => operator.apply_real(input, output),
+    }
+}
+
 fn select_indices(values: &[f64], target: SpectrumTarget, count: usize) -> Vec<usize> {
     if target == SpectrumTarget::BothEnds {
         let mut ordered: Vec<_> = (0..values.len()).collect();
@@ -603,6 +594,7 @@ fn lanczos_eigsh_real<O>(
     operator: &O,
     options: &EigshOptions,
     initial: Option<&[Complex64]>,
+    shifted_solver: Option<Box<dyn ShiftedLinearSolver>>,
 ) -> Result<Eigensystem>
 where
     O: LinearOperator + ?Sized,
@@ -642,7 +634,13 @@ where
     let mut output = vec![0.0; dimension];
 
     for iteration in 0..krylov_dimension {
-        operator.apply_real(&basis[iteration], &mut output)?;
+        transformed_apply_real(
+            operator,
+            options,
+            shifted_solver.as_deref(),
+            &basis[iteration],
+            &mut output,
+        )?;
         let alpha = real_inner(&basis[iteration], &output);
         alphas.push(alpha);
         for (value, basis_value) in output.iter_mut().zip(&basis[iteration]) {
@@ -688,9 +686,14 @@ where
         }
     }
     let decomposition = SymmetricEigen::new(tridiagonal);
+    let transformed_target = if matches!(options.target, SpectrumTarget::Shift(_)) {
+        SpectrumTarget::LargestMagnitude
+    } else {
+        options.target
+    };
     let indices = select_indices(
         decomposition.eigenvalues.as_slice(),
-        options.target,
+        transformed_target,
         options.eigenpairs,
     );
 
@@ -720,7 +723,7 @@ where
         SpectrumTarget::SmallestMagnitude => left.0.abs().total_cmp(&right.0.abs()),
         SpectrumTarget::LargestMagnitude => right.0.abs().total_cmp(&left.0.abs()),
         SpectrumTarget::BothEnds => left.0.total_cmp(&right.0),
-        SpectrumTarget::Shift(_) => unreachable!("shift-invert uses the complex backend"),
+        SpectrumTarget::Shift(shift) => (left.0 - shift).abs().total_cmp(&(right.0 - shift).abs()),
     });
     let residuals: Vec<_> = candidates.iter().map(|candidate| candidate.2).collect();
     let failure_residual = residuals.iter().copied().fold(0.0_f64, f64::max);
@@ -757,11 +760,19 @@ fn lanczos_eigsh<O>(
 where
     O: LinearOperator + ?Sized,
 {
-    if !matches!(options.target, SpectrumTarget::Shift(_))
-        && operator.is_real()
-        && initial.is_none_or(|vector| vector.iter().all(|value| value.im.abs() <= 1.0e-14))
+    let real_compatible = operator.is_real()
+        && initial.is_none_or(|vector| vector.iter().all(|value| value.im.abs() <= 1.0e-14));
+    let mut shifted_solver = match options.target {
+        SpectrumTarget::Shift(shift) if real_compatible => operator.shifted_solver(shift)?,
+        _ => None,
+    };
+    if real_compatible
+        && (!matches!(options.target, SpectrumTarget::Shift(_))
+            || shifted_solver
+                .as_ref()
+                .is_some_and(|solver| solver.supports_real()))
     {
-        return lanczos_eigsh_real(operator, options, initial);
+        return lanczos_eigsh_real(operator, options, initial, shifted_solver);
     }
     let dimension = operator.shape().0;
     let requested_dimension = options
@@ -792,10 +803,11 @@ where
     let mut alphas = Vec::with_capacity(krylov_dimension);
     let mut betas = Vec::with_capacity(krylov_dimension.saturating_sub(1));
     let mut output = vec![Complex64::new(0.0, 0.0); dimension];
-    let shifted_solver = match options.target {
-        SpectrumTarget::Shift(shift) => operator.shifted_solver(shift)?,
-        _ => None,
-    };
+    if let SpectrumTarget::Shift(shift) = options.target
+        && shifted_solver.is_none()
+    {
+        shifted_solver = operator.shifted_solver(shift)?;
+    }
 
     for iteration in 0..krylov_dimension {
         transformed_apply(

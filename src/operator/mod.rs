@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use faer::linalg::solvers::Solve;
-use faer::sparse::{SparseColMat, Triplet as FaerTriplet};
 use num_complex::Complex64;
 use smallvec::SmallVec;
 
+pub use crate::backend::ShiftedLinearSolver;
+use crate::backend::factor_shifted_csc;
 use crate::basis::Basis;
 use crate::{QuSpinError, Result};
 
@@ -407,11 +407,6 @@ impl TimeDependentOperator for TimeOperator {
     }
 }
 
-/// Reusable factorization of `(A - shift * I)` for interior eigensolvers.
-pub trait ShiftedLinearSolver: Send + Sync {
-    fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssemblyChecks {
     pub hermiticity: bool,
@@ -477,27 +472,6 @@ pub struct Operator {
     format: MatrixFormat,
     storage: Storage,
     real: bool,
-}
-
-struct FaerShiftedSolver {
-    factorization: faer::sparse::linalg::solvers::Lu<usize, Complex64>,
-    dimension: usize,
-}
-
-impl ShiftedLinearSolver for FaerShiftedSolver {
-    fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
-        if input.len() != self.dimension || output.len() != self.dimension {
-            return Err(QuSpinError::DimensionMismatch(
-                "shifted solve input or output length does not match".into(),
-            ));
-        }
-        let mut right_hand_side = faer::Col::from_fn(self.dimension, |index| input[index]);
-        self.factorization.solve_in_place(right_hand_side.as_mut());
-        for (index, value) in output.iter_mut().enumerate() {
-            *value = right_hand_side[index];
-        }
-        Ok(())
-    }
 }
 
 impl Operator {
@@ -1241,43 +1215,15 @@ impl LinearOperator for Operator {
         else {
             return Ok(None);
         };
-        let dimension = self.shape.0;
-        let mut triplets = Vec::with_capacity(values.len() + dimension);
-        for column in 0..dimension {
-            let mut has_diagonal = false;
-            for position in column_offsets[column]..column_offsets[column + 1] {
-                let row = row_indices[position];
-                let mut value = values[position];
-                if row == column {
-                    value -= shift;
-                    has_diagonal = true;
-                }
-                triplets.push(FaerTriplet::new(row, column, value));
-            }
-            if !has_diagonal {
-                triplets.push(FaerTriplet::new(
-                    column,
-                    column,
-                    Complex64::new(-shift, 0.0),
-                ));
-            }
-        }
-        let matrix = SparseColMat::<usize, Complex64>::try_new_from_triplets(
-            dimension, dimension, &triplets,
+        factor_shifted_csc(
+            self.shape.0,
+            column_offsets,
+            row_indices,
+            values,
+            shift,
+            self.real,
         )
-        .map_err(|error| {
-            QuSpinError::UnsupportedBackend(format!(
-                "could not construct sparse shifted matrix: {error}"
-            ))
-        })?;
-        let factorization = matrix.sp_lu().map_err(|_| QuSpinError::NonConvergence {
-            iterations: 0,
-            residual: f64::INFINITY,
-        })?;
-        Ok(Some(Box::new(FaerShiftedSolver {
-            factorization,
-            dimension,
-        })))
+        .map(Some)
     }
 }
 

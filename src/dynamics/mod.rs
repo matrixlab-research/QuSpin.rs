@@ -1,9 +1,9 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use nalgebra::{DMatrix, linalg::Schur};
 use num_complex::Complex64;
 
+use crate::backend;
 use crate::operator::{
     LinearOperator, MatrixFormat, Operator, TimeDependentOperator, materialize_dense,
 };
@@ -12,6 +12,8 @@ use crate::solve::{
     lanczos_spectral_measure,
 };
 use crate::{QuSpinError, Result};
+
+const DENSE_PROPAGATOR_CUTOFF: usize = 128;
 
 pub struct DriveStep {
     pub hamiltonian: Arc<dyn LinearOperator>,
@@ -175,7 +177,32 @@ impl Floquet {
     }
 
     pub fn full_unitary(&self, format: MatrixFormat) -> Result<Operator> {
-        let dense = materialize_dense(self)?;
+        let dense = if self
+            .steps
+            .iter()
+            .all(|step| matches!(step, FloquetStep::Static(_)))
+            && self.dimension <= DENSE_PROPAGATOR_CUTOFF
+        {
+            let mut total = vec![Complex64::new(0.0, 0.0); self.dimension * self.dimension];
+            for index in 0..self.dimension {
+                total[index * self.dimension + index] = Complex64::new(1.0, 0.0);
+            }
+            for step in &self.steps {
+                let FloquetStep::Static(step) = step else {
+                    unreachable!("all Floquet steps were checked as static");
+                };
+                let hamiltonian = materialize_dense(step.hamiltonian.as_ref())?;
+                let propagator = backend::hermitian_exponential(
+                    &hamiltonian,
+                    self.dimension,
+                    Complex64::new(0.0, -step.duration),
+                )?;
+                total = backend::square_matmul(&propagator, &total, self.dimension)?;
+            }
+            total
+        } else {
+            materialize_dense(self)?
+        };
         Operator::from_dense(self.dimension, self.dimension, dense)?.converted(format)
     }
 
@@ -186,25 +213,24 @@ impl Floquet {
                 "Floquet eigensystems require a positive period".into(),
             ));
         }
-        let unitary = materialize_dense(self)?;
-        let matrix = DMatrix::from_fn(self.dimension, self.dimension, |row, column| {
-            unitary[row * self.dimension + column]
-        });
-        let (vectors, triangular) = Schur::new(matrix).unpack();
+        let unitary = materialize_dense(&self.full_unitary(MatrixFormat::Dense)?)?;
+        let eigensystem = backend::complex_eigenpairs(&unitary, self.dimension)?;
         let mut entries = Vec::with_capacity(self.dimension);
         for column in 0..self.dimension {
-            let eigenvalue = triangular[(column, column)];
+            let eigenvalue = eigensystem.eigenvalues[column];
             if (eigenvalue.norm() - 1.0).abs() > 1.0e-8 {
                 return Err(QuSpinError::NonConvergence {
                     iterations: 1,
                     residual: (eigenvalue.norm() - 1.0).abs(),
                 });
             }
-            let vector: Vec<_> = (0..self.dimension)
-                .map(|row| vectors[(row, column)])
-                .collect();
+            let vector = eigensystem.eigenvectors[column].clone();
             let mut applied = vec![Complex64::new(0.0, 0.0); self.dimension];
-            self.apply_period(&vector, &mut applied)?;
+            for row in 0..self.dimension {
+                applied[row] = (0..self.dimension)
+                    .map(|inner| unitary[row * self.dimension + inner] * vector[inner])
+                    .sum();
+            }
             let residual = applied
                 .iter()
                 .zip(&vector)
