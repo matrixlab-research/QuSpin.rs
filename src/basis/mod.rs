@@ -4,9 +4,17 @@ use std::sync::Arc;
 
 use num_bigint::BigUint;
 use num_complex::Complex64;
+use smallvec::SmallVec;
 
 use crate::operator::{LinearOperator, MatrixFormat, check_apply_shape};
 use crate::{QuSpinError, Result};
+
+/// Compact collection of local-operator destinations.
+///
+/// The common zero-, one-, and two-destination cases stay inline. Operators
+/// with wider branching use the same interface and spill to heap storage
+/// automatically.
+pub type LocalTransitions<State> = SmallVec<[(State, Complex64); 2]>;
 
 /// Finite Hilbert-space basis and its local operator semantics.
 pub trait Basis: Send + Sync {
@@ -33,7 +41,7 @@ pub trait Basis: Send + Sync {
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         Ok(self
             .apply_local(state, operator, sites)?
             .into_iter()
@@ -47,13 +55,35 @@ pub trait Basis: Send + Sync {
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         self.apply_local_transitions(state, operator, sites)
     }
 
+    /// Streams unreduced destinations directly to a consumer.
+    ///
+    /// This is the universal hot-path interface used by assemblers. The
+    /// default covers deterministic bases without constructing an intermediate
+    /// collection; branching and symmetry-reduced bases override it while
+    /// preserving the same consumer contract.
+    fn visit_local_unreduced_transitions<F>(
+        &self,
+        state: Self::State,
+        operator: &str,
+        sites: &[usize],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        Self: Sized,
+        F: FnMut(Self::State, Complex64) -> Result<()>,
+    {
+        if let Some((target, amplitude)) = self.apply_local(state, operator, sites)? {
+            visit(target, amplitude)?;
+        }
+        Ok(())
+    }
+
     /// Orbit size of a canonical source state used in projector normalization.
-    fn transition_orbit_size(&self, state: Self::State) -> Result<usize> {
-        self.index(state)?;
+    fn transition_orbit_size(&self, _state: Self::State) -> Result<usize> {
         Ok(1)
     }
 
@@ -65,6 +95,22 @@ pub trait Basis: Send + Sync {
     ) -> Result<Option<(Self::State, Complex64)>> {
         match self.index(state) {
             Ok(_) => Ok(Some((state, Complex64::new(1.0, 0.0)))),
+            Err(QuSpinError::StateNotInBasis) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reduces a physical target and locates its row in one operation.
+    ///
+    /// Assemblers use this fused boundary to avoid looking up the same state
+    /// once during reduction and again during indexing.
+    fn index_transition(
+        &self,
+        state: Self::State,
+        _source_orbit_size: usize,
+    ) -> Result<Option<(usize, Complex64)>> {
+        match self.index(state) {
+            Ok(index) => Ok(Some((index, Complex64::new(1.0, 0.0)))),
             Err(QuSpinError::StateNotInBasis) => Ok(None),
             Err(error) => Err(error),
         }
@@ -573,8 +619,14 @@ fn operator_chars(operator: &str, sites: &[usize]) -> Result<Vec<char>> {
 pub struct SpinBasis1D {
     sites: usize,
     spin_twice: u16,
+    states_per_site: u128,
+    radix_bits: Option<u32>,
     up: Option<usize>,
     pauli: bool,
+    place_values: Vec<u128>,
+    z_factors: Vec<f64>,
+    raise_factors: Vec<f64>,
+    lower_factors: Vec<f64>,
     momentum: Option<usize>,
     parity: Option<i8>,
     orbit_lengths: Vec<usize>,
@@ -623,79 +675,116 @@ impl SpinBasis1D {
         state: u128,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(u128, Complex64)>> {
+    ) -> Result<LocalTransitions<u128>> {
+        let mut transitions = LocalTransitions::new();
+        self.visit_unreduced_local_transitions(state, operator, sites, |target, amplitude| {
+            transitions.push((target, amplitude));
+            Ok(())
+        })?;
+        Ok(transitions)
+    }
+
+    fn visit_unreduced_local_transitions<F>(
+        &self,
+        state: u128,
+        operator: &str,
+        sites: &[usize],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u128, Complex64) -> Result<()>,
+    {
         let chars = operator_chars(operator, sites)?;
-        let states_per_site = u128::from(self.spin_twice) + 1;
-        let spin = f64::from(self.spin_twice) * 0.5;
-        let mut branches = vec![(state, Complex64::new(1.0, 0.0))];
-        for (&site, op) in sites.iter().zip(chars).rev() {
-            checked_site(site, self.sites)?;
-            let place = states_per_site.pow(u32::try_from(site).unwrap_or(u32::MAX));
-            let mut next = Vec::with_capacity(branches.len().saturating_mul(2));
-            for (encoded, amplitude) in branches {
-                let digit = (encoded / place) % states_per_site;
-                let magnetic = digit as f64 - spin;
-                let raise = || {
-                    if digit >= u128::from(self.spin_twice) {
-                        None
-                    } else {
-                        let factor = (spin * (spin + 1.0) - magnetic * (magnetic + 1.0)).sqrt();
-                        Some((encoded + place, Complex64::new(factor, 0.0)))
-                    }
-                };
-                let lower = || {
-                    if digit == 0 {
-                        None
-                    } else {
-                        let factor = (spin * (spin + 1.0) - magnetic * (magnetic - 1.0)).sqrt();
-                        Some((encoded - place, Complex64::new(factor, 0.0)))
-                    }
-                };
+        let mut pending = SmallVec::<[(u128, Complex64, usize); 2]>::new();
+        pending.push((state, Complex64::new(1.0, 0.0), chars.len()));
+        while let Some((mut encoded, mut amplitude, mut remaining)) = pending.pop() {
+            loop {
+                if remaining == 0 {
+                    visit(encoded, amplitude)?;
+                    break;
+                }
+                let position = remaining - 1;
+                let site = sites[position];
+                let op = chars[position];
+                checked_site(site, self.sites)?;
+                let place = self.place_values[site];
+                let encoded_digit = self.radix_bits.map_or_else(
+                    || (encoded / place) % self.states_per_site,
+                    |bits| {
+                        (encoded >> (bits * u32::try_from(site).unwrap_or(u32::MAX)))
+                            & (self.states_per_site - 1)
+                    },
+                );
+                let digit =
+                    usize::try_from(encoded_digit).map_err(|_| QuSpinError::StateNotInBasis)?;
+                let raise_factor = self.raise_factors[digit];
+                let lower_factor = self.lower_factors[digit];
                 match op {
-                    'I' => next.push((encoded, amplitude)),
+                    'I' => {}
                     'z' => {
-                        let factor = if self.pauli { 2.0 * magnetic } else { magnetic };
-                        if factor != 0.0 {
-                            next.push((encoded, amplitude * factor));
+                        let factor = self.z_factors[digit];
+                        if factor == 0.0 {
+                            break;
                         }
+                        amplitude *= factor;
                     }
                     '+' => {
-                        if let Some((target, factor)) = raise() {
-                            next.push((target, amplitude * factor));
+                        if raise_factor == 0.0 {
+                            break;
+                        }
+                        encoded += place;
+                        if raise_factor != 1.0 {
+                            amplitude *= raise_factor;
                         }
                     }
                     '-' => {
-                        if let Some((target, factor)) = lower() {
-                            next.push((target, amplitude * factor));
+                        if lower_factor == 0.0 {
+                            break;
+                        }
+                        encoded -= place;
+                        if lower_factor != 1.0 {
+                            amplitude *= lower_factor;
                         }
                     }
-                    'x' => {
+                    'x' | 'y' => {
                         let scale = if self.pauli { 1.0 } else { 0.5 };
-                        if let Some((target, factor)) = raise() {
-                            next.push((target, amplitude * scale * factor));
-                        }
-                        if let Some((target, factor)) = lower() {
-                            next.push((target, amplitude * scale * factor));
-                        }
-                    }
-                    'y' => {
-                        let scale = if self.pauli { 1.0 } else { 0.5 };
-                        if let Some((target, factor)) = raise() {
-                            next.push((target, amplitude * Complex64::new(0.0, -scale) * factor));
-                        }
-                        if let Some((target, factor)) = lower() {
-                            next.push((target, amplitude * Complex64::new(0.0, scale) * factor));
+                        let raise_phase = if op == 'x' {
+                            Complex64::new(scale, 0.0)
+                        } else {
+                            Complex64::new(0.0, -scale)
+                        };
+                        let lower_phase = if op == 'x' {
+                            Complex64::new(scale, 0.0)
+                        } else {
+                            Complex64::new(0.0, scale)
+                        };
+                        match (raise_factor != 0.0, lower_factor != 0.0) {
+                            (true, true) => {
+                                pending.push((
+                                    encoded - place,
+                                    amplitude * lower_phase * lower_factor,
+                                    position,
+                                ));
+                                encoded += place;
+                                amplitude *= raise_phase * raise_factor;
+                            }
+                            (true, false) => {
+                                encoded += place;
+                                amplitude *= raise_phase * raise_factor;
+                            }
+                            (false, true) => {
+                                encoded -= place;
+                                amplitude *= lower_phase * lower_factor;
+                            }
+                            (false, false) => break,
                         }
                     }
                     _ => return Err(QuSpinError::InvalidOperator(op.to_string())),
                 }
-            }
-            branches = next;
-            if branches.is_empty() {
-                return Ok(Vec::new());
+                remaining = position;
             }
         }
-        Ok(branches)
+        Ok(())
     }
 }
 
@@ -752,6 +841,39 @@ impl SpinBasisBuilder {
             ));
         }
         let states_per_site = usize::from(self.spin_twice) + 1;
+        let states_per_site_u128 = states_per_site as u128;
+        let radix_bits = states_per_site_u128
+            .is_power_of_two()
+            .then_some(states_per_site_u128.trailing_zeros());
+        let place_values = (0..self.sites)
+            .map(|site| {
+                states_per_site_u128
+                    .checked_pow(u32::try_from(site).unwrap_or(u32::MAX))
+                    .ok_or_else(|| {
+                        QuSpinError::UnsupportedBackend(
+                            "spin-state place value exceeds the u128 backend".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let spin = f64::from(self.spin_twice) * 0.5;
+        let mut z_factors = Vec::with_capacity(states_per_site);
+        let mut raise_factors = Vec::with_capacity(states_per_site);
+        let mut lower_factors = Vec::with_capacity(states_per_site);
+        for digit in 0..states_per_site {
+            let magnetic = digit as f64 - spin;
+            z_factors.push(if self.pauli { 2.0 * magnetic } else { magnetic });
+            raise_factors.push(if digit + 1 < states_per_site {
+                (spin * (spin + 1.0) - magnetic * (magnetic + 1.0)).sqrt()
+            } else {
+                0.0
+            });
+            lower_factors.push(if digit > 0 {
+                (spin * (spin + 1.0) - magnetic * (magnetic - 1.0)).sqrt()
+            } else {
+                0.0
+            });
+        }
         let parent_states = if self.spin_twice == 1 {
             fixed_weight_states(self.sites, self.up)?
         } else {
@@ -760,7 +882,7 @@ impl SpinBasisBuilder {
         let (states, orbit_lengths, symmetry_lookup, momentum, parity) = spin_symmetry_sector(
             parent_states,
             self.sites,
-            states_per_site as u128,
+            states_per_site_u128,
             self.momentum,
             self.parity,
         )?;
@@ -770,8 +892,14 @@ impl SpinBasisBuilder {
         Ok(SpinBasis1D {
             sites: self.sites,
             spin_twice: self.spin_twice,
+            states_per_site: states_per_site_u128,
+            radix_bits,
             up: self.up,
             pauli: self.pauli,
+            place_values,
+            z_factors,
+            raise_factors,
+            lower_factors,
             momentum,
             parity,
             orbit_lengths,
@@ -820,79 +948,9 @@ impl Basis for SpinBasis1D {
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         let source_state = state;
-        let chars = operator_chars(operator, sites)?;
-        let states_per_site = u128::from(self.spin_twice) + 1;
-        let spin = f64::from(self.spin_twice) * 0.5;
-        let mut branches = vec![(state, Complex64::new(1.0, 0.0))];
-        for (&site, op) in sites.iter().zip(chars).rev() {
-            checked_site(site, self.sites)?;
-            let place = states_per_site.pow(u32::try_from(site).unwrap_or(u32::MAX));
-            let mut next = Vec::with_capacity(branches.len().saturating_mul(2));
-            for (encoded, amplitude) in branches {
-                let digit = (encoded / place) % states_per_site;
-                let magnetic = digit as f64 - spin;
-                let raise = || {
-                    if digit >= u128::from(self.spin_twice) {
-                        None
-                    } else {
-                        let factor = (spin * (spin + 1.0) - magnetic * (magnetic + 1.0)).sqrt();
-                        Some((encoded + place, Complex64::new(factor, 0.0)))
-                    }
-                };
-                let lower = || {
-                    if digit == 0 {
-                        None
-                    } else {
-                        let factor = (spin * (spin + 1.0) - magnetic * (magnetic - 1.0)).sqrt();
-                        Some((encoded - place, Complex64::new(factor, 0.0)))
-                    }
-                };
-                match op {
-                    'I' => next.push((encoded, amplitude)),
-                    'z' => {
-                        let factor = if self.pauli { 2.0 * magnetic } else { magnetic };
-                        if factor != 0.0 {
-                            next.push((encoded, amplitude * factor));
-                        }
-                    }
-                    '+' => {
-                        if let Some((target, factor)) = raise() {
-                            next.push((target, amplitude * factor));
-                        }
-                    }
-                    '-' => {
-                        if let Some((target, factor)) = lower() {
-                            next.push((target, amplitude * factor));
-                        }
-                    }
-                    'x' => {
-                        let scale = if self.pauli { 1.0 } else { 0.5 };
-                        if let Some((target, factor)) = raise() {
-                            next.push((target, amplitude * scale * factor));
-                        }
-                        if let Some((target, factor)) = lower() {
-                            next.push((target, amplitude * scale * factor));
-                        }
-                    }
-                    'y' => {
-                        let scale = if self.pauli { 1.0 } else { 0.5 };
-                        if let Some((target, factor)) = raise() {
-                            next.push((target, amplitude * Complex64::new(0.0, -scale) * factor));
-                        }
-                        if let Some((target, factor)) = lower() {
-                            next.push((target, amplitude * Complex64::new(0.0, scale) * factor));
-                        }
-                    }
-                    _ => return Err(QuSpinError::InvalidOperator(op.to_string())),
-                }
-            }
-            branches = next;
-            if branches.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
+        let branches = self.unreduced_local_transitions(state, operator, sites)?;
         if self.momentum.is_some() || self.parity.is_some() {
             let source_index = self.index(source_state)?;
             let source_orbit = self.orbit_lengths[source_index];
@@ -907,7 +965,7 @@ impl Basis for SpinBasis1D {
                     .entry(image.representative)
                     .or_insert(Complex64::new(0.0, 0.0)) += amplitude;
             }
-            let mut transitions: Vec<_> = reduced
+            let mut transitions: LocalTransitions<_> = reduced
                 .into_iter()
                 .filter(|(_, amplitude)| amplitude.norm() > f64::EPSILON)
                 .collect();
@@ -922,11 +980,27 @@ impl Basis for SpinBasis1D {
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         self.unreduced_local_transitions(state, operator, sites)
     }
 
+    fn visit_local_unreduced_transitions<F>(
+        &self,
+        state: Self::State,
+        operator: &str,
+        sites: &[usize],
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Self::State, Complex64) -> Result<()>,
+    {
+        self.visit_unreduced_local_transitions(state, operator, sites, visit)
+    }
+
     fn transition_orbit_size(&self, state: Self::State) -> Result<usize> {
+        if self.momentum.is_none() && self.parity.is_none() {
+            return Ok(1);
+        }
         Ok(self.orbit_lengths[self.index(state)?])
     }
 
@@ -940,6 +1014,27 @@ impl Basis for SpinBasis1D {
         };
         Ok(Some((
             image.representative,
+            (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
+        )))
+    }
+
+    fn index_transition(
+        &self,
+        state: Self::State,
+        source_orbit_size: usize,
+    ) -> Result<Option<(usize, Complex64)>> {
+        if self.momentum.is_none() && self.parity.is_none() {
+            return match self.index(state) {
+                Ok(index) => Ok(Some((index, Complex64::new(1.0, 0.0)))),
+                Err(QuSpinError::StateNotInBasis) => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
+        let Some(image) = self.symmetry_lookup.get(&state) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            self.index(image.representative)?,
             (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
         )))
     }
@@ -1255,14 +1350,35 @@ impl Basis for SpinlessFermionBasis1D {
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         Ok(self
             .unreduced_local_transition(state, operator, sites)?
             .into_iter()
             .collect())
     }
 
+    fn visit_local_unreduced_transitions<F>(
+        &self,
+        state: Self::State,
+        operator: &str,
+        sites: &[usize],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Self::State, Complex64) -> Result<()>,
+    {
+        if let Some((target, amplitude)) =
+            self.unreduced_local_transition(state, operator, sites)?
+        {
+            visit(target, amplitude)?;
+        }
+        Ok(())
+    }
+
     fn transition_orbit_size(&self, state: Self::State) -> Result<usize> {
+        if self.momentum.is_none() {
+            return Ok(1);
+        }
         Ok(self.orbit_lengths[self.index(state)?])
     }
 
@@ -1276,6 +1392,27 @@ impl Basis for SpinlessFermionBasis1D {
         };
         Ok(Some((
             image.representative,
+            (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
+        )))
+    }
+
+    fn index_transition(
+        &self,
+        state: Self::State,
+        source_orbit_size: usize,
+    ) -> Result<Option<(usize, Complex64)>> {
+        if self.momentum.is_none() {
+            return match self.index(state) {
+                Ok(index) => Ok(Some((index, Complex64::new(1.0, 0.0)))),
+                Err(QuSpinError::StateNotInBasis) => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
+        let Some(image) = self.symmetry_lookup.get(&state) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            self.index(image.representative)?,
             (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
         )))
     }
@@ -1476,7 +1613,11 @@ impl Basis for SpinfulFermionBasis1D {
     }
 }
 
-type UserAction<State> = Arc<dyn Fn(State, usize) -> Result<Vec<(State, Complex64)>> + Send + Sync>;
+type UserAction<State> = Arc<
+    dyn Fn(State, usize, &mut dyn FnMut(State, Complex64) -> Result<()>) -> Result<()>
+        + Send
+        + Sync,
+>;
 type UserStateFactory<State> = Arc<dyn Fn() -> Result<Vec<State>> + Send + Sync>;
 
 /// Callback-defined constrained basis using the same assembly path as built-ins.
@@ -1541,7 +1682,12 @@ where
     {
         self.operators.insert(
             name,
-            Arc::new(move |state, site| Ok(action(state, site)?.into_iter().collect())),
+            Arc::new(move |state, site, visit| {
+                if let Some((target, amplitude)) = action(state, site)? {
+                    visit(target, amplitude)?;
+                }
+                Ok(())
+            }),
         );
         self
     }
@@ -1551,7 +1697,15 @@ where
     where
         F: Fn(State, usize) -> Result<Vec<(State, Complex64)>> + Send + Sync + 'static,
     {
-        self.operators.insert(name, Arc::new(action));
+        self.operators.insert(
+            name,
+            Arc::new(move |state, site, visit| {
+                for (target, amplitude) in action(state, site)? {
+                    visit(target, amplitude)?;
+                }
+                Ok(())
+            }),
+        );
         self
     }
 
@@ -1642,6 +1796,63 @@ impl UserBasisBuilder<u128> {
     }
 }
 
+impl<State> UserBasis<State>
+where
+    State: Copy + Eq + Hash + Send + Sync + 'static,
+{
+    fn visit_user_transitions<F>(
+        &self,
+        state: State,
+        operator: &str,
+        sites: &[usize],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(State, Complex64) -> Result<()>,
+    {
+        let chars = operator_chars(operator, sites)?;
+        self.visit_user_branch(
+            state,
+            Complex64::new(1.0, 0.0),
+            &chars,
+            sites,
+            chars.len(),
+            &mut visit,
+        )
+    }
+
+    fn visit_user_branch<F>(
+        &self,
+        state: State,
+        amplitude: Complex64,
+        chars: &[char],
+        sites: &[usize],
+        remaining: usize,
+        visit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(State, Complex64) -> Result<()>,
+    {
+        if remaining == 0 {
+            return visit(state, amplitude);
+        }
+        let position = remaining - 1;
+        let site = sites[position];
+        let op = chars[position];
+        checked_site(site, self.sites)?;
+        let action = self
+            .operators
+            .get(&op)
+            .ok_or_else(|| QuSpinError::InvalidOperator(op.to_string()))?;
+        action(state, site, &mut |target, local| {
+            if local.norm() <= f64::EPSILON {
+                return Ok(());
+            }
+            self.visit_user_branch(target, amplitude * local, chars, sites, position, visit)
+        })
+    }
+}
+
 impl<State> Basis for UserBasis<State>
 where
     State: Copy + Eq + Hash + Send + Sync + 'static,
@@ -1687,38 +1898,31 @@ where
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
-        let chars = operator_chars(operator, sites)?;
-        let mut branches = vec![(state, Complex64::new(1.0, 0.0))];
-        for (&site, op) in sites.iter().zip(chars).rev() {
-            checked_site(site, self.sites)?;
-            let action = self
-                .operators
-                .get(&op)
-                .ok_or_else(|| QuSpinError::InvalidOperator(op.to_string()))?;
-            let mut next = Vec::new();
-            for (branch, amplitude) in branches {
-                for (target, local) in action(branch, site)? {
-                    if local.norm() > f64::EPSILON {
-                        next.push((target, amplitude * local));
-                    }
-                }
-            }
-            branches = next;
-            if branches.is_empty() {
-                break;
-            }
-        }
+    ) -> Result<LocalTransitions<Self::State>> {
         let mut accumulated = HashMap::<State, Complex64>::new();
-        for (target, amplitude) in branches {
+        self.visit_user_transitions(state, operator, sites, |target, amplitude| {
             *accumulated
                 .entry(target)
                 .or_insert(Complex64::new(0.0, 0.0)) += amplitude;
-        }
+            Ok(())
+        })?;
         Ok(accumulated
             .into_iter()
             .filter(|(_, amplitude)| amplitude.norm() > f64::EPSILON)
             .collect())
+    }
+
+    fn visit_local_unreduced_transitions<F>(
+        &self,
+        state: Self::State,
+        operator: &str,
+        sites: &[usize],
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Self::State, Complex64) -> Result<()>,
+    {
+        self.visit_user_transitions(state, operator, sites, visit)
     }
 }
 
@@ -2054,7 +2258,7 @@ where
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         let source_index = self.index(state)?;
         let source_orbit = self.orbit_lengths[source_index];
         let mut reduced = HashMap::<Self::State, Complex64>::new();
@@ -2071,7 +2275,7 @@ where
                 .entry(image.representative)
                 .or_insert(Complex64::new(0.0, 0.0)) += amplitude;
         }
-        let mut transitions: Vec<_> = reduced
+        let mut transitions: LocalTransitions<_> = reduced
             .into_iter()
             .filter(|(_, amplitude)| amplitude.norm() > f64::EPSILON)
             .collect();
@@ -2084,9 +2288,23 @@ where
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         self.parent
             .apply_local_unreduced_transitions(state, operator, sites)
+    }
+
+    fn visit_local_unreduced_transitions<F>(
+        &self,
+        state: Self::State,
+        operator: &str,
+        sites: &[usize],
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Self::State, Complex64) -> Result<()>,
+    {
+        self.parent
+            .visit_local_unreduced_transitions(state, operator, sites, visit)
     }
 
     fn transition_orbit_size(&self, state: Self::State) -> Result<usize> {
@@ -2103,6 +2321,20 @@ where
         };
         Ok(Some((
             image.representative,
+            (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
+        )))
+    }
+
+    fn index_transition(
+        &self,
+        state: Self::State,
+        source_orbit_size: usize,
+    ) -> Result<Option<(usize, Complex64)>> {
+        let Some(image) = self.lookup.get(&state) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            self.index(image.representative)?,
             (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
         )))
     }
@@ -2193,7 +2425,7 @@ where
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         let (left_operator, right_operator) = operator.split_once('|').ok_or_else(|| {
             QuSpinError::InvalidOperator(
                 "tensor-basis operator strings must contain one `|` separator".into(),
@@ -2212,24 +2444,40 @@ where
             ));
         }
         let left_transitions = if left_operator.is_empty() {
-            vec![(state.0, Complex64::new(1.0, 0.0))]
+            LocalTransitions::from_iter([(state.0, Complex64::new(1.0, 0.0))])
         } else {
             self.left
                 .apply_local_transitions(state.0, left_operator, &sites[..left_arity])?
         };
         let right_transitions = if right_operator.is_empty() {
-            vec![(state.1, Complex64::new(1.0, 0.0))]
+            LocalTransitions::from_iter([(state.1, Complex64::new(1.0, 0.0))])
         } else {
             self.right
                 .apply_local_transitions(state.1, right_operator, &sites[left_arity..])?
         };
-        let mut transitions = Vec::with_capacity(left_transitions.len() * right_transitions.len());
+        let mut transitions = LocalTransitions::new();
         for &(left_state, left_amplitude) in &left_transitions {
             for &(right_state, right_amplitude) in &right_transitions {
                 transitions.push(((left_state, right_state), left_amplitude * right_amplitude));
             }
         }
         Ok(transitions)
+    }
+
+    fn visit_local_unreduced_transitions<F>(
+        &self,
+        state: Self::State,
+        operator: &str,
+        sites: &[usize],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Self::State, Complex64) -> Result<()>,
+    {
+        for (target, amplitude) in self.apply_local_transitions(state, operator, sites)? {
+            visit(target, amplitude)?;
+        }
+        Ok(())
     }
 
     fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
@@ -2384,13 +2632,29 @@ where
         state: Self::State,
         operator: &str,
         sites: &[usize],
-    ) -> Result<Vec<(Self::State, Complex64)>> {
+    ) -> Result<LocalTransitions<Self::State>> {
         Ok(self
             .tensor
             .apply_local_transitions(state, operator, sites)?
             .into_iter()
             .filter(|(target, _)| self.indices.contains_key(target))
             .collect())
+    }
+
+    fn visit_local_unreduced_transitions<F>(
+        &self,
+        state: Self::State,
+        operator: &str,
+        sites: &[usize],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Self::State, Complex64) -> Result<()>,
+    {
+        for (target, amplitude) in self.apply_local_transitions(state, operator, sites)? {
+            visit(target, amplitude)?;
+        }
+        Ok(())
     }
 
     fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {

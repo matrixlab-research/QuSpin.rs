@@ -31,6 +31,15 @@ fn spin_one_cartesian_operator_uses_branching_transitions() {
 
     let transitions = basis.apply_local_transitions(1, "x", &[0]).unwrap();
     assert_eq!(transitions.len(), 2);
+    assert!(!transitions.spilled());
+    let mut streamed = Vec::new();
+    basis
+        .visit_local_unreduced_transitions(1, "x", &[0], |target, amplitude| {
+            streamed.push((target, amplitude));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(streamed.as_slice(), transitions.as_slice());
     let expected = 1.0 / 2.0_f64.sqrt();
     assert_eq!(transitions[0].0, 2);
     assert_abs_diff_eq!(transitions[0].1.re, expected, epsilon = 1.0e-14);

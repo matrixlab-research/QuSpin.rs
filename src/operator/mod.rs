@@ -1567,25 +1567,24 @@ where
             let source_orbit_size = self.source.transition_orbit_size(source_state)?;
             for term in &self.terms {
                 for coupling in term.couplings() {
-                    for (unreduced_target, local_amplitude) in
-                        self.source.apply_local_unreduced_transitions(
-                            source_state,
-                            term.operator(),
-                            &coupling.sites,
-                        )?
-                    {
-                        let Some((target_state, reduction_amplitude)) = self
-                            .target
-                            .reduce_transition(unreduced_target, source_orbit_size)?
-                        else {
-                            continue;
-                        };
-                        let row = self.target.index(target_state)?;
-                        *accumulated
-                            .entry((row, column))
-                            .or_insert(Complex64::new(0.0, 0.0)) +=
-                            coupling.coefficient * local_amplitude * reduction_amplitude;
-                    }
+                    self.source.visit_local_unreduced_transitions(
+                        source_state,
+                        term.operator(),
+                        &coupling.sites,
+                        |unreduced_target, local_amplitude| {
+                            let Some((row, reduction_amplitude)) = self
+                                .target
+                                .index_transition(unreduced_target, source_orbit_size)?
+                            else {
+                                return Ok(());
+                            };
+                            *accumulated
+                                .entry((row, column))
+                                .or_insert(Complex64::new(0.0, 0.0)) +=
+                                coupling.coefficient * local_amplitude * reduction_amplitude;
+                            Ok(())
+                        },
+                    )?;
                 }
             }
         }
@@ -1707,7 +1706,7 @@ where
     }
     let mut transitions = Vec::new();
     for ket in kets {
-        for (bra, amplitude) in basis.apply_local_unreduced_transitions(ket, operator, sites)? {
+        basis.visit_local_unreduced_transitions(ket, operator, sites, |bra, amplitude| {
             let matrix_element = coefficient * amplitude;
             if matrix_element.norm() > f64::EPSILON {
                 transitions.push(BraKetTransition {
@@ -1716,7 +1715,8 @@ where
                     matrix_element,
                 });
             }
-        }
+            Ok(())
+        })?;
     }
     Ok(transitions)
 }
@@ -1747,21 +1747,23 @@ where
         let source_orbit_size = source.transition_orbit_size(source_state)?;
         for term in terms {
             for coupling in term.couplings() {
-                for (unreduced_target, local_amplitude) in source
-                    .apply_local_unreduced_transitions(
-                        source_state,
-                        term.operator(),
-                        &coupling.sites,
-                    )?
-                {
-                    let Some((target_state, reduction_amplitude)) =
-                        target.reduce_transition(unreduced_target, source_orbit_size)?
-                    else {
-                        continue;
-                    };
-                    output[target.index(target_state)?] +=
-                        input_value * coupling.coefficient * local_amplitude * reduction_amplitude;
-                }
+                source.visit_local_unreduced_transitions(
+                    source_state,
+                    term.operator(),
+                    &coupling.sites,
+                    |unreduced_target, local_amplitude| {
+                        let Some((row, reduction_amplitude)) =
+                            target.index_transition(unreduced_target, source_orbit_size)?
+                        else {
+                            return Ok(());
+                        };
+                        output[row] += input_value
+                            * coupling.coefficient
+                            * local_amplitude
+                            * reduction_amplitude;
+                        Ok(())
+                    },
+                )?;
             }
         }
     }
