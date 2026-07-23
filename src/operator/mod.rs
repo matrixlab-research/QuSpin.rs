@@ -5,6 +5,7 @@ use std::sync::Arc;
 use faer::linalg::solvers::Solve;
 use faer::sparse::{SparseColMat, Triplet as FaerTriplet};
 use num_complex::Complex64;
+use smallvec::SmallVec;
 
 use crate::basis::Basis;
 use crate::{QuSpinError, Result};
@@ -29,6 +30,8 @@ impl Coupling {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperatorTerm {
     operator: String,
+    symbols: SmallVec<[char; 8]>,
+    split: Option<usize>,
     couplings: Vec<Coupling>,
 }
 
@@ -38,13 +41,17 @@ impl OperatorTerm {
         couplings: impl IntoIterator<Item = Coupling>,
     ) -> Result<Self> {
         let operator = operator.as_ref();
-        let arity = operator
+        let symbols: SmallVec<[char; 8]> = operator
             .chars()
             .filter(|character| *character != '|')
-            .count();
+            .collect();
+        let arity = symbols.len();
         if arity == 0 {
             return Err(QuSpinError::InvalidOperator(operator.into()));
         }
+        let split = operator
+            .find('|')
+            .map(|position| operator[..position].chars().count());
         let couplings: Vec<_> = couplings.into_iter().collect();
         for coupling in &couplings {
             if coupling.sites.len() != arity {
@@ -61,6 +68,8 @@ impl OperatorTerm {
         }
         Ok(Self {
             operator: operator.into(),
+            symbols,
+            split,
             couplings,
         })
     }
@@ -71,6 +80,14 @@ impl OperatorTerm {
 
     pub fn couplings(&self) -> &[Coupling] {
         &self.couplings
+    }
+
+    pub(crate) fn symbols(&self) -> &[char] {
+        &self.symbols
+    }
+
+    pub(crate) const fn split(&self) -> Option<usize> {
+        self.split
     }
 }
 
@@ -89,6 +106,48 @@ pub trait LinearOperator: Send + Sync {
     fn shape(&self) -> (usize, usize);
     fn format(&self) -> MatrixFormat;
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()>;
+
+    /// Whether this operator preserves real vectors exactly.
+    ///
+    /// Eigensolvers use this capability to retain the public complex-valued
+    /// interface while avoiding complex arithmetic for real Hamiltonians.
+    fn is_real(&self) -> bool {
+        false
+    }
+
+    /// Apply this operator to a real vector.
+    ///
+    /// Custom operators can opt into the real fast path by overriding
+    /// [`LinearOperator::is_real`] and this method. The compatibility fallback
+    /// remains correct, but stored operators provide an allocation-free
+    /// implementation below.
+    fn apply_real(&self, input: &[f64], output: &mut [f64]) -> Result<()> {
+        let shape = self.shape();
+        if input.len() != shape.1 || output.len() != shape.0 {
+            return Err(QuSpinError::DimensionMismatch(format!(
+                "shape {shape:?} requires real input length {} and output length {}, got {} and {}",
+                shape.1,
+                shape.0,
+                input.len(),
+                output.len()
+            )));
+        }
+        let complex_input: Vec<_> = input
+            .iter()
+            .map(|&value| Complex64::new(value, 0.0))
+            .collect();
+        let mut complex_output = vec![Complex64::new(0.0, 0.0); shape.0];
+        self.apply(&complex_input, &mut complex_output)?;
+        for (real, complex) in output.iter_mut().zip(complex_output) {
+            if complex.im.abs() > 1.0e-12 {
+                return Err(QuSpinError::UnsupportedBackend(
+                    "operator declared a real action but produced an imaginary component".into(),
+                ));
+            }
+            *real = complex.re;
+        }
+        Ok(())
+    }
 
     /// Apply the algebraic transpose without conjugating either operand.
     ///
@@ -417,6 +476,7 @@ pub struct Operator {
     shape: (usize, usize),
     format: MatrixFormat,
     storage: Storage,
+    real: bool,
 }
 
 struct FaerShiftedSolver {
@@ -452,10 +512,12 @@ impl Operator {
                 values_row_major.len()
             )));
         }
+        let storage = Storage::Dense(values_row_major);
         Ok(Self {
             shape: (rows, columns),
             format: MatrixFormat::Dense,
-            storage: Storage::Dense(values_row_major),
+            real: storage_is_real(&storage),
+            storage,
         })
     }
 
@@ -517,6 +579,7 @@ impl Operator {
         Ok(Self {
             shape,
             format,
+            real: storage_is_real(&storage),
             storage,
         })
     }
@@ -1024,6 +1087,83 @@ impl LinearOperator for Operator {
         self.format
     }
 
+    fn is_real(&self) -> bool {
+        self.real
+    }
+
+    fn apply_real(&self, input: &[f64], output: &mut [f64]) -> Result<()> {
+        if input.len() != self.shape.1 || output.len() != self.shape.0 {
+            return Err(QuSpinError::DimensionMismatch(format!(
+                "shape {:?} requires real input length {} and output length {}, got {} and {}",
+                self.shape,
+                self.shape.1,
+                self.shape.0,
+                input.len(),
+                output.len()
+            )));
+        }
+        if !self.real {
+            return Err(QuSpinError::UnsupportedBackend(
+                "real action requires an operator with real-valued storage".into(),
+            ));
+        }
+        output.fill(0.0);
+        match &self.storage {
+            Storage::Dense(values) => {
+                for row in 0..self.shape.0 {
+                    for column in 0..self.shape.1 {
+                        output[row] += values[row * self.shape.1 + column].re * input[column];
+                    }
+                }
+            }
+            Storage::Csc {
+                column_offsets,
+                row_indices,
+                values,
+            } => {
+                for column in 0..self.shape.1 {
+                    let input_value = input[column];
+                    for position in column_offsets[column]..column_offsets[column + 1] {
+                        output[row_indices[position]] += values[position].re * input_value;
+                    }
+                }
+            }
+            Storage::Csr {
+                row_offsets,
+                column_indices,
+                values,
+            } => {
+                for row in 0..self.shape.0 {
+                    for position in row_offsets[row]..row_offsets[row + 1] {
+                        output[row] += values[position].re * input[column_indices[position]];
+                    }
+                }
+            }
+            Storage::Dia {
+                offsets,
+                values_by_row,
+            } => {
+                for (diagonal, &offset) in offsets.iter().enumerate() {
+                    for row in 0..self.shape.0 {
+                        let Some(column) = row.checked_add_signed(-offset) else {
+                            continue;
+                        };
+                        if column < self.shape.1 {
+                            output[row] +=
+                                values_by_row[diagonal * self.shape.0 + row].re * input[column];
+                        }
+                    }
+                }
+            }
+            Storage::MatrixFree(entries) => {
+                for entry in entries {
+                    output[entry.row] += entry.value.re * input[entry.column];
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         check_apply_shape(self.shape, input, output)?;
         output.fill(Complex64::new(0.0, 0.0));
@@ -1153,6 +1293,19 @@ fn csc_storage(entries: &[Triplet], columns: usize) -> Storage {
         column_offsets,
         row_indices: entries.iter().map(|entry| entry.row).collect(),
         values: entries.iter().map(|entry| entry.value).collect(),
+    }
+}
+
+fn storage_is_real(storage: &Storage) -> bool {
+    match storage {
+        Storage::Dense(values)
+        | Storage::Csc { values, .. }
+        | Storage::Csr { values, .. }
+        | Storage::Dia {
+            values_by_row: values,
+            ..
+        } => values.iter().all(|value| value.im == 0.0),
+        Storage::MatrixFree(entries) => entries.iter().all(|entry| entry.value.im == 0.0),
     }
 }
 
@@ -1561,15 +1714,35 @@ where
                 }
             }
         }
-        let mut accumulated: HashMap<(usize, usize), Complex64> = HashMap::new();
+        // Local actions are generated one source column at a time. Preserve
+        // that structure instead of hashing every `(row, column)` pair into a
+        // global table and sorting it back into sparse-matrix order later.
+        //
+        // A reusable column buffer remains fully general: arbitrary terms may
+        // still emit the same row repeatedly, including branching and
+        // symmetry-reduced actions. Sorting and coalescing only the current
+        // column bounds temporary memory by the local connectivity.
+        let local_capacity = self.terms.iter().map(|term| term.couplings().len()).sum();
+        let mut column_entries = Vec::<(usize, Complex64)>::with_capacity(local_capacity);
+        let mut entries = Vec::<Triplet>::new();
+        let mut csc_column_offsets = Vec::new();
+        let mut csc_row_indices = Vec::new();
+        let mut csc_values = Vec::new();
+        if format == MatrixFormat::Csc {
+            csc_column_offsets.reserve(shape.1 + 1);
+            csc_column_offsets.push(0);
+        }
         for column in 0..self.source.len() {
+            column_entries.clear();
             let source_state = self.source.state(column)?;
             let source_orbit_size = self.source.transition_orbit_size(source_state)?;
             for term in &self.terms {
                 for coupling in term.couplings() {
-                    self.source.visit_local_unreduced_transitions(
+                    self.source.visit_preparsed_local_unreduced_transitions(
                         source_state,
                         term.operator(),
+                        term.symbols(),
+                        term.split(),
                         &coupling.sites,
                         |unreduced_target, local_amplitude| {
                             let Some((row, reduction_amplitude)) = self
@@ -1578,24 +1751,42 @@ where
                             else {
                                 return Ok(());
                             };
-                            *accumulated
-                                .entry((row, column))
-                                .or_insert(Complex64::new(0.0, 0.0)) +=
-                                coupling.coefficient * local_amplitude * reduction_amplitude;
+                            column_entries.push((
+                                row,
+                                coupling.coefficient * local_amplitude * reduction_amplitude,
+                            ));
                             Ok(())
                         },
                     )?;
                 }
             }
+
+            column_entries.sort_unstable_by_key(|(row, _)| *row);
+            let mut position = 0;
+            while position < column_entries.len() {
+                let row = column_entries[position].0;
+                let mut value = column_entries[position].1;
+                position += 1;
+                while position < column_entries.len() && column_entries[position].0 == row {
+                    value += column_entries[position].1;
+                    position += 1;
+                }
+                if value.norm() <= f64::EPSILON {
+                    continue;
+                }
+                if format == MatrixFormat::Csc {
+                    csc_row_indices.push(row);
+                    csc_values.push(value);
+                } else {
+                    entries.push(Triplet { row, column, value });
+                }
+            }
+            if format == MatrixFormat::Csc {
+                csc_column_offsets.push(csc_row_indices.len());
+            }
         }
-        let mut entries: Vec<_> = accumulated
-            .into_iter()
-            .filter_map(|((row, column), value)| {
-                (value.norm() > f64::EPSILON).then_some(Triplet { row, column, value })
-            })
-            .collect();
         match format {
-            MatrixFormat::Csc => entries.sort_by_key(|entry| (entry.column, entry.row)),
+            MatrixFormat::Csc => {}
             MatrixFormat::Csr => entries.sort_by_key(|entry| (entry.row, entry.column)),
             _ => entries.sort_by_key(|entry| (entry.row, entry.column)),
         }
@@ -1619,7 +1810,11 @@ where
                 }
                 Storage::Dense(dense)
             }
-            MatrixFormat::Csc => csc_storage(&entries, shape.1),
+            MatrixFormat::Csc => Storage::Csc {
+                column_offsets: csc_column_offsets,
+                row_indices: csc_row_indices,
+                values: csc_values,
+            },
             MatrixFormat::Csr => csr_storage(&entries, shape.0),
             MatrixFormat::Dia => dia_storage(&entries, shape.0),
             MatrixFormat::MatrixFree => Storage::MatrixFree(entries),
@@ -1627,6 +1822,7 @@ where
         let operator = Operator {
             shape,
             format,
+            real: storage_is_real(&storage),
             storage,
         };
         if self.checks.hermiticity && !operator.is_hermitian(1.0e-12) {

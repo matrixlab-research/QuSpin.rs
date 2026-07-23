@@ -4,9 +4,10 @@ use approx::assert_abs_diff_eq;
 use quspin::Complex64;
 use quspin::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
 use quspin::solve::{
-    ExpmMultiplyParallel, ExpmOptions, LanczosOptions, ShiftInvertPlan, expm_multiply,
-    ftlm_observable_iteration, ftlm_static_iteration, lanczos_full, lanczos_iter,
-    linear_combination_qt, ltlm_observable_iteration, ltlm_static_iteration,
+    EigshOptions, ExpmMultiplyParallel, ExpmOptions, LanczosOptions, ShiftInvertPlan,
+    SpectrumTarget, eigsh, expm_multiply, ftlm_observable_iteration, ftlm_static_iteration,
+    lanczos_full, lanczos_iter, linear_combination_qt, ltlm_observable_iteration,
+    ltlm_static_iteration,
 };
 
 fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
@@ -23,6 +24,49 @@ fn diagonal(values: &[f64]) -> Operator {
         dense[index * dimension + index] = Complex64::new(*value, 0.0);
     }
     Operator::from_dense(dimension, dimension, dense).unwrap()
+}
+
+#[test]
+fn real_operator_capability_drives_large_sparse_eigsh() {
+    let dimension = 160;
+    let operator = Operator::from_triplets(
+        dimension,
+        dimension,
+        [
+            (0, 0, Complex64::new(-2.0, 0.0)),
+            (1, 1, Complex64::new(-1.0, 0.0)),
+        ],
+        MatrixFormat::Csc,
+    )
+    .unwrap();
+    assert!(operator.is_real());
+    let mut real_output = vec![0.0; dimension];
+    operator
+        .apply_real(&vec![1.0; dimension], &mut real_output)
+        .unwrap();
+    assert_eq!(&real_output[..3], &[-2.0, -1.0, 0.0]);
+
+    let result = eigsh(
+        &operator,
+        EigshOptions {
+            eigenpairs: 2,
+            target: SpectrumTarget::SmallestAlgebraic,
+            krylov_dimension: Some(8),
+            tolerance: 1.0e-12,
+            max_iterations: 32,
+            seed: 7,
+        },
+    )
+    .unwrap();
+    assert_abs_diff_eq!(result.eigenvalues[0], -2.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(result.eigenvalues[1], -1.0, epsilon = 1.0e-12);
+    assert!(result.residuals.iter().all(|residual| *residual < 1.0e-12));
+
+    let complex =
+        Operator::from_triplets(1, 1, [(0, 0, Complex64::new(0.0, 1.0))], MatrixFormat::Csc)
+            .unwrap();
+    assert!(!complex.is_real());
+    assert!(complex.apply_real(&[1.0], &mut [0.0]).is_err());
 }
 
 #[test]
