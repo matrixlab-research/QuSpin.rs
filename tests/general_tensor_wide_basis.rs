@@ -1,14 +1,19 @@
 use approx::assert_abs_diff_eq;
+use num_bigint::BigUint;
 use quspin::Complex64;
 use quspin::basis::{
     Basis, BasisProjector, BosonBasis1D, ClosureSymmetryMap, GeneralBasis, PhotonBasis,
     SpinBasis1D, SpinfulFermionBasis1D, StateStorage, SymmetrySector, TensorBasis, U256, UserBasis,
     WideSpinBasis256, basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and,
     bitwise_leftshift, bitwise_not, bitwise_or, bitwise_rightshift, bitwise_xor, coherent_state,
-    get_basis_type, photon_hspace_dim, python_int_to_basis_int,
+    get_basis_type, photon_hspace_dim, python_int_to_basis_int, state_from_biguint,
+    state_to_biguint,
 };
 use quspin::measure::project_operator;
-use quspin::operator::{Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm};
+use quspin::operator::{
+    Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm, apply_sector_shift,
+    bra_ket_transitions,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -57,6 +62,16 @@ fn closure_symmetry_map_reproduces_the_builtin_translation_sector() {
         .build(MatrixFormat::Csc)
         .unwrap();
     let projector = BasisProjector::from_general(&general).unwrap();
+    assert!(
+        projector
+            .preserves_operator_symmetry(&full_operator, 1.0e-12)
+            .unwrap()
+    );
+    let local_z = OperatorBuilder::on(general.parent())
+        .term(OperatorTerm::new("z", [Coupling::new(1.0, vec![0])]).unwrap())
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    assert!(projector.symmetry_leakage_norm(&local_z).unwrap() > 1.0e-6);
     let projected = project_operator(&full_operator, &projector, MatrixFormat::Dense).unwrap();
     let builtin_operator = OperatorBuilder::on(&builtin)
         .terms(terms)
@@ -122,6 +137,16 @@ fn cross_sector_builder_reduces_into_the_target_symmetry_sector() {
         .term(term.clone())
         .build(MatrixFormat::Csc)
         .unwrap();
+    let mut streamed = vec![Complex64::new(0.0, 0.0); target.len()];
+    apply_sector_shift(
+        &source,
+        &target,
+        std::slice::from_ref(&term),
+        &[Complex64::new(1.0, 0.0)],
+        &mut streamed,
+    )
+    .unwrap();
+    assert_eq!(streamed, reduced.to_dense());
     let full = OperatorBuilder::between(source.parent(), target.parent())
         .term(term)
         .build(MatrixFormat::Csc)
@@ -232,6 +257,9 @@ fn wide_integer_helpers_and_photon_utilities_cover_python_helper_semantics() {
     assert_eq!(basis_zeros::<4>(2), vec![U256::zero(); 2]);
     assert_eq!(basis_ones::<4>(1)[0].count_ones(), 256);
     assert_eq!(get_basis_type(200, None, 2).unwrap(), StateStorage::U256);
+    let arbitrary = (BigUint::from(1_u8) << 200) + BigUint::from(7_u8);
+    let encoded: U256 = state_from_biguint(&arbitrary).unwrap();
+    assert_eq!(state_to_biguint(encoded), arbitrary);
 
     let coherent = coherent_state(Complex64::new(0.0, 0.0), 4).unwrap();
     assert_eq!(coherent[0], Complex64::new(1.0, 0.0));
@@ -359,4 +387,9 @@ fn wide_spin_basis_assembles_high_site_actions_without_u128_conversion() {
             .unwrap();
     assert_eq!(lowering.shape(), (1, 201));
     assert_eq!(lowering.to_dense()[source], Complex64::new(1.0, 0.0));
+    let transitions = bra_ket_transitions(&basis, "-", &[200], 1.0, [high]).unwrap();
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].ket, high);
+    assert_eq!(transitions[0].bra, U256::zero());
+    assert_eq!(transitions[0].matrix_element, Complex64::new(1.0, 0.0));
 }

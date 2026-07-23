@@ -4,10 +4,11 @@ use std::sync::Arc;
 use approx::assert_abs_diff_eq;
 use quspin::basis::SpinBasis1D;
 use quspin::operator::{
-    Coupling, DynamicTerm, ExpOp, Hamiltonian, LinearOperator, MatrixFormat, Operator,
-    OperatorBuilder, OperatorTerm, QuantumComponent, QuantumLinearOperator, QuantumOperator,
-    Static, TimeDependentOperator, TimeOperator, anticommutator, commutator, is_exp_op,
-    is_hamiltonian, is_quantum_linear_operator, is_quantum_operator,
+    AssemblyChecks, Coupling, DynamicTerm, ExpGrid, ExpOp, Hamiltonian, LinearOperator,
+    MatrixFormat, Operator, OperatorBuilder, OperatorTerm, QuantumComponent, QuantumLinearOperator,
+    QuantumOperator, Static, TimeDependentOperator, TimeOperator, anticommutator, commutator,
+    get_matvec_function, is_exp_op, is_hamiltonian, is_quantum_linear_operator,
+    is_quantum_operator, matmat, matvec, rmatmat, rmatvec,
 };
 use quspin::{Complex64, QuSpinError};
 
@@ -49,6 +50,25 @@ fn dynamic_hamiltonian_evaluation_and_action_share_one_semantics() {
         .unwrap();
     for (actual, expected) in matrix_free.into_iter().zip(materialized) {
         assert_complex_close(actual, expected);
+    }
+    for (transformed, expected) in [
+        (
+            hamiltonian.transpose().unwrap(),
+            evaluated.transpose().unwrap(),
+        ),
+        (
+            hamiltonian.conjugated().unwrap(),
+            evaluated.conjugated().unwrap(),
+        ),
+        (hamiltonian.adjoint().unwrap(), evaluated.adjoint().unwrap()),
+    ] {
+        assert_eq!(
+            transformed
+                .evaluate(time, MatrixFormat::Dense)
+                .unwrap()
+                .to_dense(),
+            expected.to_dense()
+        );
     }
 }
 
@@ -266,4 +286,125 @@ fn time_operator_algebra_matches_materialized_matrix_arithmetic() {
             commutator(&left_matrix, &right_matrix).unwrap().to_dense()
         );
     }
+}
+
+#[test]
+fn low_level_matvec_supports_scaled_overwrite_and_accumulation() {
+    let operator = Arc::new(
+        Operator::from_triplets(
+            2,
+            2,
+            [
+                (0, 0, Complex64::new(2.0, 0.0)),
+                (1, 0, Complex64::new(3.0, 0.0)),
+                (1, 1, Complex64::new(-1.0, 0.0)),
+            ],
+            MatrixFormat::Csc,
+        )
+        .unwrap(),
+    );
+    let input = [Complex64::new(1.0, 1.0), Complex64::new(2.0, 0.0)];
+    let mut output = vec![Complex64::new(7.0, 0.0); 2];
+    matvec(
+        operator.as_ref(),
+        &input,
+        &mut output,
+        Complex64::new(0.5, 0.0),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        output,
+        vec![Complex64::new(1.0, 1.0), Complex64::new(0.5, 1.5)]
+    );
+
+    get_matvec_function(operator.clone())
+        .apply(&input, &mut output, Complex64::new(2.0, 0.0), false)
+        .unwrap();
+    assert_eq!(
+        output,
+        vec![Complex64::new(5.0, 5.0), Complex64::new(2.5, 7.5)]
+    );
+    let columns = vec![input.to_vec(), vec![Complex64::new(0.0, 0.0); 2]];
+    assert_eq!(
+        matmat(operator.as_ref(), &columns).unwrap()[0][0],
+        Complex64::new(2.0, 2.0)
+    );
+    assert_eq!(
+        rmatvec(operator.as_ref(), &input).unwrap()[0],
+        Complex64::new(8.0, 2.0)
+    );
+    assert_eq!(rmatmat(operator.as_ref(), &columns).unwrap().len(), 2);
+}
+
+#[test]
+fn exp_op_grid_and_right_action_match_explicit_matrices() {
+    let generator = Arc::new(
+        Operator::from_dense(
+            2,
+            2,
+            vec![
+                Complex64::new(0.0, 0.0),
+                Complex64::new(1.0, 0.0),
+                Complex64::new(0.0, 0.0),
+                Complex64::new(0.0, 0.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let exponential = ExpOp::new(generator, Complex64::new(1.0, 0.0), 8, 1.0e-13, 32).unwrap();
+    let state = [Complex64::new(1.0, 0.0), Complex64::new(2.0, 0.0)];
+    let grid = ExpGrid::new(0.0, 1.0, 3, true).unwrap();
+    let states = exponential.apply_grid(&state, grid).unwrap();
+    assert_eq!(states.len(), 3);
+    assert_complex_close(states[0][0], Complex64::new(1.0, 0.0));
+    assert_complex_close(states[0][1], Complex64::new(2.0, 0.0));
+    assert_complex_close(states[1][0], Complex64::new(2.0, 0.0));
+    assert_complex_close(states[2][0], Complex64::new(3.0, 0.0));
+
+    let explicit = exponential.matrix(MatrixFormat::Dense).unwrap();
+    let right = exponential.right_apply(&state).unwrap();
+    let expected = explicit.right_apply(&state).unwrap();
+    for (actual, expected) in right.into_iter().zip(expected) {
+        assert_complex_close(actual, expected);
+    }
+    let transformations = [
+        (
+            exponential.transpose().unwrap(),
+            explicit.transpose().unwrap(),
+        ),
+        (
+            exponential.conjugated().unwrap(),
+            explicit.conjugated().unwrap(),
+        ),
+        (exponential.adjoint().unwrap(), explicit.adjoint().unwrap()),
+    ];
+    for (transformed, expected) in transformations {
+        let actual = transformed.matrix(MatrixFormat::Dense).unwrap().to_dense();
+        for (actual, expected) in actual.into_iter().zip(expected.to_dense()) {
+            assert_complex_close(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn assembly_particle_check_rejects_sector_leakage_and_can_be_explicitly_disabled() {
+    let basis = SpinBasis1D::builder(4).up(2).build().unwrap();
+    let transverse = OperatorTerm::new("x", [Coupling::new(1.0, vec![0])]).unwrap();
+    let error = OperatorBuilder::on(&basis)
+        .term(transverse.clone())
+        .build(MatrixFormat::Csc)
+        .unwrap_err();
+    assert!(matches!(error, QuSpinError::InvalidSector(_)));
+
+    let projected = OperatorBuilder::on(&basis)
+        .checks(AssemblyChecks {
+            hermiticity: false,
+            particle_conservation: false,
+            symmetry_compatibility: true,
+        })
+        .term(transverse)
+        .build(MatrixFormat::Csc)
+        .unwrap();
+    assert_eq!(projected.nnz(), 0);
 }

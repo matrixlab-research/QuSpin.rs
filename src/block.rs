@@ -54,6 +54,24 @@ impl BlockOps {
     pub fn materialize(&self, format: MatrixFormat) -> Result<Operator> {
         block_diag_hamiltonian(self.blocks.iter().cloned(), format)
     }
+
+    pub fn push(&mut self, block: Arc<dyn LinearOperator>) -> Result<()> {
+        if block.shape().0 != block.shape().1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "block-diagonal operators require square blocks".into(),
+            ));
+        }
+        let next = self
+            .offsets
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .checked_add(block.shape().0)
+            .ok_or_else(|| QuSpinError::UnsupportedBackend("block dimension overflow".into()))?;
+        self.blocks.push(block);
+        self.offsets.push(next);
+        Ok(())
+    }
 }
 
 impl LinearOperator for BlockOps {
@@ -151,6 +169,51 @@ impl DynamicBlockOps {
 
     pub fn blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    pub fn push(&mut self, block: Arc<dyn TimeDependentOperator>) -> Result<()> {
+        if block.shape().0 != block.shape().1 {
+            return Err(QuSpinError::DimensionMismatch(
+                "block-diagonal operators require square blocks".into(),
+            ));
+        }
+        let next = self
+            .offsets
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .checked_add(block.shape().0)
+            .ok_or_else(|| QuSpinError::UnsupportedBackend("block dimension overflow".into()))?;
+        self.blocks.push(block);
+        self.offsets.push(next);
+        Ok(())
+    }
+
+    pub fn materialize(&self, time: f64, format: MatrixFormat) -> Result<Operator> {
+        if !time.is_finite() {
+            return Err(QuSpinError::InvalidOptions(
+                "dynamic block materialization time must be finite".into(),
+            ));
+        }
+        let dimension = self.offsets.last().copied().unwrap_or_default();
+        let mut entries = Vec::new();
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let block_dimension = block.shape().0;
+            let offset = self.offsets[block_index];
+            let mut input = vec![Complex64::new(0.0, 0.0); block_dimension];
+            let mut output = vec![Complex64::new(0.0, 0.0); block_dimension];
+            for column in 0..block_dimension {
+                input.fill(Complex64::new(0.0, 0.0));
+                input[column] = Complex64::new(1.0, 0.0);
+                block.apply_at(time, &input, &mut output)?;
+                for (row, value) in output.iter().copied().enumerate() {
+                    if value.norm() > f64::EPSILON {
+                        entries.push((offset + row, offset + column, value));
+                    }
+                }
+            }
+        }
+        Operator::from_triplets(dimension, dimension, entries, format)
     }
 }
 

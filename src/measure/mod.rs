@@ -237,10 +237,199 @@ pub fn partial_trace_density(
     Ok(reduced)
 }
 
+#[derive(Clone, Debug)]
+struct SubsystemIndexMap {
+    full_dimension: usize,
+    subsystem_dimension: usize,
+    environment_dimension: usize,
+    subsystem_indices: Vec<usize>,
+    environment_indices: Vec<usize>,
+}
+
+fn subsystem_index_map(
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<SubsystemIndexMap> {
+    if local_dimensions.is_empty() || local_dimensions.contains(&0) {
+        return Err(QuSpinError::InvalidOptions(
+            "local dimensions must be a nonempty list of positive values".into(),
+        ));
+    }
+    let mut retained = vec![false; local_dimensions.len()];
+    for &site in retained_sites {
+        if site >= local_dimensions.len() {
+            return Err(QuSpinError::InvalidSite {
+                site,
+                sites: local_dimensions.len(),
+            });
+        }
+        if std::mem::replace(&mut retained[site], true) {
+            return Err(QuSpinError::InvalidOptions(
+                "retained subsystem sites must be unique".into(),
+            ));
+        }
+    }
+    let product = |sites: &[usize]| -> Result<usize> {
+        sites.iter().try_fold(1_usize, |dimension, &site| {
+            dimension
+                .checked_mul(local_dimensions[site])
+                .ok_or_else(|| QuSpinError::DimensionMismatch("Hilbert-space size overflow".into()))
+        })
+    };
+    let environment_sites: Vec<_> = (0..local_dimensions.len())
+        .filter(|site| !retained[*site])
+        .collect();
+    let subsystem_dimension = product(retained_sites)?;
+    let environment_dimension = product(&environment_sites)?;
+    let full_dimension = subsystem_dimension
+        .checked_mul(environment_dimension)
+        .ok_or_else(|| QuSpinError::DimensionMismatch("Hilbert-space size overflow".into()))?;
+
+    let mut subsystem_indices = vec![0; full_dimension];
+    let mut environment_indices = vec![0; full_dimension];
+    for global in 0..full_dimension {
+        let mut value = global;
+        let mut digits = Vec::with_capacity(local_dimensions.len());
+        for &dimension in local_dimensions {
+            digits.push(value % dimension);
+            value /= dimension;
+        }
+        let mut stride = 1;
+        for &site in retained_sites {
+            subsystem_indices[global] += digits[site] * stride;
+            stride *= local_dimensions[site];
+        }
+        stride = 1;
+        for &site in &environment_sites {
+            environment_indices[global] += digits[site] * stride;
+            stride *= local_dimensions[site];
+        }
+    }
+    Ok(SubsystemIndexMap {
+        full_dimension,
+        subsystem_dimension,
+        environment_dimension,
+        subsystem_indices,
+        environment_indices,
+    })
+}
+
+/// Reduced density matrix for an arbitrary retained set of mixed-radix sites.
+/// Site zero is the least-significant local digit, matching the basis encodings.
+pub fn partial_trace_subsystem(
+    state: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<Vec<Complex64>> {
+    let layout = subsystem_index_map(local_dimensions, retained_sites)?;
+    if state.len() != layout.full_dimension {
+        return Err(QuSpinError::DimensionMismatch(
+            "state length does not match the product of local dimensions".into(),
+        ));
+    }
+    let norm = state.iter().map(Complex64::norm_sqr).sum::<f64>();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(QuSpinError::InvalidOptions(
+            "state must have positive finite norm".into(),
+        ));
+    }
+    let mut amplitudes = vec![Complex64::new(0.0, 0.0); layout.full_dimension];
+    for (global, &value) in state.iter().enumerate() {
+        let subsystem = layout.subsystem_indices[global];
+        let environment = layout.environment_indices[global];
+        amplitudes[subsystem * layout.environment_dimension + environment] = value;
+    }
+    let mut reduced =
+        vec![Complex64::new(0.0, 0.0); layout.subsystem_dimension * layout.subsystem_dimension];
+    for left in 0..layout.subsystem_dimension {
+        for right in 0..layout.subsystem_dimension {
+            reduced[left * layout.subsystem_dimension + right] = (0..layout.environment_dimension)
+                .map(|environment| {
+                    amplitudes[left * layout.environment_dimension + environment]
+                        * amplitudes[right * layout.environment_dimension + environment].conj()
+                        / norm
+                })
+                .sum();
+        }
+    }
+    Ok(reduced)
+}
+
+/// Mixed-state partial trace for an arbitrary retained site set.
+pub fn partial_trace_density_subsystem(
+    density: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<Vec<Complex64>> {
+    let layout = subsystem_index_map(local_dimensions, retained_sites)?;
+    if density.len() != layout.full_dimension.saturating_mul(layout.full_dimension) {
+        return Err(QuSpinError::DimensionMismatch(
+            "density shape does not match the product of local dimensions".into(),
+        ));
+    }
+    let trace: Complex64 = (0..layout.full_dimension)
+        .map(|index| density[index * layout.full_dimension + index])
+        .sum();
+    if trace.im.abs() > 1.0e-10 || !trace.re.is_finite() || trace.re <= f64::EPSILON {
+        return Err(QuSpinError::InvalidOptions(
+            "density matrix must have a positive real trace".into(),
+        ));
+    }
+    for row in 0..layout.full_dimension {
+        for column in 0..layout.full_dimension {
+            if (density[row * layout.full_dimension + column]
+                - density[column * layout.full_dimension + row].conj())
+            .norm()
+                > 1.0e-10
+            {
+                return Err(QuSpinError::InvalidOptions(
+                    "density matrix must be Hermitian".into(),
+                ));
+            }
+        }
+    }
+    let mut reduced =
+        vec![Complex64::new(0.0, 0.0); layout.subsystem_dimension * layout.subsystem_dimension];
+    for row in 0..layout.full_dimension {
+        for column in 0..layout.full_dimension {
+            if layout.environment_indices[row] == layout.environment_indices[column] {
+                let reduced_row = layout.subsystem_indices[row];
+                let reduced_column = layout.subsystem_indices[column];
+                reduced[reduced_row * layout.subsystem_dimension + reduced_column] +=
+                    density[row * layout.full_dimension + column] / trace.re;
+            }
+        }
+    }
+    Ok(reduced)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EntropyOrder {
     VonNeumann,
     Renyi(f64),
+}
+
+fn entropy_from_probabilities(probabilities: Vec<f64>, order: EntropyOrder) -> Result<f64> {
+    match order {
+        EntropyOrder::VonNeumann => Ok(-probabilities
+            .into_iter()
+            .filter(|probability| *probability > f64::EPSILON)
+            .map(|probability| probability * probability.ln())
+            .sum::<f64>()),
+        EntropyOrder::Renyi(alpha)
+            if alpha.is_finite() && alpha > 0.0 && (alpha - 1.0).abs() > 1.0e-12 =>
+        {
+            Ok(probabilities
+                .into_iter()
+                .map(|probability| probability.powf(alpha))
+                .sum::<f64>()
+                .ln()
+                / (1.0 - alpha))
+        }
+        EntropyOrder::Renyi(_) => Err(QuSpinError::InvalidOptions(
+            "Renyi order must be positive, finite, and different from one".into(),
+        )),
+    }
 }
 
 pub fn entanglement_entropy(
@@ -271,19 +460,67 @@ pub fn entanglement_entropy(
             }
         })
         .collect::<Result<_>>()?;
-    match order {
-        EntropyOrder::VonNeumann => Ok(-probabilities
-            .into_iter()
-            .filter(|probability| *probability > f64::EPSILON)
-            .map(|probability| probability * probability.ln())
-            .sum::<f64>()),
-        EntropyOrder::Renyi(alpha) => Ok(probabilities
-            .into_iter()
-            .map(|probability| probability.powf(alpha))
-            .sum::<f64>()
-            .ln()
-            / (1.0 - alpha)),
-    }
+    entropy_from_probabilities(probabilities, order)
+}
+
+pub fn entanglement_spectrum_subsystem(
+    state: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<Vec<f64>> {
+    let layout = subsystem_index_map(local_dimensions, retained_sites)?;
+    density_spectrum(
+        partial_trace_subsystem(state, local_dimensions, retained_sites)?,
+        layout.subsystem_dimension,
+    )
+}
+
+pub fn entanglement_spectrum_density_subsystem(
+    density: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+) -> Result<Vec<f64>> {
+    let layout = subsystem_index_map(local_dimensions, retained_sites)?;
+    density_spectrum(
+        partial_trace_density_subsystem(density, local_dimensions, retained_sites)?,
+        layout.subsystem_dimension,
+    )
+}
+
+pub fn entanglement_entropy_subsystem(
+    state: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    order: EntropyOrder,
+) -> Result<f64> {
+    entropy_from_probabilities(
+        entanglement_spectrum_subsystem(state, local_dimensions, retained_sites)?,
+        order,
+    )
+}
+
+pub fn entanglement_entropy_density(
+    density: &[Complex64],
+    subsystem_dimension: usize,
+    environment_dimension: usize,
+    order: EntropyOrder,
+) -> Result<f64> {
+    entropy_from_probabilities(
+        entanglement_spectrum_density(density, subsystem_dimension, environment_dimension)?,
+        order,
+    )
+}
+
+pub fn entanglement_entropy_density_subsystem(
+    density: &[Complex64],
+    local_dimensions: &[usize],
+    retained_sites: &[usize],
+    order: EntropyOrder,
+) -> Result<f64> {
+    entropy_from_probabilities(
+        entanglement_spectrum_density_subsystem(density, local_dimensions, retained_sites)?,
+        order,
+    )
 }
 
 fn density_spectrum(density: Vec<Complex64>, dimension: usize) -> Result<Vec<f64>> {

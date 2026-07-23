@@ -413,6 +413,102 @@ where
     })
 }
 
+/// Reusable action of `(A - shift I)^{-1}`. Stored CSC operators cache one
+/// sparse factorization; other operators reuse the plan and solve with
+/// restarted GMRES without materializing `A`.
+pub struct ShiftInvertPlan {
+    operator: Arc<dyn LinearOperator>,
+    shift: f64,
+    tolerance: f64,
+    max_iterations: usize,
+    factorization: Option<Box<dyn ShiftedLinearSolver>>,
+}
+
+impl std::fmt::Debug for ShiftInvertPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShiftInvertPlan")
+            .field("shape", &self.operator.shape())
+            .field("shift", &self.shift)
+            .field("tolerance", &self.tolerance)
+            .field("max_iterations", &self.max_iterations)
+            .field("factorized", &self.factorization.is_some())
+            .finish()
+    }
+}
+
+impl ShiftInvertPlan {
+    pub fn new(
+        operator: Arc<dyn LinearOperator>,
+        shift: f64,
+        tolerance: f64,
+        max_iterations: usize,
+    ) -> Result<Self> {
+        let shape = operator.shape();
+        if shape.0 != shape.1
+            || !shift.is_finite()
+            || !tolerance.is_finite()
+            || tolerance <= 0.0
+            || max_iterations == 0
+        {
+            return Err(QuSpinError::InvalidOptions(
+                "shift-invert needs a square operator, finite shift, positive tolerance, and positive iteration cap"
+                    .into(),
+            ));
+        }
+        let factorization = operator.shifted_solver(shift)?;
+        Ok(Self {
+            operator,
+            shift,
+            tolerance,
+            max_iterations,
+            factorization,
+        })
+    }
+
+    pub const fn shift(&self) -> f64 {
+        self.shift
+    }
+
+    pub const fn is_factorized(&self) -> bool {
+        self.factorization.is_some()
+    }
+
+    pub fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        if input.len() != self.operator.shape().0 || output.len() != input.len() {
+            return Err(QuSpinError::DimensionMismatch(
+                "shift-invert input and output must match the operator dimension".into(),
+            ));
+        }
+        if let Some(factorization) = &self.factorization {
+            return factorization.solve(input, output);
+        }
+        let solved = gmres_shift_invert(
+            self.operator.as_ref(),
+            self.shift,
+            input,
+            self.tolerance,
+            self.max_iterations,
+        )?;
+        output.copy_from_slice(&solved);
+        Ok(())
+    }
+}
+
+impl LinearOperator for ShiftInvertPlan {
+    fn shape(&self) -> (usize, usize) {
+        self.operator.shape()
+    }
+
+    fn format(&self) -> MatrixFormat {
+        MatrixFormat::MatrixFree
+    }
+
+    fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
+        self.solve(input, output)
+    }
+}
+
 fn transformed_apply<O>(
     operator: &O,
     options: &EigshOptions,

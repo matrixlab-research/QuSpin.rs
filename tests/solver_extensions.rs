@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
 use quspin::Complex64;
-use quspin::operator::{ExpOp, LinearOperator, Operator};
+use quspin::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
 use quspin::solve::{
-    ExpmMultiplyParallel, ExpmOptions, LanczosOptions, expm_multiply, ftlm_observable_iteration,
-    ftlm_static_iteration, lanczos_full, lanczos_iter, linear_combination_qt,
-    ltlm_observable_iteration, ltlm_static_iteration,
+    ExpmMultiplyParallel, ExpmOptions, LanczosOptions, ShiftInvertPlan, expm_multiply,
+    ftlm_observable_iteration, ftlm_static_iteration, lanczos_full, lanczos_iter,
+    linear_combination_qt, ltlm_observable_iteration, ltlm_static_iteration,
 };
 
 fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
@@ -222,4 +222,29 @@ fn reusable_exponential_plan_supports_batches_and_coefficient_updates() {
     plan.apply_in_place(&mut state).unwrap();
     assert_abs_diff_eq!(state[0].re, 0.5_f64.cosh(), epsilon = 1.0e-12);
     assert_abs_diff_eq!(state[1].im, -0.5_f64.sinh(), epsilon = 1.0e-12);
+}
+
+#[test]
+fn reusable_shift_invert_plan_caches_sparse_factorization() {
+    let operator = Arc::new(
+        Operator::from_triplets(
+            3,
+            3,
+            [
+                (0, 0, Complex64::new(1.0, 0.0)),
+                (1, 1, Complex64::new(2.0, 0.0)),
+                (2, 2, Complex64::new(4.0, 0.0)),
+            ],
+            MatrixFormat::Csc,
+        )
+        .unwrap(),
+    );
+    let plan = ShiftInvertPlan::new(operator, 0.5, 1.0e-12, 100).unwrap();
+    assert!(plan.is_factorized());
+    let mut output = vec![Complex64::new(0.0, 0.0); 3];
+    plan.solve(&[Complex64::new(1.0, 0.0); 3], &mut output)
+        .unwrap();
+    assert_abs_diff_eq!(output[0].re, 2.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(output[1].re, 2.0 / 3.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(output[2].re, 2.0 / 7.0, epsilon = 1.0e-12);
 }

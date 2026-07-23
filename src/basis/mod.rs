@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
+use num_bigint::BigUint;
 use num_complex::Complex64;
 
 use crate::operator::{LinearOperator, MatrixFormat, check_apply_shape};
@@ -69,9 +70,30 @@ pub trait Basis: Send + Sync {
         }
     }
 
+    /// Whether a local operator string preserves the particle-sector
+    /// constraints represented by this basis. Unconstrained and custom bases
+    /// accept every syntactically valid string by default.
+    fn operator_preserves_particle_sector(&self, _operator: &str) -> Result<bool> {
+        Ok(true)
+    }
+
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn operator_number_change(operator: &str) -> Result<Option<i32>> {
+    let mut change = 0_i32;
+    for character in operator.chars().filter(|character| *character != '|') {
+        match character {
+            '+' => change += 1,
+            '-' => change -= 1,
+            'x' | 'y' => return Ok(None),
+            'I' | 'n' | 'z' => {}
+            _ => return Err(QuSpinError::InvalidOperator(operator.into())),
+        }
+    }
+    Ok(Some(change))
 }
 
 fn fixed_weight_states(sites: usize, particles: Option<usize>) -> Result<Vec<u128>> {
@@ -85,14 +107,44 @@ fn fixed_weight_states(sites: usize, particles: Option<usize>) -> Result<Vec<u12
             "particle count exceeds site count".into(),
         ));
     }
-    let limit = 1_u128
-        .checked_shl(u32::try_from(sites).unwrap_or(u32::MAX))
-        .ok_or_else(|| QuSpinError::UnsupportedBackend("state enumeration overflow".into()))?;
+    let Some(particles) = particles else {
+        let limit = 1_u128
+            .checked_shl(u32::try_from(sites).unwrap_or(u32::MAX))
+            .ok_or_else(|| {
+                QuSpinError::UnsupportedBackend(
+                    "enumerating the unconstrained 128-site Hilbert space is infeasible".into(),
+                )
+            })?;
+        return Ok((0..limit).collect());
+    };
+    if particles == 0 {
+        return Ok(vec![0]);
+    }
+    if particles == sites {
+        let state = if sites == 128 {
+            u128::MAX
+        } else {
+            (1_u128 << sites) - 1
+        };
+        return Ok(vec![state]);
+    }
+
+    // Gosper's hack enumerates only C(sites, particles) states instead of
+    // scanning the complete 2^sites parent space.
+    let mut state = (1_u128 << particles) - 1;
+    let limit = (sites < 128).then(|| 1_u128 << sites);
     let mut states = Vec::new();
-    for state in 0..limit {
-        if particles.is_none_or(|count| state.count_ones() as usize == count) {
-            states.push(state);
+    loop {
+        states.push(state);
+        let low_bit = state & state.wrapping_neg();
+        let Some(ripple) = state.checked_add(low_bit) else {
+            break;
+        };
+        let next = (((ripple ^ state) >> 2) / low_bit) | ripple;
+        if limit.is_some_and(|upper| next >= upper) {
+            break;
         }
+        state = next;
     }
     Ok(states)
 }
@@ -891,6 +943,10 @@ impl Basis for SpinBasis1D {
             (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
         )))
     }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        Ok(self.up.is_none() || operator_number_change(operator)? == Some(0))
+    }
 }
 
 /// Truncated on-site boson basis.
@@ -951,25 +1007,7 @@ impl BosonBasisBuilder {
                 "particle count exceeds the local cutoff".into(),
             ));
         }
-        let base = u128::try_from(self.states_per_site)
-            .map_err(|_| QuSpinError::InvalidSector("local cutoff is too large".into()))?;
-        let exponent = u32::try_from(self.sites)
-            .map_err(|_| QuSpinError::UnsupportedBackend("site count is too large".into()))?;
-        let limit = base.checked_pow(exponent).ok_or_else(|| {
-            QuSpinError::UnsupportedBackend("boson state encoding overflow".into())
-        })?;
-        let mut states = Vec::new();
-        for encoded in 0..limit {
-            let mut value = encoded;
-            let mut total = 0_usize;
-            for _ in 0..self.sites {
-                total += usize::try_from(value % base).unwrap_or(usize::MAX);
-                value /= base;
-            }
-            if self.particles.is_none_or(|count| count == total) {
-                states.push(encoded);
-            }
-        }
+        let states = fixed_digit_sum_states(self.sites, self.states_per_site, self.particles)?;
         if states.is_empty() {
             return Err(QuSpinError::InvalidSector("empty boson sector".into()));
         }
@@ -1029,6 +1067,10 @@ impl Basis for BosonBasis1D {
             }
         }
         Ok(Some((state, amplitude)))
+    }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        Ok(self.particles.is_none() || operator_number_change(operator)? == Some(0))
     }
 }
 
@@ -1237,6 +1279,10 @@ impl Basis for SpinlessFermionBasis1D {
             (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
         )))
     }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        Ok(self.particles.is_none() || operator_number_change(operator)? == Some(0))
+    }
 }
 
 /// Two-flavor fermion basis with all up orbitals ordered before all down orbitals.
@@ -1396,6 +1442,37 @@ impl Basis for SpinfulFermionBasis1D {
             amplitude *= local;
         }
         Ok(Some((state, amplitude)))
+    }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        let (up_operator, down_operator) = operator.split_once('|').unwrap_or((operator, ""));
+        if down_operator.contains('|') {
+            return Err(QuSpinError::InvalidOperator(operator.into()));
+        }
+        let Some(up_change) = operator_number_change(up_operator)? else {
+            return Ok(self.particles_up.is_none()
+                && self.particle_sectors.is_none()
+                && self.particles_down.is_none());
+        };
+        let Some(down_change) = operator_number_change(down_operator)? else {
+            return Ok(self.particles_up.is_none()
+                && self.particle_sectors.is_none()
+                && self.particles_down.is_none());
+        };
+        if let Some(sectors) = &self.particle_sectors {
+            let sectors: HashSet<_> = sectors.iter().copied().collect();
+            return Ok(sectors.iter().all(|&(up, down)| {
+                let target_up = up as i32 + up_change;
+                let target_down = down as i32 + down_change;
+                target_up >= 0
+                    && target_down >= 0
+                    && target_up <= self.sites as i32
+                    && target_down <= self.sites as i32
+                    && sectors.contains(&(target_up as usize, target_down as usize))
+            }));
+        }
+        Ok(self.particles_up.is_none_or(|_| up_change == 0)
+            && self.particles_down.is_none_or(|_| down_change == 0))
     }
 }
 
@@ -2029,6 +2106,10 @@ where
             (source_orbit_size as f64 / image.orbit_size as f64).sqrt() * image.phase.conj(),
         )))
     }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        self.parent.operator_preserves_particle_sector(operator)
+    }
 }
 
 pub type SpinBasisGeneral = GeneralBasis<SpinBasis1D>;
@@ -2149,6 +2230,21 @@ where
             }
         }
         Ok(transitions)
+    }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        let (left_operator, right_operator) = operator
+            .split_once('|')
+            .ok_or_else(|| QuSpinError::InvalidOperator(operator.into()))?;
+        if right_operator.contains('|') {
+            return Err(QuSpinError::InvalidOperator(operator.into()));
+        }
+        Ok(self
+            .left
+            .operator_preserves_particle_sector(left_operator)?
+            && self
+                .right
+                .operator_preserves_particle_sector(right_operator)?)
     }
 }
 
@@ -2295,6 +2391,10 @@ where
             .into_iter()
             .filter(|(target, _)| self.indices.contains_key(target))
             .collect())
+    }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        Ok(self.total_excitations.is_none() || operator_number_change(operator)? == Some(0))
     }
 }
 
@@ -2563,6 +2663,10 @@ impl<const WORDS: usize> Basis for WideSpinBasis<WORDS> {
         }
         Ok(Some((state, amplitude)))
     }
+
+    fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
+        Ok(self.particles.is_none() || operator_number_change(operator)? == Some(0))
+    }
 }
 
 pub type WideSpinBasis256 = WideSpinBasis<4>;
@@ -2636,6 +2740,32 @@ pub fn basis_int_to_python_int<const WORDS: usize>(value: WideState<WORDS>) -> R
     }
     Ok(u128::from(value.words.first().copied().unwrap_or_default())
         | (u128::from(value.words.get(1).copied().unwrap_or_default()) << 64))
+}
+
+/// Convert an arbitrary-precision nonnegative integer into a fixed-width basis
+/// state without truncating high words.
+pub fn state_from_biguint<const WORDS: usize>(value: &BigUint) -> Result<WideState<WORDS>> {
+    let digits = value.to_u64_digits();
+    if digits.len() > WORDS {
+        return Err(QuSpinError::UnsupportedBackend(format!(
+            "integer needs {} bits but this state stores {} bits",
+            value.bits(),
+            WideState::<WORDS>::capacity_bits()
+        )));
+    }
+    let mut words = [0_u64; WORDS];
+    words[..digits.len()].copy_from_slice(&digits);
+    Ok(WideState::from_words(words))
+}
+
+/// Convert a fixed-width state to an arbitrary-precision integer.
+pub fn state_to_biguint<const WORDS: usize>(value: WideState<WORDS>) -> BigUint {
+    let bytes: Vec<_> = value
+        .words()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    BigUint::from_bytes_le(&bytes)
 }
 
 pub fn get_basis_type(
@@ -2831,6 +2961,47 @@ impl BasisProjector {
 
     pub fn project_batch(&self, parent: &[Vec<Complex64>]) -> Result<Vec<Vec<Complex64>>> {
         parent.iter().map(|state| self.projected(state)).collect()
+    }
+
+    /// Frobenius norm of `(I - P P†) A P`, evaluated one reduced column at a
+    /// time. Zero means the parent-space operator preserves this symmetry
+    /// sector; no parent-space square projector is formed.
+    pub fn symmetry_leakage_norm(&self, operator: &(impl LinearOperator + ?Sized)) -> Result<f64> {
+        if operator.shape() != (self.source_dimension, self.source_dimension) {
+            return Err(QuSpinError::DimensionMismatch(
+                "symmetry check requires a square parent-space operator".into(),
+            ));
+        }
+        let mut total = 0.0;
+        let mut reduced_basis = vec![Complex64::new(0.0, 0.0); self.reduced_dimension];
+        let mut applied = vec![Complex64::new(0.0, 0.0); self.source_dimension];
+        for column in 0..self.reduced_dimension {
+            reduced_basis.fill(Complex64::new(0.0, 0.0));
+            reduced_basis[column] = Complex64::new(1.0, 0.0);
+            let lifted = self.lifted(&reduced_basis)?;
+            operator.apply(&lifted, &mut applied)?;
+            let projected = self.projected(&applied)?;
+            let invariant_component = self.lifted(&projected)?;
+            total += applied
+                .iter()
+                .zip(invariant_component)
+                .map(|(value, invariant)| (*value - invariant).norm_sqr())
+                .sum::<f64>();
+        }
+        Ok(total.sqrt())
+    }
+
+    pub fn preserves_operator_symmetry(
+        &self,
+        operator: &(impl LinearOperator + ?Sized),
+        tolerance: f64,
+    ) -> Result<bool> {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(QuSpinError::InvalidOptions(
+                "symmetry-check tolerance must be finite and nonnegative".into(),
+            ));
+        }
+        Ok(self.symmetry_leakage_norm(operator)? <= tolerance)
     }
 }
 
