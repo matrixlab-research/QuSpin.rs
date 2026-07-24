@@ -2,9 +2,7 @@ use qmbed::basis::SpinBasis1D;
 use qmbed::operator::{
     Coupling, LocalOperator, MatrixFormat, OpProduct, OperatorBuilder, OperatorSpec,
 };
-use qmbed::runtime::{
-    Accelerator, CpuRuntime, ExecutionProfile, Runtime, RuntimeLinearOperator,
-};
+use qmbed::runtime::{Accelerator, CpuRuntime, ExecutionProfile, Runtime, RuntimeLinearOperator};
 use qmbed::{Complex64, QmbedError};
 
 #[test]
@@ -12,9 +10,7 @@ fn cpu_runtime_applies_the_same_scientific_operator() {
     let basis = SpinBasis1D::builder(1).pauli(true).build().unwrap();
     let x = OpProduct::new([LocalOperator::X]).unwrap();
     let operator = OperatorBuilder::on(&basis)
-        .term(
-            OperatorSpec::from_product(x, [Coupling::new(1.0, vec![0])]).unwrap(),
-        )
+        .term(OperatorSpec::from_product(x, [Coupling::new(1.0, vec![0])]).unwrap())
         .build(MatrixFormat::Csc)
         .unwrap();
     let runtime = CpuRuntime::new(2).unwrap();

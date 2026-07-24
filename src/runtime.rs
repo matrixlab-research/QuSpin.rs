@@ -89,12 +89,8 @@ pub trait Runtime: Send + Sync {
     fn from_host(&self, values: &[Complex64]) -> Result<Self::Buffer>;
     fn to_host(&self, buffer: &Self::Buffer) -> Result<Vec<Complex64>>;
     fn fill(&self, buffer: &mut Self::Buffer, value: Complex64) -> Result<()>;
-    fn axpy(
-        &self,
-        alpha: Complex64,
-        input: &Self::Buffer,
-        output: &mut Self::Buffer,
-    ) -> Result<()>;
+    fn axpy(&self, alpha: Complex64, input: &Self::Buffer, output: &mut Self::Buffer)
+    -> Result<()>;
     fn scale(&self, alpha: Complex64, buffer: &mut Self::Buffer) -> Result<()>;
     fn dotc(&self, left: &Self::Buffer, right: &Self::Buffer) -> Result<Complex64>;
 
@@ -109,12 +105,7 @@ where
     R: Runtime,
 {
     fn runtime_shape(&self) -> (usize, usize);
-    fn apply_on(
-        &self,
-        runtime: &R,
-        input: &R::Buffer,
-        output: &mut R::Buffer,
-    ) -> Result<()>;
+    fn apply_on(&self, runtime: &R, input: &R::Buffer, output: &mut R::Buffer) -> Result<()>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
