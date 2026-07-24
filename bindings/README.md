@@ -26,6 +26,13 @@ operator strings are parsed in the adapter and sent as typed local actions;
 they do not select a separate Rust assembler. Julia callers construct
 `OpProduct` and `OperatorSpec` values directly.
 
+General packed bases use a serializable lattice-symmetry schema rather than
+frontend callbacks. Each generator specifies a bijection of source sites,
+optional per-site permutations of local states, and a character sector. Rust
+validates the map, derives its finite period, and computes fermionic exchange
+phases. The same representation therefore covers translations, reflections,
+local spin inversion, and higher-dimensional lattice permutations.
+
 ## Python compatibility contract
 
 The directory `python/compat_tests/quspin-1.0.1/` is a byte-for-byte snapshot

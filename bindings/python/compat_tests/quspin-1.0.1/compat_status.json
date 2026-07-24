@@ -1,7 +1,12 @@
 {
   "passing": [
     "test/test_boson_vs_ho.py",
+    "test/test_boson_vs_spin.py",
     "test/test_higher_spin.py",
+    "test/test_sq_lat_Bose_Hubbard.py",
+    "test/test_sq_lat_Fermi_Hubbard_spinful.py",
+    "test/test_sq_lat_Fermi_Hubbard_spinless.py",
+    "test/test_sq_lat_Heis.py",
     "test/test_version.py"
   ],
   "schema_version": 1,
@@ -25,7 +30,6 @@
     "test/test_basis_entropy_sparse.py",
     "test/test_basis_particle_sectors.py",
     "test/test_block_tools.py",
-    "test/test_boson_vs_spin.py",
     "test/test_diag_ensemble.py",
     "test/test_ent_basis_vs_tools.py",
     "test/test_entropy_pure.py",
@@ -67,10 +71,6 @@
     "test/test_sent_wrapper.py",
     "test/test_spinful_fermion_entropy.py",
     "test/test_spinful_fermion_tensor.py",
-    "test/test_sq_lat_Bose_Hubbard.py",
-    "test/test_sq_lat_Fermi_Hubbard_spinful.py",
-    "test/test_sq_lat_Fermi_Hubbard_spinless.py",
-    "test/test_sq_lat_Heis.py",
     "test/test_sq_lat_Heis_double_occupancy.py",
     "test/test_tensor_entropy.py",
     "test/test_tilted_sq_lat_Heis.py",

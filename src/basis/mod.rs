@@ -2217,6 +2217,243 @@ pub trait SymmetryMap<State>: Send + Sync {
     fn apply(&self, state: State) -> Result<(State, Complex64)>;
 }
 
+/// Exchange statistics used when a lattice map reorders local degrees of freedom.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeStatistics {
+    Distinguishable,
+    Fermionic,
+}
+
+/// Runtime-owned finite symmetry of a packed lattice state.
+///
+/// `destinations[source]` gives the target site. Each source site also owns a
+/// permutation of its local digits, allowing the same representation to cover
+/// translations, reflections, sublattice maps, and local spin inversion.
+/// Fermionic maps compute the parity of the occupied-orbital permutation
+/// instead of requiring a frontend-provided phase callback.
+#[derive(Clone, Debug)]
+pub struct LatticeSymmetryMap {
+    states_per_site: usize,
+    destinations: Vec<usize>,
+    local_permutations: Vec<Vec<usize>>,
+    statistics: ExchangeStatistics,
+    place_values: Vec<u128>,
+    state_limit: Option<u128>,
+    period: usize,
+}
+
+impl LatticeSymmetryMap {
+    pub fn new(
+        states_per_site: usize,
+        destinations: impl Into<Vec<usize>>,
+        local_permutations: Option<Vec<Vec<usize>>>,
+        statistics: ExchangeStatistics,
+    ) -> Result<Self> {
+        let destinations = destinations.into();
+        if destinations.is_empty() || states_per_site == 0 {
+            return Err(QmbedError::InvalidSector(
+                "a lattice symmetry requires sites and local states".into(),
+            ));
+        }
+        let unique_destinations: HashSet<_> = destinations.iter().copied().collect();
+        if unique_destinations.len() != destinations.len()
+            || destinations
+                .iter()
+                .any(|&destination| destination >= destinations.len())
+        {
+            return Err(QmbedError::IncompatibleSymmetry(
+                "symmetry site destinations must be a bijection".into(),
+            ));
+        }
+
+        let identity = (0..states_per_site).collect::<Vec<_>>();
+        let local_permutations =
+            local_permutations.unwrap_or_else(|| vec![identity.clone(); destinations.len()]);
+        if local_permutations.len() != destinations.len()
+            || local_permutations.iter().any(|permutation| {
+                permutation.len() != states_per_site
+                    || permutation.iter().copied().collect::<HashSet<_>>().len() != states_per_site
+                    || permutation.iter().any(|&digit| digit >= states_per_site)
+            })
+        {
+            return Err(QmbedError::IncompatibleSymmetry(
+                "every local-state map must be a permutation".into(),
+            ));
+        }
+        if statistics == ExchangeStatistics::Fermionic
+            && (states_per_site != 2
+                || local_permutations
+                    .iter()
+                    .any(|permutation| permutation != &identity))
+        {
+            return Err(QmbedError::InvalidOptions(
+                "fermionic lattice maps require binary occupation and cannot change it".into(),
+            ));
+        }
+
+        let base = states_per_site as u128;
+        let mut place_values = Vec::with_capacity(destinations.len());
+        let mut place = 1_u128;
+        for site in 0..destinations.len() {
+            place_values.push(place);
+            if site + 1 < destinations.len() {
+                place = place.checked_mul(base).ok_or_else(|| {
+                    QmbedError::UnsupportedBackend(
+                        "lattice-symmetry state encoding exceeds u128".into(),
+                    )
+                })?;
+            }
+        }
+        let state_limit = place.checked_mul(base);
+        let exact_full_range = base.is_power_of_two()
+            && (base.trailing_zeros() as usize).checked_mul(destinations.len()) == Some(128);
+        if state_limit.is_none() && !exact_full_range {
+            return Err(QmbedError::UnsupportedBackend(
+                "lattice-symmetry state encoding exceeds u128".into(),
+            ));
+        }
+        let period =
+            combined_permutation_period(&destinations, &local_permutations, states_per_site)?;
+        Ok(Self {
+            states_per_site,
+            destinations,
+            local_permutations,
+            statistics,
+            place_values,
+            state_limit,
+            period,
+        })
+    }
+
+    pub fn site_permutation(
+        states_per_site: usize,
+        destinations: impl Into<Vec<usize>>,
+    ) -> Result<Self> {
+        Self::new(
+            states_per_site,
+            destinations,
+            None,
+            ExchangeStatistics::Distinguishable,
+        )
+    }
+
+    pub fn fermionic_orbital_permutation(destinations: impl Into<Vec<usize>>) -> Result<Self> {
+        Self::new(2, destinations, None, ExchangeStatistics::Fermionic)
+    }
+
+    pub fn sites(&self) -> usize {
+        self.destinations.len()
+    }
+
+    pub const fn states_per_site(&self) -> usize {
+        self.states_per_site
+    }
+
+    pub fn destinations(&self) -> &[usize] {
+        &self.destinations
+    }
+
+    pub fn local_permutations(&self) -> &[Vec<usize>] {
+        &self.local_permutations
+    }
+
+    pub const fn statistics(&self) -> ExchangeStatistics {
+        self.statistics
+    }
+
+    fn mapped_state(&self, state: u128) -> Result<(u128, Complex64)> {
+        if self.state_limit.is_some_and(|limit| state >= limit) {
+            return Err(QmbedError::StateNotInBasis);
+        }
+        let base = self.states_per_site as u128;
+        let mut mapped = 0_u128;
+        let mut occupied_destinations = 0_u128;
+        let mut odd_fermion_permutation = false;
+        for source in 0..self.destinations.len() {
+            let digit = usize::try_from((state / self.place_values[source]) % base)
+                .map_err(|_| QmbedError::StateNotInBasis)?;
+            let mapped_digit = self.local_permutations[source][digit];
+            let destination = self.destinations[source];
+            mapped += mapped_digit as u128 * self.place_values[destination];
+            if self.statistics == ExchangeStatistics::Fermionic && digit == 1 {
+                let occupied_after = if destination == 127 {
+                    0
+                } else {
+                    (occupied_destinations >> (destination + 1)).count_ones()
+                };
+                odd_fermion_permutation ^= occupied_after % 2 == 1;
+                occupied_destinations |= 1_u128 << destination;
+            }
+        }
+        Ok((
+            mapped,
+            Complex64::new(if odd_fermion_permutation { -1.0 } else { 1.0 }, 0.0),
+        ))
+    }
+}
+
+impl SymmetryMap<u128> for LatticeSymmetryMap {
+    fn period(&self) -> usize {
+        self.period
+    }
+
+    fn apply(&self, state: u128) -> Result<(u128, Complex64)> {
+        self.mapped_state(state)
+    }
+}
+
+fn combined_permutation_period(
+    destinations: &[usize],
+    local_permutations: &[Vec<usize>],
+    states_per_site: usize,
+) -> Result<usize> {
+    let elements = destinations
+        .len()
+        .checked_mul(states_per_site)
+        .ok_or_else(|| {
+            QmbedError::UnsupportedBackend("lattice-symmetry permutation is too large".into())
+        })?;
+    let mut visited = vec![false; elements];
+    let mut period = 1_usize;
+    for seed in 0..elements {
+        if visited[seed] {
+            continue;
+        }
+        let mut current = seed;
+        let mut cycle = 0_usize;
+        loop {
+            if visited[current] {
+                if current != seed {
+                    return Err(QmbedError::IncompatibleSymmetry(
+                        "lattice symmetry does not decompose into closed cycles".into(),
+                    ));
+                }
+                break;
+            }
+            visited[current] = true;
+            cycle += 1;
+            let source = current / states_per_site;
+            let digit = current % states_per_site;
+            current = destinations[source] * states_per_site + local_permutations[source][digit];
+        }
+        period = checked_lcm(period, cycle)?;
+    }
+    Ok(period)
+}
+
+fn checked_lcm(left: usize, right: usize) -> Result<usize> {
+    fn gcd(mut left: usize, mut right: usize) -> usize {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left
+    }
+
+    left.checked_div(gcd(left, right))
+        .and_then(|reduced| reduced.checked_mul(right))
+        .ok_or_else(|| QmbedError::UnsupportedBackend("symmetry period is too large".into()))
+}
+
 type SymmetryAction<State> = Arc<dyn Fn(State) -> Result<(State, Complex64)> + Send + Sync>;
 
 /// Closure-backed finite map for lattice, particle-hole, or user symmetries.
@@ -2364,6 +2601,7 @@ where
 }
 
 /// Arbitrary finite-map reduction of any concrete parent basis.
+#[derive(Clone, Debug)]
 pub struct GeneralBasis<Parent>
 where
     Parent: Basis,
@@ -2457,11 +2695,6 @@ where
             representatives.push((representative, orbit_size));
         }
         representatives.sort_by_key(|(state, _)| *state);
-        if representatives.is_empty() {
-            return Err(QmbedError::InvalidSector(
-                "the requested general symmetry sector is empty".into(),
-            ));
-        }
         let (states, orbit_lengths) = representatives.into_iter().unzip();
         Ok(Self {
             parent,
@@ -3613,6 +3846,10 @@ pub enum PackedBasis {
     Boson(BosonBasis1D),
     SpinlessFermion(SpinlessFermionBasis1D),
     SpinfulFermion(SpinfulFermionBasis1D),
+    GeneralSpin(SpinBasisGeneral),
+    GeneralBoson(BosonBasisGeneral),
+    GeneralSpinlessFermion(SpinlessFermionBasisGeneral),
+    GeneralSpinfulFermion(SpinfulFermionBasisGeneral),
     Reversed(Box<PackedBasis>),
 }
 
@@ -3653,6 +3890,30 @@ impl From<SpinfulFermionBasis1D> for PackedBasis {
     }
 }
 
+impl From<SpinBasisGeneral> for PackedBasis {
+    fn from(basis: SpinBasisGeneral) -> Self {
+        Self::GeneralSpin(basis)
+    }
+}
+
+impl From<BosonBasisGeneral> for PackedBasis {
+    fn from(basis: BosonBasisGeneral) -> Self {
+        Self::GeneralBoson(basis)
+    }
+}
+
+impl From<SpinlessFermionBasisGeneral> for PackedBasis {
+    fn from(basis: SpinlessFermionBasisGeneral) -> Self {
+        Self::GeneralSpinlessFermion(basis)
+    }
+}
+
+impl From<SpinfulFermionBasisGeneral> for PackedBasis {
+    fn from(basis: SpinfulFermionBasisGeneral) -> Self {
+        Self::GeneralSpinfulFermion(basis)
+    }
+}
+
 impl Basis for PackedBasis {
     type State = u128;
 
@@ -3662,6 +3923,10 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.len(),
             Self::SpinlessFermion(basis) => basis.len(),
             Self::SpinfulFermion(basis) => basis.len(),
+            Self::GeneralSpin(basis) => basis.len(),
+            Self::GeneralBoson(basis) => basis.len(),
+            Self::GeneralSpinlessFermion(basis) => basis.len(),
+            Self::GeneralSpinfulFermion(basis) => basis.len(),
             Self::Reversed(basis) => basis.len(),
         }
     }
@@ -3672,6 +3937,10 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.state(index),
             Self::SpinlessFermion(basis) => basis.state(index),
             Self::SpinfulFermion(basis) => basis.state(index),
+            Self::GeneralSpin(basis) => basis.state(index),
+            Self::GeneralBoson(basis) => basis.state(index),
+            Self::GeneralSpinlessFermion(basis) => basis.state(index),
+            Self::GeneralSpinfulFermion(basis) => basis.state(index),
             Self::Reversed(basis) => {
                 let reversed = basis
                     .len()
@@ -3688,6 +3957,10 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.index(state),
             Self::SpinlessFermion(basis) => basis.index(state),
             Self::SpinfulFermion(basis) => basis.index(state),
+            Self::GeneralSpin(basis) => basis.index(state),
+            Self::GeneralBoson(basis) => basis.index(state),
+            Self::GeneralSpinlessFermion(basis) => basis.index(state),
+            Self::GeneralSpinfulFermion(basis) => basis.index(state),
             Self::Reversed(basis) => basis.index(state).map(|index| basis.len() - index - 1),
         }
     }
@@ -3703,6 +3976,10 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.apply_local(state, operator, sites),
             Self::SpinlessFermion(basis) => basis.apply_local(state, operator, sites),
             Self::SpinfulFermion(basis) => basis.apply_local(state, operator, sites),
+            Self::GeneralSpin(basis) => basis.apply_local(state, operator, sites),
+            Self::GeneralBoson(basis) => basis.apply_local(state, operator, sites),
+            Self::GeneralSpinlessFermion(basis) => basis.apply_local(state, operator, sites),
+            Self::GeneralSpinfulFermion(basis) => basis.apply_local(state, operator, sites),
             Self::Reversed(basis) => basis.apply_local(state, operator, sites),
         }
     }
@@ -3718,6 +3995,14 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.apply_local_transitions(state, operator, sites),
             Self::SpinlessFermion(basis) => basis.apply_local_transitions(state, operator, sites),
             Self::SpinfulFermion(basis) => basis.apply_local_transitions(state, operator, sites),
+            Self::GeneralSpin(basis) => basis.apply_local_transitions(state, operator, sites),
+            Self::GeneralBoson(basis) => basis.apply_local_transitions(state, operator, sites),
+            Self::GeneralSpinlessFermion(basis) => {
+                basis.apply_local_transitions(state, operator, sites)
+            }
+            Self::GeneralSpinfulFermion(basis) => {
+                basis.apply_local_transitions(state, operator, sites)
+            }
             Self::Reversed(basis) => basis.apply_local_transitions(state, operator, sites),
         }
     }
@@ -3735,6 +4020,18 @@ impl Basis for PackedBasis {
                 basis.apply_local_unreduced_transitions(state, operator, sites)
             }
             Self::SpinfulFermion(basis) => {
+                basis.apply_local_unreduced_transitions(state, operator, sites)
+            }
+            Self::GeneralSpin(basis) => {
+                basis.apply_local_unreduced_transitions(state, operator, sites)
+            }
+            Self::GeneralBoson(basis) => {
+                basis.apply_local_unreduced_transitions(state, operator, sites)
+            }
+            Self::GeneralSpinlessFermion(basis) => {
+                basis.apply_local_unreduced_transitions(state, operator, sites)
+            }
+            Self::GeneralSpinfulFermion(basis) => {
                 basis.apply_local_unreduced_transitions(state, operator, sites)
             }
             Self::Reversed(basis) => {
@@ -3765,6 +4062,18 @@ impl Basis for PackedBasis {
                 basis.visit_local_unreduced_transitions(state, operator, sites, visit)
             }
             Self::SpinfulFermion(basis) => {
+                basis.visit_local_unreduced_transitions(state, operator, sites, visit)
+            }
+            Self::GeneralSpin(basis) => {
+                basis.visit_local_unreduced_transitions(state, operator, sites, visit)
+            }
+            Self::GeneralBoson(basis) => {
+                basis.visit_local_unreduced_transitions(state, operator, sites, visit)
+            }
+            Self::GeneralSpinlessFermion(basis) => {
+                basis.visit_local_unreduced_transitions(state, operator, sites, visit)
+            }
+            Self::GeneralSpinfulFermion(basis) => {
                 basis.visit_local_unreduced_transitions(state, operator, sites, visit)
             }
             Self::Reversed(basis) => {
@@ -3799,6 +4108,20 @@ impl Basis for PackedBasis {
             Self::SpinfulFermion(basis) => basis.visit_preparsed_local_unreduced_transitions(
                 state, operator, symbols, split, sites, visit,
             ),
+            Self::GeneralSpin(basis) => basis.visit_preparsed_local_unreduced_transitions(
+                state, operator, symbols, split, sites, visit,
+            ),
+            Self::GeneralBoson(basis) => basis.visit_preparsed_local_unreduced_transitions(
+                state, operator, symbols, split, sites, visit,
+            ),
+            Self::GeneralSpinlessFermion(basis) => basis
+                .visit_preparsed_local_unreduced_transitions(
+                    state, operator, symbols, split, sites, visit,
+                ),
+            Self::GeneralSpinfulFermion(basis) => basis
+                .visit_preparsed_local_unreduced_transitions(
+                    state, operator, symbols, split, sites, visit,
+                ),
             Self::Reversed(basis) => basis.visit_preparsed_local_unreduced_transitions(
                 state, operator, symbols, split, sites, visit,
             ),
@@ -3811,6 +4134,10 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.transition_orbit_size(state),
             Self::SpinlessFermion(basis) => basis.transition_orbit_size(state),
             Self::SpinfulFermion(basis) => basis.transition_orbit_size(state),
+            Self::GeneralSpin(basis) => basis.transition_orbit_size(state),
+            Self::GeneralBoson(basis) => basis.transition_orbit_size(state),
+            Self::GeneralSpinlessFermion(basis) => basis.transition_orbit_size(state),
+            Self::GeneralSpinfulFermion(basis) => basis.transition_orbit_size(state),
             Self::Reversed(basis) => basis.transition_orbit_size(state),
         }
     }
@@ -3825,6 +4152,12 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.reduce_transition(state, source_orbit_size),
             Self::SpinlessFermion(basis) => basis.reduce_transition(state, source_orbit_size),
             Self::SpinfulFermion(basis) => basis.reduce_transition(state, source_orbit_size),
+            Self::GeneralSpin(basis) => basis.reduce_transition(state, source_orbit_size),
+            Self::GeneralBoson(basis) => basis.reduce_transition(state, source_orbit_size),
+            Self::GeneralSpinlessFermion(basis) => {
+                basis.reduce_transition(state, source_orbit_size)
+            }
+            Self::GeneralSpinfulFermion(basis) => basis.reduce_transition(state, source_orbit_size),
             Self::Reversed(basis) => basis.reduce_transition(state, source_orbit_size),
         }
     }
@@ -3839,6 +4172,10 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.index_transition(state, source_orbit_size),
             Self::SpinlessFermion(basis) => basis.index_transition(state, source_orbit_size),
             Self::SpinfulFermion(basis) => basis.index_transition(state, source_orbit_size),
+            Self::GeneralSpin(basis) => basis.index_transition(state, source_orbit_size),
+            Self::GeneralBoson(basis) => basis.index_transition(state, source_orbit_size),
+            Self::GeneralSpinlessFermion(basis) => basis.index_transition(state, source_orbit_size),
+            Self::GeneralSpinfulFermion(basis) => basis.index_transition(state, source_orbit_size),
             Self::Reversed(basis) => Ok(basis
                 .index_transition(state, source_orbit_size)?
                 .map(|(index, amplitude)| (basis.len() - index - 1, amplitude))),
@@ -3851,6 +4188,14 @@ impl Basis for PackedBasis {
             Self::Boson(basis) => basis.operator_preserves_particle_sector(operator),
             Self::SpinlessFermion(basis) => basis.operator_preserves_particle_sector(operator),
             Self::SpinfulFermion(basis) => basis.operator_preserves_particle_sector(operator),
+            Self::GeneralSpin(basis) => basis.operator_preserves_particle_sector(operator),
+            Self::GeneralBoson(basis) => basis.operator_preserves_particle_sector(operator),
+            Self::GeneralSpinlessFermion(basis) => {
+                basis.operator_preserves_particle_sector(operator)
+            }
+            Self::GeneralSpinfulFermion(basis) => {
+                basis.operator_preserves_particle_sector(operator)
+            }
             Self::Reversed(basis) => basis.operator_preserves_particle_sector(operator),
         }
     }

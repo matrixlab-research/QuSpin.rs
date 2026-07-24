@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use qmbed::basis::{
-    Basis, BosonBasis1D, PackedBasis, SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D,
+    Basis, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap, PackedBasis,
+    SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetrySector,
 };
 use qmbed::interop::PackedEdModel;
 use qmbed::operator::{
@@ -121,12 +122,16 @@ enum BasisRequest {
         #[serde(default)]
         pauli: bool,
         #[serde(default)]
+        symmetries: Vec<SymmetryRequest>,
+        #[serde(default)]
         reverse: bool,
     },
     Boson {
         sites: usize,
         particles: Option<usize>,
         states_per_site: usize,
+        #[serde(default)]
+        symmetries: Vec<SymmetryRequest>,
         #[serde(default)]
         reverse: bool,
     },
@@ -135,12 +140,16 @@ enum BasisRequest {
         particles: Option<usize>,
         momentum: Option<i32>,
         #[serde(default)]
+        symmetries: Vec<SymmetryRequest>,
+        #[serde(default)]
         reverse: bool,
     },
     SpinfulFermion {
         sites: usize,
         particles_up: Option<usize>,
         particles_down: Option<usize>,
+        #[serde(default)]
+        symmetries: Vec<SymmetryRequest>,
         #[serde(default)]
         reverse: bool,
     },
@@ -166,6 +175,13 @@ struct ProductRequest {
 struct CouplingRequest {
     coefficient: [f64; 2],
     sites: Vec<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymmetryRequest {
+    destinations: Vec<usize>,
+    local_permutations: Option<Vec<Vec<usize>>>,
+    sector: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -400,72 +416,192 @@ fn execute(request: SolveRequest) -> Result<SolveResult> {
 
 fn build_basis(request: &BasisRequest) -> Result<PackedBasis> {
     match request {
-        BasisRequest::Spin {
-            sites,
-            spin_twice,
-            up,
-            momentum,
-            parity,
-            pauli,
-            reverse,
-        } => {
-            let mut builder = SpinBasis1D::builder(*sites)
-                .spin_twice(*spin_twice)
-                .pauli(*pauli);
-            if let Some(up) = up {
-                builder = builder.up(*up);
-            }
-            if let Some(momentum) = momentum {
-                builder = builder.momentum(*momentum);
-            }
-            if let Some(parity) = parity {
-                builder = builder.parity(*parity);
-            }
-            Ok(ordered_basis(builder.build()?.into(), *reverse))
-        }
-        BasisRequest::Boson {
-            sites,
-            particles,
-            states_per_site,
-            reverse,
-        } => {
-            let mut builder = BosonBasis1D::builder(*sites, *states_per_site);
-            if let Some(particles) = particles {
-                builder = builder.particles(*particles);
-            }
-            Ok(ordered_basis(builder.build()?.into(), *reverse))
-        }
-        BasisRequest::SpinlessFermion {
-            sites,
-            particles,
-            momentum,
-            reverse,
-        } => {
-            let mut builder = SpinlessFermionBasis1D::builder(*sites);
-            if let Some(particles) = particles {
-                builder = builder.particles(*particles);
-            }
-            if let Some(momentum) = momentum {
-                builder = builder.momentum(*momentum);
-            }
-            Ok(ordered_basis(builder.build()?.into(), *reverse))
-        }
-        BasisRequest::SpinfulFermion {
-            sites,
-            particles_up,
-            particles_down,
-            reverse,
-        } => {
-            let mut builder = SpinfulFermionBasis1D::builder(*sites);
-            if let Some(particles) = particles_up {
-                builder = builder.particles_up(*particles);
-            }
-            if let Some(particles) = particles_down {
-                builder = builder.particles_down(*particles);
-            }
-            Ok(ordered_basis(builder.build()?.into(), *reverse))
-        }
+        BasisRequest::Spin { .. } => build_spin_basis(request),
+        BasisRequest::Boson { .. } => build_boson_basis(request),
+        BasisRequest::SpinlessFermion { .. } => build_spinless_basis(request),
+        BasisRequest::SpinfulFermion { .. } => build_spinful_basis(request),
     }
+}
+
+fn build_spin_basis(request: &BasisRequest) -> Result<PackedBasis> {
+    let BasisRequest::Spin {
+        sites,
+        spin_twice,
+        up,
+        momentum,
+        parity,
+        pauli,
+        symmetries,
+        reverse,
+    } = request
+    else {
+        unreachable!("build_spin_basis requires a spin request");
+    };
+    if !symmetries.is_empty() && (momentum.is_some() || parity.is_some()) {
+        return Err(QmbedError::InvalidOptions(
+            "built-in and general spin symmetries cannot be mixed".into(),
+        ));
+    }
+    let mut builder = SpinBasis1D::builder(*sites)
+        .spin_twice(*spin_twice)
+        .pauli(*pauli);
+    if let Some(up) = up {
+        builder = builder.up(*up);
+    }
+    if let Some(momentum) = momentum {
+        builder = builder.momentum(*momentum);
+    }
+    if let Some(parity) = parity {
+        builder = builder.parity(*parity);
+    }
+    let basis = builder.build()?;
+    let packed = if symmetries.is_empty() {
+        basis.into()
+    } else {
+        GeneralBasis::new(
+            basis,
+            runtime_symmetry_sector(
+                *sites,
+                usize::from(*spin_twice) + 1,
+                ExchangeStatistics::Distinguishable,
+                symmetries,
+            )?,
+        )?
+        .into()
+    };
+    Ok(ordered_basis(packed, *reverse))
+}
+
+fn build_boson_basis(request: &BasisRequest) -> Result<PackedBasis> {
+    let BasisRequest::Boson {
+        sites,
+        particles,
+        states_per_site,
+        symmetries,
+        reverse,
+    } = request
+    else {
+        unreachable!("build_boson_basis requires a boson request");
+    };
+    let mut builder = BosonBasis1D::builder(*sites, *states_per_site);
+    if let Some(particles) = particles {
+        builder = builder.particles(*particles);
+    }
+    let basis = builder.build()?;
+    let packed = if symmetries.is_empty() {
+        basis.into()
+    } else {
+        GeneralBasis::new(
+            basis,
+            runtime_symmetry_sector(
+                *sites,
+                *states_per_site,
+                ExchangeStatistics::Distinguishable,
+                symmetries,
+            )?,
+        )?
+        .into()
+    };
+    Ok(ordered_basis(packed, *reverse))
+}
+
+fn build_spinless_basis(request: &BasisRequest) -> Result<PackedBasis> {
+    let BasisRequest::SpinlessFermion {
+        sites,
+        particles,
+        momentum,
+        symmetries,
+        reverse,
+    } = request
+    else {
+        unreachable!("build_spinless_basis requires a spinless request");
+    };
+    if !symmetries.is_empty() && momentum.is_some() {
+        return Err(QmbedError::InvalidOptions(
+            "built-in and general fermion symmetries cannot be mixed".into(),
+        ));
+    }
+    let mut builder = SpinlessFermionBasis1D::builder(*sites);
+    if let Some(particles) = particles {
+        builder = builder.particles(*particles);
+    }
+    if let Some(momentum) = momentum {
+        builder = builder.momentum(*momentum);
+    }
+    let basis = builder.build()?;
+    let packed = if symmetries.is_empty() {
+        basis.into()
+    } else {
+        GeneralBasis::new(
+            basis,
+            runtime_symmetry_sector(*sites, 2, ExchangeStatistics::Fermionic, symmetries)?,
+        )?
+        .into()
+    };
+    Ok(ordered_basis(packed, *reverse))
+}
+
+fn build_spinful_basis(request: &BasisRequest) -> Result<PackedBasis> {
+    let BasisRequest::SpinfulFermion {
+        sites,
+        particles_up,
+        particles_down,
+        symmetries,
+        reverse,
+    } = request
+    else {
+        unreachable!("build_spinful_basis requires a spinful request");
+    };
+    let mut builder = SpinfulFermionBasis1D::builder(*sites);
+    if let Some(particles) = particles_up {
+        builder = builder.particles_up(*particles);
+    }
+    if let Some(particles) = particles_down {
+        builder = builder.particles_down(*particles);
+    }
+    let basis = builder.build()?;
+    let packed = if symmetries.is_empty() {
+        basis.into()
+    } else {
+        GeneralBasis::new(
+            basis,
+            runtime_symmetry_sector(
+                sites.checked_mul(2).ok_or_else(|| {
+                    QmbedError::UnsupportedBackend("spinful orbital count is too large".into())
+                })?,
+                2,
+                ExchangeStatistics::Fermionic,
+                symmetries,
+            )?,
+        )?
+        .into()
+    };
+    Ok(ordered_basis(packed, *reverse))
+}
+
+fn runtime_symmetry_sector(
+    encoded_sites: usize,
+    states_per_site: usize,
+    statistics: ExchangeStatistics,
+    requests: &[SymmetryRequest],
+) -> Result<SymmetrySector<u128>> {
+    let mut sector = SymmetrySector::new();
+    for request in requests {
+        if request.destinations.len() != encoded_sites {
+            return Err(QmbedError::InvalidOptions(format!(
+                "symmetry map has {} sites, expected {encoded_sites}",
+                request.destinations.len()
+            )));
+        }
+        let map = LatticeSymmetryMap::new(
+            states_per_site,
+            request.destinations.clone(),
+            request.local_permutations.clone(),
+            statistics,
+        )?;
+        sector = sector.with_map(map, request.sector);
+    }
+    Ok(sector)
 }
 
 fn ordered_basis(basis: PackedBasis, reverse: bool) -> PackedBasis {
@@ -930,5 +1066,57 @@ mod tests {
                 .unwrap()
                 .contains("is not registered")
         );
+    }
+
+    #[test]
+    fn serialized_runtime_symmetry_matches_the_builtin_translation_sector() {
+        let builtin = run_command_json(
+            r#"{
+                "operation":"describe_basis",
+                "basis":{
+                    "kind":"spin",
+                    "sites":6,
+                    "up":3,
+                    "momentum":1
+                }
+            }"#,
+        );
+        let general = run_command_json(
+            r#"{
+                "operation":"describe_basis",
+                "basis":{
+                    "kind":"spin",
+                    "sites":6,
+                    "up":3,
+                    "symmetries":[{
+                        "destinations":[1,2,3,4,5,0],
+                        "sector":1
+                    }]
+                }
+            }"#,
+        );
+        let builtin: Value = serde_json::from_str(&builtin).unwrap();
+        let general: Value = serde_json::from_str(&general).unwrap();
+        assert_eq!(builtin["status"], "ok");
+        assert_eq!(general["status"], "ok");
+        assert_eq!(general["result"], builtin["result"]);
+
+        let invalid = run_command_json(
+            r#"{
+                "operation":"describe_basis",
+                "basis":{
+                    "kind":"boson",
+                    "sites":3,
+                    "states_per_site":2,
+                    "symmetries":[{
+                        "destinations":[1,0],
+                        "sector":0
+                    }]
+                }
+            }"#,
+        );
+        let invalid: Value = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(invalid["status"], "error");
+        assert!(invalid["error"].as_str().unwrap().contains("expected 3"));
     }
 }

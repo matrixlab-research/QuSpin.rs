@@ -4,7 +4,7 @@ import numpy as np
 import qmbed
 from qmbed.compat import quspin
 from qmbed._ffi import QmbedError, command
-from quspin.basis import spin_basis_1d
+from quspin.basis import spin_basis_1d, spin_basis_general
 from quspin.operators import hamiltonian
 
 
@@ -64,6 +64,55 @@ class QmbedBindingTests(unittest.TestCase):
             operator.toarray()
         with self.assertRaisesRegex(QmbedError, "is not registered"):
             command({"operation": "describe_model", "handle": handle})
+
+    def test_python_site_maps_reproduce_the_optimized_momentum_sector(self):
+        sites = 6
+        translation = (np.arange(sites) + 1) % sites
+        general = spin_basis_general(
+            sites,
+            Nup=3,
+            pauli=False,
+            translation=(translation, 1),
+        )
+        optimized = spin_basis_1d(
+            sites,
+            Nup=3,
+            pauli=False,
+            kblock=1,
+        )
+
+        np.testing.assert_array_equal(general.states, optimized.states)
+        static = [
+            [
+                "+-",
+                [[1.0j, site, (site + 1) % sites] for site in range(sites)],
+            ],
+            [
+                "-+",
+                [[-1.0j, site, (site + 1) % sites] for site in range(sites)],
+            ],
+        ]
+        general_operator = hamiltonian(
+            static,
+            [],
+            basis=general,
+            check_herm=False,
+            check_pcon=False,
+            check_symm=False,
+        )
+        optimized_operator = hamiltonian(
+            static,
+            [],
+            basis=optimized,
+            check_herm=False,
+            check_pcon=False,
+            check_symm=False,
+        )
+        np.testing.assert_allclose(
+            general_operator.toarray(),
+            optimized_operator.toarray(),
+            atol=1.0e-12,
+        )
 
 
 if __name__ == "__main__":
