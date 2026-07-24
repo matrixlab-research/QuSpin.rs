@@ -4,12 +4,14 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use qmbed::basis::{
-    Basis, BosonBasis1D, SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D,
+    Basis, BosonBasis1D, PackedBasis, SpinBasis1D, SpinfulFermionBasis1D,
+    SpinlessFermionBasis1D,
 };
+use qmbed::interop::PackedEdModel;
 use qmbed::operator::{
-    Coupling, LocalOperator, MatrixFormat, OpProduct, OperatorBuilder, OperatorSpec,
+    AssemblyChecks, Coupling, LocalOperator, MatrixFormat, OpProduct, OperatorSpec,
 };
-use qmbed::solve::{EigshOptions, SpectrumTarget, eigsh};
+use qmbed::solve::{EighOptions, EigshOptions, SpectrumTarget};
 use qmbed::{Complex64, QmbedError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,59 @@ pub struct SolveRequest {
     #[serde(default)]
     format: StorageFormat,
     solver: SolverRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum CommandRequest {
+    DescribeBasis {
+        basis: BasisRequest,
+    },
+    Materialize {
+        basis: BasisRequest,
+        terms: Vec<TermRequest>,
+        site_permutation: Option<Vec<usize>>,
+        #[serde(default)]
+        format: StorageFormat,
+        #[serde(default)]
+        checks: ChecksRequest,
+    },
+    Eigh {
+        basis: BasisRequest,
+        terms: Vec<TermRequest>,
+        site_permutation: Option<Vec<usize>>,
+        #[serde(default)]
+        eigenvectors: bool,
+        #[serde(default)]
+        checks: ChecksRequest,
+    },
+    Eigsh {
+        basis: BasisRequest,
+        terms: Vec<TermRequest>,
+        site_permutation: Option<Vec<usize>>,
+        #[serde(default)]
+        format: StorageFormat,
+        solver: SolverRequest,
+        #[serde(default)]
+        checks: ChecksRequest,
+    },
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChecksRequest {
+    hermiticity: Option<bool>,
+    particle_conservation: Option<bool>,
+    symmetry_compatibility: Option<bool>,
+}
+
+impl From<ChecksRequest> for AssemblyChecks {
+    fn from(checks: ChecksRequest) -> Self {
+        Self {
+            hermiticity: checks.hermiticity.unwrap_or(true),
+            particle_conservation: checks.particle_conservation.unwrap_or(true),
+            symmetry_compatibility: checks.symmetry_compatibility.unwrap_or(true),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,21 +89,29 @@ enum BasisRequest {
         parity: Option<i8>,
         #[serde(default)]
         pauli: bool,
+        #[serde(default)]
+        reverse: bool,
     },
     Boson {
         sites: usize,
         particles: Option<usize>,
         states_per_site: usize,
+        #[serde(default)]
+        reverse: bool,
     },
     SpinlessFermion {
         sites: usize,
         particles: Option<usize>,
         momentum: Option<i32>,
+        #[serde(default)]
+        reverse: bool,
     },
     SpinfulFermion {
         sites: usize,
         particles_up: Option<usize>,
         particles_down: Option<usize>,
+        #[serde(default)]
+        reverse: bool,
     },
 }
 
@@ -74,7 +137,7 @@ struct CouplingRequest {
     sites: Vec<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum StorageFormat {
     Dense,
@@ -83,6 +146,36 @@ enum StorageFormat {
     Csr,
     Dia,
     MatrixFree,
+}
+
+#[derive(Debug, Serialize)]
+struct MatrixEntry {
+    row: usize,
+    column: usize,
+    value: [f64; 2],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CommandResult {
+    Basis {
+        dimension: usize,
+        states: Vec<String>,
+    },
+    Operator {
+        shape: [usize; 2],
+        format: StorageFormat,
+        entries: Vec<MatrixEntry>,
+    },
+    Eigensystem {
+        dimension: usize,
+        eigenvalues: Vec<f64>,
+        residuals: Vec<f64>,
+        iterations: usize,
+        converged: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eigenvectors: Option<Vec<Vec<[f64; 2]>>>,
+    },
 }
 
 impl From<StorageFormat> for MatrixFormat {
@@ -162,6 +255,13 @@ enum Response {
     Error { error: String },
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum CommandResponse {
+    Ok { result: CommandResult },
+    Error { error: String },
+}
+
 pub fn run_json(request: &str) -> String {
     let response = serde_json::from_str::<SolveRequest>(request)
         .map_err(|error| QmbedError::InvalidOptions(format!("invalid binding request: {error}")))
@@ -177,8 +277,33 @@ pub fn run_json(request: &str) -> String {
     })
 }
 
+pub fn run_command_json(request: &str) -> String {
+    let response = serde_json::from_str::<CommandRequest>(request)
+        .map_err(|error| QmbedError::InvalidOptions(format!("invalid binding command: {error}")))
+        .and_then(execute_command)
+        .map_or_else(
+            |error| CommandResponse::Error {
+                error: error.to_string(),
+            },
+            |result| CommandResponse::Ok { result },
+        );
+    serde_json::to_string(&response).unwrap_or_else(|error| {
+        format!(r#"{{"status":"error","error":"response serialization failed: {error}"}}"#)
+    })
+}
+
 fn execute(request: SolveRequest) -> Result<SolveResult> {
-    match request.basis {
+    let model = build_model(
+        &request.basis,
+        request.terms,
+        AssemblyChecks::all(),
+        None,
+    )?;
+    solve_model(&model, request.format, &request.solver)
+}
+
+fn build_basis(request: &BasisRequest) -> Result<PackedBasis> {
+    match request {
         BasisRequest::Spin {
             sites,
             spin_twice,
@@ -186,102 +311,96 @@ fn execute(request: SolveRequest) -> Result<SolveResult> {
             momentum,
             parity,
             pauli,
+            reverse,
         } => {
-            let mut builder = SpinBasis1D::builder(sites)
-                .spin_twice(spin_twice)
-                .pauli(pauli);
+            let mut builder = SpinBasis1D::builder(*sites)
+                .spin_twice(*spin_twice)
+                .pauli(*pauli);
             if let Some(up) = up {
-                builder = builder.up(up);
+                builder = builder.up(*up);
             }
             if let Some(momentum) = momentum {
-                builder = builder.momentum(momentum);
+                builder = builder.momentum(*momentum);
             }
             if let Some(parity) = parity {
-                builder = builder.parity(parity);
+                builder = builder.parity(*parity);
             }
-            solve_on(
-                &builder.build()?,
-                request.terms,
-                request.format,
-                &request.solver,
-            )
+            Ok(ordered_basis(builder.build()?.into(), *reverse))
         }
         BasisRequest::Boson {
             sites,
             particles,
             states_per_site,
+            reverse,
         } => {
-            let mut builder = BosonBasis1D::builder(sites, states_per_site);
+            let mut builder = BosonBasis1D::builder(*sites, *states_per_site);
             if let Some(particles) = particles {
-                builder = builder.particles(particles);
+                builder = builder.particles(*particles);
             }
-            solve_on(
-                &builder.build()?,
-                request.terms,
-                request.format,
-                &request.solver,
-            )
+            Ok(ordered_basis(builder.build()?.into(), *reverse))
         }
         BasisRequest::SpinlessFermion {
             sites,
             particles,
             momentum,
+            reverse,
         } => {
-            let mut builder = SpinlessFermionBasis1D::builder(sites);
+            let mut builder = SpinlessFermionBasis1D::builder(*sites);
             if let Some(particles) = particles {
-                builder = builder.particles(particles);
+                builder = builder.particles(*particles);
             }
             if let Some(momentum) = momentum {
-                builder = builder.momentum(momentum);
+                builder = builder.momentum(*momentum);
             }
-            solve_on(
-                &builder.build()?,
-                request.terms,
-                request.format,
-                &request.solver,
-            )
+            Ok(ordered_basis(builder.build()?.into(), *reverse))
         }
         BasisRequest::SpinfulFermion {
             sites,
             particles_up,
             particles_down,
+            reverse,
         } => {
-            let mut builder = SpinfulFermionBasis1D::builder(sites);
+            let mut builder = SpinfulFermionBasis1D::builder(*sites);
             if let Some(particles) = particles_up {
-                builder = builder.particles_up(particles);
+                builder = builder.particles_up(*particles);
             }
             if let Some(particles) = particles_down {
-                builder = builder.particles_down(particles);
+                builder = builder.particles_down(*particles);
             }
-            solve_on(
-                &builder.build()?,
-                request.terms,
-                request.format,
-                &request.solver,
-            )
+            Ok(ordered_basis(builder.build()?.into(), *reverse))
         }
     }
 }
 
-fn solve_on<B>(
-    basis: &B,
+fn ordered_basis(basis: PackedBasis, reverse: bool) -> PackedBasis {
+    if reverse { basis.reversed() } else { basis }
+}
+
+fn build_model(
+    basis: &BasisRequest,
     terms: Vec<TermRequest>,
-    format: StorageFormat,
-    solver: &SolverRequest,
-) -> Result<SolveResult>
-where
-    B: Basis<State = u128>,
-{
+    checks: AssemblyChecks,
+    site_permutation: Option<Vec<usize>>,
+) -> Result<PackedEdModel> {
     let terms = terms
         .into_iter()
         .map(typed_term)
         .collect::<Result<Vec<_>>>()?;
-    let operator = OperatorBuilder::on(basis)
-        .terms(terms)
-        .build(format.into())?;
+    let model = PackedEdModel::new(build_basis(basis)?, terms).with_checks(checks);
+    match site_permutation {
+        Some(permutation) => model.with_site_permutation(&permutation),
+        None => Ok(model),
+    }
+}
+
+fn solve_model(
+    model: &PackedEdModel,
+    format: StorageFormat,
+    solver: &SolverRequest,
+) -> Result<SolveResult> {
     let include_vectors = solver.eigenvectors;
-    let result = eigsh(
-        &operator,
+    let result = model.eigsh(
+        format.into(),
         EigshOptions {
             eigenpairs: solver.eigenpairs,
             target: solver.target.into(),
@@ -292,7 +411,7 @@ where
         },
     )?;
     Ok(SolveResult {
-        dimension: basis.len(),
+        dimension: model.dimension(),
         eigenvalues: result.eigenvalues,
         residuals: result.residuals,
         iterations: result.iterations,
@@ -310,6 +429,116 @@ where
                 .collect()
         }),
     })
+}
+
+fn command_eigensystem(
+    dimension: usize,
+    result: qmbed::solve::Eigensystem,
+    include_vectors: bool,
+) -> CommandResult {
+    CommandResult::Eigensystem {
+        dimension,
+        eigenvalues: result.eigenvalues,
+        residuals: result.residuals,
+        iterations: result.iterations,
+        converged: result.converged,
+        eigenvectors: include_vectors.then(|| {
+            result
+                .eigenvectors
+                .into_iter()
+                .map(|vector| {
+                    vector
+                        .into_iter()
+                        .map(|value| [value.re, value.im])
+                        .collect()
+                })
+                .collect()
+        }),
+    }
+}
+
+fn execute_command(request: CommandRequest) -> Result<CommandResult> {
+    match request {
+        CommandRequest::DescribeBasis { basis } => {
+            let basis = build_basis(&basis)?;
+            let states = (0..basis.len())
+                .map(|index| basis.state(index).map(|state| state.to_string()))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(CommandResult::Basis {
+                dimension: basis.len(),
+                states,
+            })
+        }
+        CommandRequest::Materialize {
+            basis,
+            terms,
+            site_permutation,
+            format,
+            checks,
+        } => {
+            let model = build_model(&basis, terms, checks.into(), site_permutation)?;
+            let operator = model.materialize(format.into())?;
+            let (rows, columns) = qmbed::operator::LinearOperator::shape(&operator);
+            let entries = operator
+                .triplets()
+                .into_iter()
+                .map(|(row, column, value)| MatrixEntry {
+                    row,
+                    column,
+                    value: [value.re, value.im],
+                })
+                .collect();
+            Ok(CommandResult::Operator {
+                shape: [rows, columns],
+                format,
+                entries,
+            })
+        }
+        CommandRequest::Eigh {
+            basis,
+            terms,
+            site_permutation,
+            eigenvectors,
+            checks,
+        } => {
+            let model = build_model(&basis, terms, checks.into(), site_permutation)?;
+            let result = model.eigh(EighOptions {
+                return_eigenvectors: eigenvectors,
+            })?;
+            Ok(command_eigensystem(
+                model.dimension(),
+                result,
+                eigenvectors,
+            ))
+        }
+        CommandRequest::Eigsh {
+            basis,
+            terms,
+            site_permutation,
+            format,
+            solver,
+            checks,
+        } => {
+            let model = build_model(&basis, terms, checks.into(), site_permutation)?;
+            let include_vectors = solver.eigenvectors;
+            let result = model.eigsh(
+                format.into(),
+                EigshOptions {
+                    eigenpairs: solver.eigenpairs,
+                    target: solver.target.into(),
+                    krylov_dimension: solver.krylov_dimension,
+                    tolerance: solver.tolerance,
+                    max_iterations: solver.max_iterations,
+                    seed: solver.seed,
+                },
+            )?;
+            Ok(command_eigensystem(
+                model.dimension(),
+                result,
+                include_vectors,
+            ))
+        }
+    }
 }
 
 fn typed_term(term: TermRequest) -> Result<OperatorSpec> {
@@ -382,6 +611,39 @@ pub unsafe extern "C" fn qmbed_run_json(request: *const c_char) -> *mut c_char {
         .into_raw()
 }
 
+/// Execute a reusable-model command encoded as JSON.
+///
+/// # Safety
+///
+/// `request` must point to a valid NUL-terminated string for the duration of
+/// this call. The returned pointer must be released exactly once with
+/// [`qmbed_string_free`].
+///
+/// # Panics
+///
+/// This function panics only if Rust's JSON serializer violates its guarantee
+/// to escape interior NUL characters.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmbed_command_json(request: *const c_char) -> *mut c_char {
+    let response = catch_unwind(AssertUnwindSafe(|| {
+        if request.is_null() {
+            return r#"{"status":"error","error":"request pointer is null"}"#.to_string();
+        }
+        // SAFETY: The caller contract requires a live NUL-terminated string.
+        let request = unsafe { CStr::from_ptr(request) };
+        match request.to_str() {
+            Ok(request) => run_command_json(request),
+            Err(error) => {
+                format!(r#"{{"status":"error","error":"request is not UTF-8: {error}"}}"#)
+            }
+        }
+    }))
+    .unwrap_or_else(|_| r#"{"status":"error","error":"Rust binding panic"}"#.to_string());
+    CString::new(response)
+        .expect("serialized JSON never contains an interior NUL")
+        .into_raw()
+}
+
 /// Release a response returned by [`qmbed_run_json`].
 ///
 /// # Safety
@@ -400,7 +662,7 @@ pub unsafe extern "C" fn qmbed_string_free(response: *mut c_char) {
 mod tests {
     use serde_json::Value;
 
-    use super::run_json;
+    use super::{run_command_json, run_json};
 
     #[test]
     fn typed_json_request_reaches_the_rust_solver() {
@@ -420,5 +682,39 @@ mod tests {
         assert_eq!(response["status"], "ok");
         assert_eq!(response["result"]["dimension"], 4);
         assert!((response["result"]["eigenvalues"][0].as_f64().unwrap() + 0.75).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn command_protocol_reuses_one_model_shape_for_basis_operator_and_eigh() {
+        let basis = r#"{"kind":"boson","sites":1,"states_per_site":4}"#;
+        let terms = r#"[
+            {"product":{"local":["raising"]},"couplings":[{"coefficient":[1.0,0.0],"sites":[0]}]},
+            {"product":{"local":["lowering"]},"couplings":[{"coefficient":[1.0,0.0],"sites":[0]}]},
+            {"product":{"local":["number"]},"couplings":[{"coefficient":[0.25,0.0],"sites":[0]}]}
+        ]"#;
+
+        let describe = run_command_json(&format!(
+            r#"{{"operation":"describe_basis","basis":{basis}}}"#
+        ));
+        let describe: Value = serde_json::from_str(&describe).unwrap();
+        assert_eq!(describe["status"], "ok");
+        assert_eq!(describe["result"]["dimension"], 4);
+        assert_eq!(describe["result"]["states"][3], "3");
+
+        let materialize = run_command_json(&format!(
+            r#"{{"operation":"materialize","basis":{basis},"terms":{terms},"format":"csc"}}"#
+        ));
+        let materialize: Value = serde_json::from_str(&materialize).unwrap();
+        assert_eq!(materialize["status"], "ok");
+        assert_eq!(materialize["result"]["shape"], serde_json::json!([4, 4]));
+        assert_eq!(materialize["result"]["entries"].as_array().unwrap().len(), 9);
+
+        let eigh = run_command_json(&format!(
+            r#"{{"operation":"eigh","basis":{basis},"terms":{terms}}}"#
+        ));
+        let eigh: Value = serde_json::from_str(&eigh).unwrap();
+        assert_eq!(eigh["status"], "ok");
+        assert_eq!(eigh["result"]["eigenvalues"].as_array().unwrap().len(), 4);
+        assert!(eigh["result"].get("eigenvectors").is_none());
     }
 }

@@ -188,6 +188,54 @@ impl OperatorTerm {
         &self.couplings
     }
 
+    /// Return the same local action after a bijective site relabeling.
+    ///
+    /// `permutation[old_site]` is the site used by the returned term. This
+    /// keeps frontend indexing conventions and lattice embeddings outside the
+    /// universal assembler.
+    pub fn with_site_permutation(&self, permutation: &[usize]) -> Result<Self> {
+        if permutation.iter().any(|&site| site >= permutation.len()) {
+            return Err(QmbedError::InvalidSite {
+                site: permutation
+                    .iter()
+                    .copied()
+                    .find(|&site| site >= permutation.len())
+                    .unwrap_or(permutation.len()),
+                sites: permutation.len(),
+            });
+        }
+        let unique = permutation
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique.len() != permutation.len() {
+            return Err(QmbedError::InvalidOptions(
+                "site permutation must be bijective".into(),
+            ));
+        }
+        let couplings = self
+            .couplings
+            .iter()
+            .map(|coupling| {
+                let sites = coupling
+                    .sites
+                    .iter()
+                    .map(|&site| {
+                        permutation
+                            .get(site)
+                            .copied()
+                            .ok_or(QmbedError::InvalidSite {
+                                site,
+                                sites: permutation.len(),
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Coupling::new(coupling.coefficient, sites))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_product(self.product.clone(), couplings)
+    }
+
     pub(crate) fn symbols(&self) -> &[char] {
         self.product.symbols()
     }

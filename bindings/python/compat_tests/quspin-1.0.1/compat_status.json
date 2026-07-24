@@ -1,5 +1,7 @@
 {
   "passing": [
+    "test/test_boson_vs_ho.py",
+    "test/test_higher_spin.py",
     "test/test_version.py"
   ],
   "schema_version": 1,
@@ -23,7 +25,6 @@
     "test/test_basis_entropy_sparse.py",
     "test/test_basis_particle_sectors.py",
     "test/test_block_tools.py",
-    "test/test_boson_vs_ho.py",
     "test/test_boson_vs_spin.py",
     "test/test_diag_ensemble.py",
     "test/test_ent_basis_vs_tools.py",
@@ -40,7 +41,6 @@
     "test/test_get_amp.py",
     "test/test_ham_project_to.py",
     "test/test_hamiltonian.py",
-    "test/test_higher_spin.py",
     "test/test_inplace_op.py",
     "test/test_local_entropy.py",
     "test/test_mean_level_spacing.py",

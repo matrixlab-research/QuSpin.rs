@@ -42,14 +42,15 @@ def _library_path() -> Path:
     )
 
 
-def run(request: dict[str, Any]) -> dict[str, Any]:
+def _call_json(symbol: str, request: dict[str, Any]) -> dict[str, Any]:
     library = ctypes.CDLL(str(_library_path()))
-    library.qmbed_run_json.argtypes = [ctypes.c_char_p]
-    library.qmbed_run_json.restype = ctypes.c_void_p
+    function = getattr(library, symbol)
+    function.argtypes = [ctypes.c_char_p]
+    function.restype = ctypes.c_void_p
     library.qmbed_string_free.argtypes = [ctypes.c_void_p]
     library.qmbed_string_free.restype = None
     encoded = json.dumps(request, separators=(",", ":")).encode()
-    pointer = library.qmbed_run_json(encoded)
+    pointer = function(encoded)
     if not pointer:
         raise QmbedError("QMBED returned a null response")
     try:
@@ -59,3 +60,11 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
     if response.get("status") != "ok":
         raise QmbedError(response.get("error", "unknown QMBED error"))
     return response["result"]
+
+
+def run(request: dict[str, Any]) -> dict[str, Any]:
+    return _call_json("qmbed_run_json", request)
+
+
+def command(request: dict[str, Any]) -> dict[str, Any]:
+    return _call_json("qmbed_command_json", request)
