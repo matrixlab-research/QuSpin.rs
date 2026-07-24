@@ -3,6 +3,7 @@ use std::sync::Arc;
 use approx::assert_abs_diff_eq;
 use qmbed::Complex64;
 use qmbed::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
+use qmbed::runtime::{CpuRuntime, ExecutionProfile};
 use qmbed::solve::{
     EigshOptions, ExpmMultiplyParallel, ExpmOptions, LanczosOptions, ShiftInvertPlan,
     SpectrumTarget, eigsh, expm_multiply, ftlm_observable_iteration, ftlm_static_iteration,
@@ -251,11 +252,15 @@ fn reusable_exponential_plan_supports_batches_and_coefficient_updates() {
     );
     let mut plan =
         ExpmMultiplyParallel::new(generator, Complex64::new(0.25, 0.0), 32, 1.0e-14, 100).unwrap();
+    let inputs = [
+        vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
+        vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
+    ];
     let batch = plan
-        .apply_batch(&[
-            vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)],
-            vec![Complex64::new(0.0, 0.0), Complex64::new(1.0, 0.0)],
-        ])
+        .apply_batch_with_runtime(
+            &CpuRuntime::from_profile(ExecutionProfile::throughput(4)).unwrap(),
+            &inputs,
+        )
         .unwrap();
     assert_abs_diff_eq!(batch[0][0].re, 0.25_f64.cos(), epsilon = 1.0e-13);
     assert_abs_diff_eq!(batch[0][1].re, 0.25_f64.sin(), epsilon = 1.0e-13);

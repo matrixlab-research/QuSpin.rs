@@ -1,3 +1,5 @@
 /target/
 Cargo.lock
 *.profraw
+__pycache__/
+*.py[cod]
