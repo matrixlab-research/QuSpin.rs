@@ -58,6 +58,11 @@ QuSpin operator strings remain accepted by `OperatorTerm::new` and by the
 explicit functions in `qmbed::compat::quspin`. They are parsed once into the
 same `OpProduct` used above; they do not select a second assembler.
 
+Thin [Python and Julia bindings](bindings/README.md) construct the same typed
+request through a shared C ABI. Their compatibility namespaces
+(`qmbed.compat.quspin` and `QMBED.Compat.QuSpin`) translate legacy operator
+strings before crossing that boundary.
+
 The same `OperatorBuilder::between(source, target)` path constructs a
 rectangular probe between particle-number or symmetry sectors. The same
 operator can be converted among stored formats or consumed matrix-free by
