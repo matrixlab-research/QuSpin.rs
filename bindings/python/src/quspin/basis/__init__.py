@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from fractions import Fraction
 from functools import cached_property
 from typing import Any
 
 import numpy as np
+import scipy.sparse as sp
 
-from qmbed._ffi import NativeModel
+from qmbed._ffi import NativeModel, command
 from qmbed.compat.quspin import operator_term
 from qmbed.model import Coupling
 
@@ -132,10 +134,6 @@ def _one_dimensional_symmetries(
     if parity is not None:
         if parity not in (-1, 1):
             raise ValueError("pblock must be either -1 or +1")
-        if momentum is not None:
-            normalized = int(momentum) % sites
-            if normalized != 0 and 2 * normalized != sites:
-                raise ValueError("parity can accompany momentum only at k=0 or k=pi")
         reflection = np.arange(sites)[::-1]
         blocks["parity"] = (reflection, 0 if parity == 1 else 1)
     return _general_symmetries(
@@ -179,6 +177,14 @@ class _PackedBasis:
             dtype=object,
         )
 
+    @property
+    def blocks(self) -> dict[str, Any]:
+        return {
+            name: value
+            for name, value in self._request.items()
+            if name in {"momentum", "parity", "symmetries"} and value not in (None, [])
+        }
+
     def __len__(self) -> int:
         return self.Ns
 
@@ -188,6 +194,143 @@ class _PackedBasis:
     @property
     def _site_permutation(self) -> list[int]:
         return list(range(self.N - 1, -1, -1))
+
+    def _new_empty_model(self, request: dict[str, Any]) -> NativeModel:
+        return NativeModel(
+            {
+                "basis": request,
+                "terms": [],
+                "site_permutation": self._site_permutation,
+                "checks": {
+                    "hermiticity": False,
+                    "particle_conservation": False,
+                    "symmetry_compatibility": False,
+                },
+            }
+        )
+
+    def _parent_request(self, *, pcon: bool) -> dict[str, Any]:
+        request = deepcopy(self._request)
+        request["symmetries"] = []
+        if request["kind"] == "spin":
+            request["momentum"] = None
+            request["parity"] = None
+            if not pcon:
+                request["up"] = None
+        elif request["kind"] == "boson":
+            if not pcon:
+                request["particles"] = None
+        elif request["kind"] == "spinless_fermion":
+            request["momentum"] = None
+            if not pcon:
+                request["particles"] = None
+        elif request["kind"] == "spinful_fermion" and not pcon:
+            request["particles_up"] = None
+            request["particles_down"] = None
+        return request
+
+    @cached_property
+    def _full_parent_model(self) -> NativeModel:
+        return self._new_empty_model(self._parent_request(pcon=False))
+
+    @cached_property
+    def _particle_parent_model(self) -> NativeModel:
+        return self._new_empty_model(self._parent_request(pcon=True))
+
+    def _parent_model(self, *, pcon: bool) -> NativeModel:
+        return self._particle_parent_model if pcon else self._full_parent_model
+
+    @staticmethod
+    def _complex_vectors(array: np.ndarray) -> list[list[list[float]]]:
+        columns = int(np.prod(array.shape[1:], dtype=np.intp)) if array.ndim > 1 else 1
+        matrix = array.reshape((array.shape[0], columns))
+        return [
+            [[complex(value).real, complex(value).imag] for value in matrix[:, column]]
+            for column in range(matrix.shape[1])
+        ]
+
+    @staticmethod
+    def _vectors_from_result(result: dict[str, Any]) -> np.ndarray:
+        return np.column_stack(
+            [
+                np.asarray([complex(*value) for value in vector])
+                for vector in result["vectors"]
+            ]
+        )
+
+    def get_proj(self, dtype, pcon: bool = False):
+        parent = self._parent_model(pcon=bool(pcon))
+        result = self._model.execute(
+            "projector_model",
+            parent_handle=parent.handle,
+        )
+        entries = result["entries"]
+        values = self._values_for_dtype(
+            [complex(*entry["value"]) for entry in entries],
+            dtype,
+        )
+        rows = np.asarray([entry["row"] for entry in entries], dtype=np.intp)
+        columns = np.asarray([entry["column"] for entry in entries], dtype=np.intp)
+        return sp.csc_matrix(
+            (values, (rows, columns)),
+            shape=tuple(result["shape"]),
+            dtype=np.dtype(dtype),
+        )
+
+    def _apply_projector(self, vectors, *, pcon: bool, action: str) -> np.ndarray:
+        array = np.asanyarray(vectors)
+        expected = self.Ns if action == "lift" else self._parent_model(pcon=pcon).dimension
+        if array.ndim == 0 or array.shape[0] != expected:
+            raise ValueError("dimension mismatch")
+        result_dtype = np.result_type(array.dtype, np.complex128)
+        array = array.astype(result_dtype, order="C", copy=False)
+        parent = self._parent_model(pcon=pcon)
+        result = self._model.execute(
+            "apply_projector_model",
+            parent_handle=parent.handle,
+            vectors=self._complex_vectors(array),
+            action=action,
+        )
+        output = self._vectors_from_result(result)
+        output = self._values_for_dtype(output, result_dtype)
+        shape = (int(result["dimension"]), *array.shape[1:])
+        return output.reshape(shape)
+
+    def project_from(self, v0, sparse: bool = True, pcon: bool = False):
+        output = self._apply_projector(v0, pcon=bool(pcon), action="lift")
+        return sp.csc_matrix(output.reshape((output.shape[0], -1))) if sparse else output
+
+    def get_vec(self, v0, sparse: bool = True, pcon: bool = False):
+        return self.project_from(v0, sparse=sparse, pcon=pcon)
+
+    def project_to(self, v0, sparse: bool = True, pcon: bool = False):
+        output = self._apply_projector(v0, pcon=bool(pcon), action="project")
+        return sp.csc_matrix(output.reshape((output.shape[0], -1))) if sparse else output
+
+    def Op_shift_sector(self, other_basis, op_list, v_in):
+        if not isinstance(other_basis, _PackedBasis):
+            raise TypeError("other_basis must be a QMBED-backed basis")
+        input_array = np.asanyarray(v_in)
+        if input_array.ndim == 0 or input_array.shape[0] != other_basis.Ns:
+            raise ValueError("dimension mismatch")
+        result_dtype = np.result_type(input_array.dtype, np.complex128)
+        input_array = input_array.astype(result_dtype, order="C", copy=False)
+        terms = [
+            self._term_request(opstr, indx, coefficient)
+            for opstr, indx, coefficient in op_list
+        ]
+        result = command(
+            {
+                "operation": "apply_terms_between_models",
+                "source_handle": other_basis._model.handle,
+                "target_handle": self._model.handle,
+                "terms": terms,
+                "vectors": self._complex_vectors(input_array),
+            }
+        )
+        output = self._vectors_from_result(result)
+        output = self._values_for_dtype(output, result_dtype)
+        return output.reshape((self.Ns, *input_array.shape[1:]))
 
     def expanded_form(self, static, dynamic):
         return static, dynamic
@@ -265,22 +408,14 @@ class _PackedBasis:
             self._term_request(opstr, indx, a * coefficient)
             for opstr, indx, coefficient in op_list
         ]
-        vectors = [
-            [[complex(value).real, complex(value).imag] for value in input_matrix[:, column]]
-            for column in range(input_matrix.shape[1])
-        ]
+        vectors = self._complex_vectors(input_matrix)
         result = self._model.execute(
             "apply_terms_model",
             terms=terms,
             vectors=vectors,
             action=action,
         )
-        applied = np.column_stack(
-            [
-                np.asarray([complex(*value) for value in vector])
-                for vector in result["vectors"]
-            ]
-        )
+        applied = self._vectors_from_result(result)
         applied = self._values_for_dtype(applied, result_dtype).reshape(input_array.shape)
 
         if v_out is None:

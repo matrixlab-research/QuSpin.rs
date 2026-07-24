@@ -25,6 +25,15 @@ cover normal, transpose, conjugate, and adjoint forms. These commands are the
 language-neutral protocol behind Python `dot`, `Op`, `inplace_Op`, and
 `Op_bra_ket`; none materializes a dense matrix.
 
+Cross-basis operations keep both bases alive as explicit handles.
+`projector_model` exports the sparse isometry from a reduced model into a
+caller-selected parent, while `apply_projector_model` performs batched lift or
+projection. `apply_terms_between_models` streams typed terms directly from a
+source sector into a target sector. This is the common Rust capability behind
+Python `get_proj`, `project_from`, `project_to`, `get_vec`, and
+`Op_shift_sector`; `pcon` only chooses which explicit parent model the Python
+adapter requests.
+
 - `python/` exposes the native `qmbed` module and the versioned
   `qmbed.compat.quspin` migration surface.
 - `julia/` exposes only the native `QMBED` API.

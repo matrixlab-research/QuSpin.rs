@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use num_complex::Complex64;
 
-use crate::basis::{Basis, PackedBasis};
+use crate::basis::{Basis, BasisProjector, PackedBasis};
 use crate::operator::{
     AssemblyChecks, BraKetTransition, LinearOperator, MatrixFormat, Operator, OperatorBuilder,
-    OperatorSpec,
+    OperatorSpec, apply_sector_shift,
 };
 use crate::solve::{Eigensystem, EighOptions, EigshOptions, eigh_with_options, eigsh};
 use crate::{QmbedError, Result};
@@ -88,6 +88,55 @@ impl PackedEdModel {
     pub fn states(&self) -> Result<Vec<u128>> {
         (0..self.basis.len())
             .map(|index| self.basis.state(index))
+            .collect()
+    }
+
+    /// Build the sparse isometry from this model's basis into an explicit
+    /// parent model's basis.
+    ///
+    /// The parent is deliberately explicit: frontends may choose either a
+    /// particle-conserving parent or the unrestricted physical Hilbert space
+    /// without encoding either policy in the Rust core.
+    pub fn projector_to(&self, parent: &Self) -> Result<BasisProjector> {
+        self.ensure_same_site_convention(parent)?;
+        BasisProjector::between(&self.basis, &parent.basis)
+    }
+
+    /// Lift a batch of reduced-space vectors into an explicit parent model.
+    pub fn lift_to_batch(
+        &self,
+        parent: &Self,
+        vectors: &[Vec<Complex64>],
+    ) -> Result<Vec<Vec<Complex64>>> {
+        self.projector_to(parent)?.lift_batch(vectors)
+    }
+
+    /// Project a batch of parent-space vectors into this model's basis.
+    pub fn project_from_batch(
+        &self,
+        parent: &Self,
+        vectors: &[Vec<Complex64>],
+    ) -> Result<Vec<Vec<Complex64>>> {
+        self.projector_to(parent)?.project_batch(vectors)
+    }
+
+    /// Apply temporary terms directly from a source model into this target
+    /// model without materializing either physical parent space.
+    pub fn apply_terms_from_batch(
+        &self,
+        source: &Self,
+        terms: impl IntoIterator<Item = OperatorSpec>,
+        inputs: &[Vec<Complex64>],
+    ) -> Result<Vec<Vec<Complex64>>> {
+        self.ensure_same_site_convention(source)?;
+        let terms = self.prepare_terms(terms)?;
+        inputs
+            .iter()
+            .map(|input| {
+                let mut output = vec![Complex64::new(0.0, 0.0); self.dimension()];
+                apply_sector_shift(&source.basis, &self.basis, &terms, input, &mut output)?;
+                Ok(output)
+            })
             .collect()
     }
 
@@ -225,6 +274,15 @@ impl PackedEdModel {
                 .collect(),
             None => Ok(terms.collect()),
         }
+    }
+
+    fn ensure_same_site_convention(&self, other: &Self) -> Result<()> {
+        if self.site_permutation != other.site_permutation {
+            return Err(QmbedError::InvalidOptions(
+                "models must use the same site permutation for cross-basis operations".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

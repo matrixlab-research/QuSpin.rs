@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use qmbed::basis::{
-    Basis, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap, PackedBasis,
-    SpinBasis1D, SpinNormalization, SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetrySector,
+    Basis, BasisProjector, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap,
+    PackedBasis, SpinBasis1D, SpinNormalization, SpinfulFermionBasis1D, SpinlessFermionBasis1D,
+    SymmetrySector,
 };
 use qmbed::interop::{OperatorAction, PackedEdModel};
 use qmbed::operator::{
@@ -101,6 +102,23 @@ enum CommandRequest {
         handle: String,
         terms: Vec<TermRequest>,
         kets: Vec<String>,
+    },
+    ProjectorModel {
+        handle: String,
+        parent_handle: String,
+    },
+    ApplyProjectorModel {
+        handle: String,
+        parent_handle: String,
+        vectors: Vec<Vec<[f64; 2]>>,
+        #[serde(default)]
+        action: ProjectorActionRequest,
+    },
+    ApplyTermsBetweenModels {
+        source_handle: String,
+        target_handle: String,
+        terms: Vec<TermRequest>,
+        vectors: Vec<Vec<[f64; 2]>>,
     },
     EighModel {
         handle: String,
@@ -243,6 +261,14 @@ impl From<OperatorActionRequest> for OperatorAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProjectorActionRequest {
+    #[default]
+    Lift,
+    Project,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SpinNormalizationRequest {
@@ -315,9 +341,16 @@ enum CommandResult {
 
 static NEXT_MODEL_HANDLE: AtomicU64 = AtomicU64::new(1);
 static MODEL_REGISTRY: OnceLock<RwLock<HashMap<u64, Arc<PackedEdModel>>>> = OnceLock::new();
+type ProjectorKey = (u64, u64);
+type ProjectorCache = HashMap<ProjectorKey, Arc<BasisProjector>>;
+static PROJECTOR_REGISTRY: OnceLock<RwLock<ProjectorCache>> = OnceLock::new();
 
 fn model_registry() -> &'static RwLock<HashMap<u64, Arc<PackedEdModel>>> {
     MODEL_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn projector_registry() -> &'static RwLock<ProjectorCache> {
+    PROJECTOR_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn parse_model_handle(handle: &str) -> Result<u64> {
@@ -362,17 +395,44 @@ fn registered_model(handle: &str) -> Result<Arc<PackedEdModel>> {
         })
 }
 
+fn cached_projector(handle: &str, parent_handle: &str) -> Result<Arc<BasisProjector>> {
+    let handle = parse_model_handle(handle)?;
+    let parent_handle = parse_model_handle(parent_handle)?;
+    let models = model_registry()
+        .read()
+        .map_err(|_| QmbedError::InternalState("model registry lock is poisoned".into()))?;
+    let model = models.get(&handle).ok_or_else(|| {
+        QmbedError::InvalidOptions(format!("model handle {handle} is not registered"))
+    })?;
+    let parent = models.get(&parent_handle).ok_or_else(|| {
+        QmbedError::InvalidOptions(format!("model handle {parent_handle} is not registered"))
+    })?;
+    let mut projectors = projector_registry()
+        .write()
+        .map_err(|_| QmbedError::InternalState("projector cache lock is poisoned".into()))?;
+    if let Some(projector) = projectors.get(&(handle, parent_handle)) {
+        return Ok(Arc::clone(projector));
+    }
+    let projector = Arc::new(model.projector_to(parent)?);
+    projectors.insert((handle, parent_handle), Arc::clone(&projector));
+    Ok(projector)
+}
+
 fn release_model(handle: &str) -> Result<String> {
     let parsed = parse_model_handle(handle)?;
-    let removed = model_registry()
+    let mut models = model_registry()
         .write()
-        .map_err(|_| QmbedError::InternalState("model registry lock is poisoned".into()))?
-        .remove(&parsed);
+        .map_err(|_| QmbedError::InternalState("model registry lock is poisoned".into()))?;
+    let removed = models.remove(&parsed);
     if removed.is_none() {
         return Err(QmbedError::InvalidOptions(format!(
             "model handle {parsed} is not registered"
         )));
     }
+    projector_registry()
+        .write()
+        .map_err(|_| QmbedError::InternalState("projector cache lock is poisoned".into()))?
+        .retain(|&(reduced, parent), _| reduced != parsed && parent != parsed);
     Ok(parsed.to_string())
 }
 
@@ -837,7 +897,14 @@ fn complex_vectors(vectors: Vec<Vec<[f64; 2]>>) -> Vec<Vec<Complex64>> {
 }
 
 fn command_vectors(model: &PackedEdModel, vectors: Vec<Vec<Complex64>>) -> CommandResult {
-    let dimension = vectors.first().map_or(model.dimension(), Vec::len);
+    command_vectors_with_dimension(model.dimension(), vectors)
+}
+
+fn command_vectors_with_dimension(
+    default_dimension: usize,
+    vectors: Vec<Vec<Complex64>>,
+) -> CommandResult {
+    let dimension = vectors.first().map_or(default_dimension, Vec::len);
     CommandResult::Vectors {
         dimension,
         vectors: vectors
@@ -850,6 +917,83 @@ fn command_vectors(model: &PackedEdModel, vectors: Vec<Vec<Complex64>>) -> Comma
             })
             .collect(),
     }
+}
+
+fn command_projector(projector: &BasisProjector) -> Result<CommandResult> {
+    let entries = qmbed::operator::LinearOperator::stored_triplets(projector)?
+        .ok_or_else(|| QmbedError::InternalState("projector has no sparse entries".into()))?
+        .into_iter()
+        .map(|(row, column, value)| MatrixEntry {
+            row,
+            column,
+            value: [value.re, value.im],
+        })
+        .collect();
+    Ok(CommandResult::Operator {
+        shape: [projector.source_dimension(), projector.reduced_dimension()],
+        format: StorageFormat::Csc,
+        entries,
+    })
+}
+
+fn command_apply_projector(
+    projector: &BasisProjector,
+    vectors: Vec<Vec<[f64; 2]>>,
+    action: ProjectorActionRequest,
+) -> Result<CommandResult> {
+    let vectors = complex_vectors(vectors);
+    let (default_dimension, vectors) = match action {
+        ProjectorActionRequest::Lift => (
+            projector.source_dimension(),
+            projector.lift_batch(&vectors)?,
+        ),
+        ProjectorActionRequest::Project => (
+            projector.reduced_dimension(),
+            projector.project_batch(&vectors)?,
+        ),
+    };
+    Ok(command_vectors_with_dimension(default_dimension, vectors))
+}
+
+fn command_apply_terms_between(
+    source: &PackedEdModel,
+    target: &PackedEdModel,
+    terms: Vec<TermRequest>,
+    vectors: Vec<Vec<[f64; 2]>>,
+) -> Result<CommandResult> {
+    let terms = terms
+        .into_iter()
+        .map(typed_term)
+        .collect::<Result<Vec<_>>>()?;
+    let vectors = complex_vectors(vectors);
+    let vectors = target.apply_terms_from_batch(source, terms, &vectors)?;
+    Ok(command_vectors(target, vectors))
+}
+
+fn registered_projector(handle: &str, parent_handle: &str) -> Result<CommandResult> {
+    let projector = cached_projector(handle, parent_handle)?;
+    command_projector(&projector)
+}
+
+fn registered_projector_action(
+    handle: &str,
+    parent_handle: &str,
+    vectors: Vec<Vec<[f64; 2]>>,
+    action: ProjectorActionRequest,
+) -> Result<CommandResult> {
+    let projector = cached_projector(handle, parent_handle)?;
+    command_apply_projector(&projector, vectors, action)
+}
+
+fn registered_cross_sector_action(
+    source_handle: &str,
+    target_handle: &str,
+    terms: Vec<TermRequest>,
+    vectors: Vec<Vec<[f64; 2]>>,
+) -> Result<CommandResult> {
+    let source = registered_model(source_handle)?;
+    let target = registered_model(target_handle)?;
+    command_apply_terms_between(&source, &target, terms, vectors)
 }
 
 fn command_bra_ket_terms(
@@ -1035,6 +1179,22 @@ fn execute_registered_command(request: CommandRequest) -> Result<CommandResult> 
             let model = registered_model(&handle)?;
             command_bra_ket_terms(&model, terms, kets)
         }
+        CommandRequest::ProjectorModel {
+            handle,
+            parent_handle,
+        } => registered_projector(&handle, &parent_handle),
+        CommandRequest::ApplyProjectorModel {
+            handle,
+            parent_handle,
+            vectors,
+            action,
+        } => registered_projector_action(&handle, &parent_handle, vectors, action),
+        CommandRequest::ApplyTermsBetweenModels {
+            source_handle,
+            target_handle,
+            terms,
+            vectors,
+        } => registered_cross_sector_action(&source_handle, &target_handle, terms, vectors),
         CommandRequest::EighModel {
             handle,
             eigenvectors,
@@ -1184,9 +1344,10 @@ pub unsafe extern "C" fn qmbed_string_free(response: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use std::sync::Arc;
     use std::thread;
 
-    use super::{run_command_json, run_json};
+    use super::{cached_projector, run_command_json, run_json};
 
     #[test]
     fn typed_json_request_reaches_the_rust_solver() {
@@ -1439,5 +1600,77 @@ mod tests {
         ));
         let release: Value = serde_json::from_str(&release).unwrap();
         assert_eq!(release["status"], "ok");
+    }
+
+    #[test]
+    fn registered_models_share_projectors_and_cross_sector_actions() {
+        let source = run_command_json(
+            r#"{
+                "operation":"create_model",
+                "basis":{"kind":"spin","sites":3,"up":0,"reverse":true},
+                "terms":[],
+                "site_permutation":[2,1,0]
+            }"#,
+        );
+        let source: Value = serde_json::from_str(&source).unwrap();
+        let source_handle = source["result"]["handle"].as_str().unwrap();
+        let target = run_command_json(
+            r#"{
+                "operation":"create_model",
+                "basis":{"kind":"spin","sites":3,"up":1,"reverse":true},
+                "terms":[],
+                "site_permutation":[2,1,0]
+            }"#,
+        );
+        let target: Value = serde_json::from_str(&target).unwrap();
+        let target_handle = target["result"]["handle"].as_str().unwrap();
+        let parent = run_command_json(
+            r#"{
+                "operation":"create_model",
+                "basis":{"kind":"spin","sites":3,"reverse":true},
+                "terms":[],
+                "site_permutation":[2,1,0]
+            }"#,
+        );
+        let parent: Value = serde_json::from_str(&parent).unwrap();
+        let parent_handle = parent["result"]["handle"].as_str().unwrap();
+        let first_projector = cached_projector(target_handle, parent_handle).unwrap();
+        let second_projector = cached_projector(target_handle, parent_handle).unwrap();
+        assert!(Arc::ptr_eq(&first_projector, &second_projector));
+
+        let projector = run_command_json(&format!(
+            r#"{{
+                "operation":"projector_model",
+                "handle":"{target_handle}",
+                "parent_handle":"{parent_handle}"
+            }}"#
+        ));
+        let projector: Value = serde_json::from_str(&projector).unwrap();
+        assert_eq!(projector["status"], "ok");
+        assert_eq!(projector["result"]["shape"], serde_json::json!([8, 3]));
+        assert_eq!(projector["result"]["entries"].as_array().unwrap().len(), 3);
+
+        let shifted = run_command_json(&format!(
+            r#"{{
+                "operation":"apply_terms_between_models",
+                "source_handle":"{source_handle}",
+                "target_handle":"{target_handle}",
+                "terms":[{{
+                    "product":{{"local":["raising"]}},
+                    "couplings":[{{"coefficient":[2.0,0.0],"sites":[0]}}]
+                }}],
+                "vectors":[[[1.0,0.0]]]
+            }}"#
+        ));
+        let shifted: Value = serde_json::from_str(&shifted).unwrap();
+        assert_eq!(shifted["status"], "ok");
+        assert_eq!(shifted["result"]["dimension"], 3);
+        let nonzero = shifted["result"]["vectors"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value[0].as_f64().unwrap().abs() > f64::EPSILON)
+            .count();
+        assert_eq!(nonzero, 1);
     }
 }

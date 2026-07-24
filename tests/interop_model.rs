@@ -1,6 +1,9 @@
 use approx::assert_abs_diff_eq;
 use qmbed::Complex64;
-use qmbed::basis::{Basis, BosonBasis1D, PackedBasis, SpinBasis1D, SpinNormalization};
+use qmbed::basis::{
+    Basis, BosonBasis1D, GeneralBasis, LatticeSymmetryMap, PackedBasis, SpinBasis1D,
+    SpinNormalization, SymmetrySector,
+};
 use qmbed::interop::{OperatorAction, PackedEdModel};
 use qmbed::operator::{
     AssemblyChecks, Coupling, LinearOperator, LocalOperator, MatrixFormat, OpProduct,
@@ -266,4 +269,89 @@ fn temporary_terms_and_bra_ket_share_the_models_site_convention() {
     let invalid = PackedEdModel::new(SpinBasis1D::builder(2).build().unwrap(), std::iter::empty())
         .with_site_permutation(&[0, 0]);
     assert!(invalid.is_err());
+}
+
+#[test]
+fn packed_models_project_between_explicit_parent_spaces() {
+    let translation = LatticeSymmetryMap::site_permutation(2, vec![1, 2, 3, 0]).unwrap();
+    let reduced = GeneralBasis::new(
+        SpinBasis1D::builder(4).up(2).build().unwrap(),
+        SymmetrySector::new().with_map(translation, 1),
+    )
+    .unwrap();
+    let reduced = PackedEdModel::new(reduced, []);
+    let fixed_parent = PackedEdModel::new(SpinBasis1D::builder(4).up(2).build().unwrap(), []);
+    let full_parent = PackedEdModel::new(SpinBasis1D::builder(4).build().unwrap(), []);
+    let vectors = vec![vec![Complex64::new(0.25, -0.5); reduced.dimension()]];
+
+    let fixed_lifted = reduced.lift_to_batch(&fixed_parent, &vectors).unwrap();
+    let full_lifted = reduced.lift_to_batch(&full_parent, &vectors).unwrap();
+    assert_eq!(fixed_lifted[0].len(), 6);
+    assert_eq!(full_lifted[0].len(), 16);
+    assert_eq!(
+        reduced
+            .project_from_batch(&fixed_parent, &fixed_lifted)
+            .unwrap(),
+        vectors
+    );
+    assert_eq!(
+        reduced
+            .project_from_batch(&full_parent, &full_lifted)
+            .unwrap(),
+        vectors
+    );
+}
+
+#[test]
+fn packed_models_apply_terms_directly_between_sectors() {
+    let source = PackedEdModel::new(
+        PackedBasis::from(SpinBasis1D::builder(3).up(0).build().unwrap()).reversed(),
+        [],
+    )
+    .with_site_permutation(&[2, 1, 0])
+    .unwrap();
+    let target = PackedEdModel::new(
+        PackedBasis::from(SpinBasis1D::builder(3).up(1).build().unwrap()).reversed(),
+        [],
+    )
+    .with_site_permutation(&[2, 1, 0])
+    .unwrap();
+    let term = OperatorSpec::from_product(
+        OpProduct::new([LocalOperator::Raising]).unwrap(),
+        [Coupling::new(2.0, vec![0])],
+    )
+    .unwrap();
+    let actual = target
+        .apply_terms_from_batch(&source, [term], &[vec![Complex64::new(1.0, 0.0)]])
+        .unwrap();
+
+    assert_eq!(actual[0].len(), 3);
+    assert_eq!(
+        actual[0]
+            .iter()
+            .filter(|value| value.norm() > f64::EPSILON)
+            .count(),
+        1
+    );
+    assert_eq!(
+        actual[0]
+            .iter()
+            .copied()
+            .find(|value| value.norm() > f64::EPSILON)
+            .unwrap(),
+        Complex64::new(2.0, 0.0)
+    );
+}
+
+#[test]
+fn packed_spin_basis_can_represent_an_empty_symmetry_sector() {
+    let basis = SpinBasis1D::builder(4)
+        .momentum(0)
+        .parity(-1)
+        .build()
+        .unwrap();
+    let model = PackedEdModel::new(basis, []);
+
+    assert_eq!(model.dimension(), 0);
+    assert!(model.states().unwrap().is_empty());
 }

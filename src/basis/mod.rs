@@ -514,11 +514,6 @@ fn spin_symmetry_sector(
     }
 
     sectors.sort_by_key(|(representative, _)| *representative);
-    if sectors.is_empty() {
-        return Err(QmbedError::InvalidSector(
-            "the requested symmetry sector is empty".into(),
-        ));
-    }
     let (states, orbit_sizes) = sectors.into_iter().unzip();
     Ok((states, orbit_sizes, lookup, normalized_momentum, parity))
 }
@@ -1009,9 +1004,6 @@ impl SpinBasisBuilder {
             self.momentum,
             self.parity,
         )?;
-        if states.is_empty() {
-            return Err(QmbedError::InvalidSector("empty spin sector".into()));
-        }
         Ok(SpinBasis1D {
             sites: self.sites,
             spin_twice: self.spin_twice,
@@ -3747,21 +3739,34 @@ impl BasisProjector {
         Self::from_columns(parent.len(), columns)
     }
 
+    /// Isometric lift from any basis into an explicitly selected parent basis.
+    ///
+    /// The reduced basis owns the symmetry-reduction convention through
+    /// [`Basis::index_transition`]. Iterating the explicit parent states makes
+    /// this equally useful for built-in and runtime symmetry sectors, fixed
+    /// particle subspaces, and unrestricted parent spaces.
+    pub fn between<Reduced, Parent>(reduced: &Reduced, parent: &Parent) -> Result<Self>
+    where
+        Reduced: Basis,
+        Parent: Basis<State = Reduced::State>,
+    {
+        let mut columns = vec![Vec::<(usize, Complex64)>::new(); reduced.len()];
+        for row in 0..parent.len() {
+            let state = parent.state(row)?;
+            let Some((column, reduction_amplitude)) = reduced.index_transition(state, 1)? else {
+                continue;
+            };
+            columns[column].push((row, reduction_amplitude.conj()));
+        }
+        Self::from_columns(parent.len(), columns)
+    }
+
     pub fn from_general<Parent>(basis: &GeneralBasis<Parent>) -> Result<Self>
     where
         Parent: Basis,
         Parent::State: Hash + Ord + 'static,
     {
-        let mut by_column = vec![Vec::<(usize, Complex64)>::new(); basis.len()];
-        for row in 0..basis.parent.len() {
-            let state = basis.parent.state(row)?;
-            let Some(image) = basis.lookup.get(&state) else {
-                continue;
-            };
-            let column = basis.index(image.representative)?;
-            by_column[column].push((row, image.phase / (image.orbit_size as f64).sqrt()));
-        }
-        Self::from_columns(basis.parent.len(), by_column)
+        Self::between(basis, &basis.parent)
     }
 
     pub const fn source_dimension(&self) -> usize {

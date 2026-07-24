@@ -196,6 +196,50 @@ class QmbedBindingTests(unittest.TestCase):
         np.testing.assert_allclose(pauli_x, 2.0 * spin_x)
         np.testing.assert_allclose(cartesian_x, 2.0 * spin_x)
 
+    def test_projection_uses_explicit_full_and_particle_parent_models(self):
+        sites = 4
+        translation = (np.arange(sites) + 1) % sites
+        basis = spin_basis_general(
+            sites,
+            Nup=2,
+            pauli=False,
+            translation=(translation, 1),
+        )
+        reduced = np.arange(1, basis.Ns + 1, dtype=np.complex128)
+
+        full_projector = basis.get_proj(np.complex128)
+        particle_projector = basis.get_proj(np.complex128, pcon=True)
+        self.assertEqual(full_projector.shape, (2**sites, basis.Ns))
+        self.assertEqual(particle_projector.shape, (6, basis.Ns))
+        np.testing.assert_allclose(
+            basis.project_from(reduced, sparse=False),
+            full_projector.dot(reduced),
+            atol=1.0e-12,
+        )
+        np.testing.assert_allclose(
+            basis.project_from(reduced, sparse=False, pcon=True),
+            particle_projector.dot(reduced),
+            atol=1.0e-12,
+        )
+        np.testing.assert_allclose(
+            basis.project_to(full_projector.dot(reduced), sparse=False),
+            reduced,
+            atol=1.0e-12,
+        )
+
+    def test_sector_shift_runs_directly_between_persistent_models(self):
+        source = spin_basis_general(3, Nup=0, pauli=False)
+        target = spin_basis_general(3, Nup=1, pauli=False)
+        output = target.Op_shift_sector(
+            source,
+            [["+", [0], 2.0]],
+            np.asarray([1.0], dtype=np.complex128),
+        )
+
+        self.assertEqual(output.shape, (target.Ns,))
+        self.assertEqual(np.count_nonzero(np.abs(output) > 1.0e-14), 1)
+        np.testing.assert_allclose(np.linalg.norm(output), 2.0, atol=1.0e-12)
+
 
 if __name__ == "__main__":
     unittest.main()
