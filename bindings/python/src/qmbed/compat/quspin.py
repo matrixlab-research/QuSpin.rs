@@ -11,6 +11,8 @@ from ..model import (
     eigsh as native_eigsh,
 )
 
+TARGET_QUSPIN_VERSION = "1.0.1"
+
 _SYMBOLS = {
     "I": LocalOperator.IDENTITY,
     "n": LocalOperator.NUMBER,
@@ -43,7 +45,9 @@ def terms_from_static(static: Iterable[Sequence]) -> tuple[OperatorSpec, ...]:
     for operator, coupling_rows in static:
         couplings = []
         for coefficient, *sites in coupling_rows:
-            couplings.append(Coupling(complex(coefficient), tuple(sites)))
+            couplings.append(
+                Coupling(complex(coefficient), tuple(int(site) for site in sites))
+            )
         terms.append(operator_term(operator, couplings))
     return tuple(terms)
 

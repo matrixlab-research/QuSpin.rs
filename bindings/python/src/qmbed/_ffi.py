@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ctypes
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
 import sys
 from typing import Any
+import weakref
 
 
 class QmbedError(RuntimeError):
@@ -42,14 +44,28 @@ def _library_path() -> Path:
     )
 
 
-def run(request: dict[str, Any]) -> dict[str, Any]:
-    library = ctypes.CDLL(str(_library_path()))
-    library.qmbed_run_json.argtypes = [ctypes.c_char_p]
-    library.qmbed_run_json.restype = ctypes.c_void_p
+@lru_cache(maxsize=None)
+def _load_library(path: str) -> ctypes.CDLL:
+    library = ctypes.CDLL(path)
+    for symbol in ("qmbed_run_json", "qmbed_command_json"):
+        function = getattr(library, symbol)
+        function.argtypes = [ctypes.c_char_p]
+        function.restype = ctypes.c_void_p
     library.qmbed_string_free.argtypes = [ctypes.c_void_p]
     library.qmbed_string_free.restype = None
+    return library
+
+
+def _call_json(
+    symbol: str,
+    request: dict[str, Any],
+    *,
+    library_path: str | None = None,
+) -> dict[str, Any]:
+    library = _load_library(library_path or str(_library_path()))
+    function = getattr(library, symbol)
     encoded = json.dumps(request, separators=(",", ":")).encode()
-    pointer = library.qmbed_run_json(encoded)
+    pointer = function(encoded)
     if not pointer:
         raise QmbedError("QMBED returned a null response")
     try:
@@ -59,3 +75,82 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
     if response.get("status") != "ok":
         raise QmbedError(response.get("error", "unknown QMBED error"))
     return response["result"]
+
+
+def run(request: dict[str, Any]) -> dict[str, Any]:
+    return _call_json("qmbed_run_json", request)
+
+
+def command(request: dict[str, Any]) -> dict[str, Any]:
+    return _call_json("qmbed_command_json", request)
+
+
+def _release_model_noexcept(library_path: str, handle: str) -> None:
+    try:
+        _call_json(
+            "qmbed_command_json",
+            {"operation": "release_model", "handle": handle},
+            library_path=library_path,
+        )
+    except Exception:
+        # Finalizers may run while Python is tearing down modules. Explicit
+        # close() still reports native lifecycle errors to the caller.
+        pass
+
+
+class NativeModel:
+    """Owned reference to one persistent Rust ED model."""
+
+    def __init__(self, request: dict[str, Any]):
+        self._library_path = str(_library_path())
+        result = _call_json(
+            "qmbed_command_json",
+            {"operation": "create_model", **request},
+            library_path=self._library_path,
+        )
+        self._handle: str | None = str(result["handle"])
+        self.dimension = int(result["dimension"])
+        self._finalizer = weakref.finalize(
+            self,
+            _release_model_noexcept,
+            self._library_path,
+            self._handle,
+        )
+
+    @property
+    def handle(self) -> str:
+        if self._handle is None:
+            raise QmbedError("QMBED model is closed")
+        return self._handle
+
+    @property
+    def closed(self) -> bool:
+        return self._handle is None
+
+    def execute(self, operation: str, **options: Any) -> dict[str, Any]:
+        return _call_json(
+            "qmbed_command_json",
+            {
+                "operation": operation,
+                "handle": self.handle,
+                **options,
+            },
+            library_path=self._library_path,
+        )
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        _call_json(
+            "qmbed_command_json",
+            {"operation": "release_model", "handle": self._handle},
+            library_path=self._library_path,
+        )
+        self._handle = None
+        self._finalizer.detach()
+
+    def __enter__(self) -> NativeModel:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
