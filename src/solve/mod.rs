@@ -8,7 +8,7 @@ use crate::operator::{
     ExpOp, LinearOperator, MatrixFormat, ShiftedLinearSolver, TimeDependentOperator,
     materialize_dense,
 };
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 /// Reusable exponential-action plan for vectors and batches.
 #[derive(Clone, Debug)]
@@ -54,7 +54,7 @@ impl ExpmMultiplyParallel {
             .iter()
             .map(|state| {
                 if state.len() != dimension {
-                    return Err(QuSpinError::DimensionMismatch(
+                    return Err(QmbedError::DimensionMismatch(
                         "exponential batch column has the wrong length".into(),
                     ));
                 }
@@ -114,12 +114,12 @@ impl EigshOptions {
 
     fn validate(&self, dimension: usize) -> Result<()> {
         if self.eigenpairs == 0 || self.eigenpairs >= dimension {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "eigenpairs must be positive and smaller than the operator dimension".into(),
             ));
         }
         if !self.tolerance.is_finite() || self.tolerance <= 0.0 || self.max_iterations == 0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "tolerance and max_iterations must be positive".into(),
             ));
         }
@@ -127,12 +127,12 @@ impl EigshOptions {
             .krylov_dimension
             .is_some_and(|size| size <= self.eigenpairs || size > dimension)
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "krylov_dimension must exceed eigenpairs and not exceed dimension".into(),
             ));
         }
         if matches!(self.target, SpectrumTarget::Shift(value) if !value.is_finite()) {
-            return Err(QuSpinError::InvalidOptions("shift must be finite".into()));
+            return Err(QmbedError::InvalidOptions("shift must be finite".into()));
         }
         Ok(())
     }
@@ -165,7 +165,7 @@ pub(crate) fn hermitian_eigenpairs_all(
 ) -> Result<(Vec<f64>, Vec<Vec<Complex64>>)> {
     let shape = operator.shape();
     if shape.0 != shape.1 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "a square operator is required".into(),
         ));
     }
@@ -176,7 +176,7 @@ pub(crate) fn hermitian_eigenpairs_all(
             if (dense[row * dimension + column] - dense[column * dimension + row].conj()).norm()
                 > 1.0e-12
             {
-                return Err(QuSpinError::NonHermitian);
+                return Err(QmbedError::NonHermitian);
             }
         }
     }
@@ -244,7 +244,7 @@ fn vector_norm(vector: &[Complex64]) -> f64 {
 fn normalize(vector: &mut [Complex64]) -> Result<()> {
     let norm = vector_norm(vector);
     if !norm.is_finite() || norm <= f64::EPSILON {
-        return Err(QuSpinError::NonConvergence {
+        return Err(QmbedError::NonConvergence {
             iterations: 0,
             residual: norm,
         });
@@ -359,7 +359,7 @@ where
             normal
                 .lu()
                 .solve(&projected_rhs)
-                .ok_or(QuSpinError::NonConvergence {
+                .ok_or(QmbedError::NonConvergence {
                     iterations,
                     residual: beta,
                 })?;
@@ -376,7 +376,7 @@ where
         }
         iterations += columns;
     }
-    Err(QuSpinError::NonConvergence {
+    Err(QmbedError::NonConvergence {
         iterations,
         residual: vector_norm(&residual),
     })
@@ -420,7 +420,7 @@ impl ShiftInvertPlan {
             || tolerance <= 0.0
             || max_iterations == 0
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "shift-invert needs a square operator, finite shift, positive tolerance, and positive iteration cap"
                     .into(),
             ));
@@ -445,7 +445,7 @@ impl ShiftInvertPlan {
 
     pub fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         if input.len() != self.operator.shape().0 || output.len() != input.len() {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "shift-invert input and output must match the operator dimension".into(),
             ));
         }
@@ -520,7 +520,7 @@ where
     match options.target {
         SpectrumTarget::Shift(_) => shifted_solver
             .ok_or_else(|| {
-                QuSpinError::UnsupportedBackend(
+                QmbedError::UnsupportedBackend(
                     "real shift-invert requires a reusable real factorization".into(),
                 )
             })?
@@ -579,7 +579,7 @@ fn real_vector_norm(vector: &[f64]) -> f64 {
 fn normalize_real(vector: &mut [f64]) -> Result<()> {
     let norm = real_vector_norm(vector);
     if !norm.is_finite() || norm <= f64::EPSILON {
-        return Err(QuSpinError::NonConvergence {
+        return Err(QmbedError::NonConvergence {
             iterations: 0,
             residual: norm,
         });
@@ -607,14 +607,14 @@ where
         .min(options.max_iterations)
         .min(dimension);
     if krylov_dimension <= options.eigenpairs {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "the effective Krylov dimension must exceed eigenpairs".into(),
         ));
     }
 
     let first = if let Some(initial) = initial {
         if initial.len() != dimension {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "eigsh initial vector does not match the operator".into(),
             ));
         }
@@ -671,7 +671,7 @@ where
     }
 
     if basis.len() <= options.eigenpairs {
-        return Err(QuSpinError::NonConvergence {
+        return Err(QmbedError::NonConvergence {
             iterations: basis.len(),
             residual: f64::INFINITY,
         });
@@ -729,7 +729,7 @@ where
     let failure_residual = residuals.iter().copied().fold(0.0_f64, f64::max);
     let accepted_residual = options.tolerance.max(1.0e-7);
     if failure_residual > accepted_residual {
-        return Err(QuSpinError::NonConvergence {
+        return Err(QmbedError::NonConvergence {
             iterations: size,
             residual: failure_residual,
         });
@@ -782,7 +782,7 @@ where
         .min(options.max_iterations)
         .min(dimension);
     if krylov_dimension <= options.eigenpairs {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "the effective Krylov dimension must exceed eigenpairs".into(),
         ));
     }
@@ -790,7 +790,7 @@ where
     let mut basis = Vec::with_capacity(krylov_dimension);
     basis.push(if let Some(initial) = initial {
         if initial.len() != dimension {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "eigsh initial vector does not match the operator".into(),
             ));
         }
@@ -850,7 +850,7 @@ where
     }
 
     if basis.len() <= options.eigenpairs {
-        return Err(QuSpinError::NonConvergence {
+        return Err(QmbedError::NonConvergence {
             iterations: basis.len(),
             residual: f64::INFINITY,
         });
@@ -905,7 +905,7 @@ where
     let failure_residual = residuals.iter().copied().fold(0.0_f64, f64::max);
     let accepted_residual = options.tolerance.max(1.0e-7);
     if failure_residual > accepted_residual {
-        return Err(QuSpinError::NonConvergence {
+        return Err(QmbedError::NonConvergence {
             iterations: size,
             residual: failure_residual,
         });
@@ -933,7 +933,7 @@ where
 {
     let shape = operator.shape();
     if shape.0 != shape.1 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "eigsh requires a square operator".into(),
         ));
     }
@@ -985,7 +985,7 @@ where
 {
     let shape = operator.shape();
     if shape.0 != shape.1 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "eigsh requires a square operator".into(),
         ));
     }
@@ -1018,7 +1018,7 @@ impl EvolutionOptions {
             || self.times.iter().any(|time| !time.is_finite())
             || self.times.windows(2).any(|pair| pair[0] > pair[1])
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "times must be a nonempty finite nondecreasing grid".into(),
             ));
         }
@@ -1027,7 +1027,7 @@ impl EvolutionOptions {
             || self.tolerance <= 0.0
             || self.max_substeps == 0
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "evolution controls must be positive".into(),
             ));
         }
@@ -1057,7 +1057,7 @@ pub struct LanczosOptions {
 impl LanczosOptions {
     fn validate(&self) -> Result<()> {
         if self.krylov_dimension == 0 || !self.tolerance.is_finite() || self.tolerance <= 0.0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "Lanczos dimension and tolerance must be positive".into(),
             ));
         }
@@ -1114,7 +1114,7 @@ where
         let alpha = inner(&current, &applied);
         if alpha.im.abs() > self.options.tolerance.max(1.0e-10) {
             self.failed = true;
-            return Some(Err(QuSpinError::NonHermitian));
+            return Some(Err(QmbedError::NonHermitian));
         }
         for (value, basis_value) in applied.iter_mut().zip(&current) {
             *value -= alpha.re * *basis_value;
@@ -1168,7 +1168,7 @@ where
     options.validate()?;
     let shape = operator.shape();
     if shape.0 != shape.1 || initial.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "Lanczos operator and initial vector do not match".into(),
         ));
     }
@@ -1246,12 +1246,12 @@ pub(crate) fn lanczos_spectral_measure(
 ) -> Result<(Vec<f64>, Vec<f64>)> {
     let shape = operator.shape();
     if shape.0 != shape.1 || source.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "spectral Lanczos requires a square operator matching the source".into(),
         ));
     }
     if krylov_dimension == 0 {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "spectral Krylov dimension must be positive".into(),
         ));
     }
@@ -1291,7 +1291,7 @@ fn lanczos_projection(
         operator.apply(&basis[iteration], &mut applied)?;
         let alpha = inner(&basis[iteration], &applied);
         if alpha.im.abs() > 1.0e-10 {
-            return Err(QuSpinError::NonHermitian);
+            return Err(QmbedError::NonHermitian);
         }
         alphas.push(alpha.re);
         for (value, basis_value) in applied.iter_mut().zip(&basis[iteration]) {
@@ -1383,7 +1383,7 @@ pub(crate) fn expm_action(
 ) -> Result<Vec<Complex64>> {
     let shape = operator.shape();
     if shape.0 != shape.1 || initial.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "evolution requires a square operator matching the state".into(),
         ));
     }
@@ -1420,7 +1420,7 @@ pub(crate) fn expm_action_complex(
 ) -> Result<Vec<Complex64>> {
     let shape = operator.shape();
     if shape.0 != shape.1 || initial.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "exponential action requires a square operator matching the state".into(),
         ));
     }
@@ -1431,7 +1431,7 @@ pub(crate) fn expm_action_complex(
         || tolerance <= 0.0
         || max_substeps == 0
     {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "invalid exponential coefficient or numerical controls".into(),
         ));
     }
@@ -1440,7 +1440,7 @@ pub(crate) fn expm_action_complex(
     }
     let requested_steps = exponent.norm().ceil().max(1.0) as usize;
     if requested_steps > max_substeps {
-        return Err(QuSpinError::NonConvergence {
+        return Err(QmbedError::NonConvergence {
             iterations: max_substeps,
             residual: exponent.norm(),
         });
@@ -1464,7 +1464,7 @@ pub(crate) fn expm_action_complex(
                 break;
             }
             if order == krylov_dimension {
-                return Err(QuSpinError::NonConvergence {
+                return Err(QmbedError::NonConvergence {
                     iterations: order,
                     residual: vector_norm(&term),
                 });
@@ -1487,7 +1487,7 @@ where
     options.validate()?;
     let shape = operator.shape();
     if shape.0 != shape.1 || initial.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "evolution operator and initial state do not match".into(),
         ));
     }
@@ -1544,7 +1544,7 @@ where
 {
     options.validate()?;
     if !time.is_finite() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "exponential time must be finite".into(),
         ));
     }
@@ -1580,7 +1580,7 @@ where
             .iter()
             .any(|beta| !beta.is_finite() || *beta < 0.0)
     {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "inverse temperatures must be nonempty, finite, and nonnegative".into(),
         ));
     }
@@ -1617,7 +1617,7 @@ where
             .collect();
         let projected_partition = boltzmann.iter().sum::<f64>();
         if projected_partition <= f64::EPSILON {
-            return Err(QuSpinError::NonConvergence {
+            return Err(QmbedError::NonConvergence {
                 iterations: size,
                 residual: projected_partition,
             });
@@ -1709,14 +1709,14 @@ fn validate_thermal_observables(
             .iter()
             .any(|beta| !beta.is_finite() || *beta < 0.0)
     {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "thermal observables and inverse temperatures must be nonempty and valid".into(),
         ));
     }
     let mut names = std::collections::HashSet::new();
     for (name, observable) in observables {
         if name.is_empty() || !names.insert(name) || observable.shape() != (dimension, dimension) {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "thermal observables require unique names and matching square shapes".into(),
             ));
         }
@@ -1858,13 +1858,13 @@ pub fn linear_combination_qt(
     coefficients: &[Complex64],
 ) -> Result<Vec<Complex64>> {
     if basis.len() != coefficients.len() || basis.is_empty() {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "basis and coefficient counts must be equal and nonzero".into(),
         ));
     }
     let dimension = basis[0].len();
     if basis.iter().any(|vector| vector.len() != dimension) {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "linear-combination basis vectors must have equal lengths".into(),
         ));
     }
@@ -1956,7 +1956,7 @@ where
     let mut steps = 0;
     while direction * (target_time - time) > 16.0 * f64::EPSILON * target_time.abs().max(1.0) {
         if steps >= options.max_substeps {
-            return Err(QuSpinError::NonConvergence {
+            return Err(QmbedError::NonConvergence {
                 iterations: steps,
                 residual: (target_time - time).abs(),
             });
@@ -2019,7 +2019,7 @@ where
     options.validate()?;
     let shape = operator.shape();
     if shape.0 != shape.1 || initial.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "time-dependent operator and initial state do not match".into(),
         ));
     }
@@ -2053,7 +2053,7 @@ where
     O: LinearOperator + ?Sized,
 {
     if initial_columns.is_empty() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "a state batch must contain at least one column".into(),
         ));
     }
@@ -2085,7 +2085,7 @@ where
     O: TimeDependentOperator + ?Sized,
 {
     if initial_columns.is_empty() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "a state batch must contain at least one column".into(),
         ));
     }
@@ -2126,7 +2126,7 @@ impl RhsEvolutionOptions {
             || self.max_step <= 0.0
             || self.max_substeps == 0
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "invalid callable-RHS time grid or integration controls".into(),
             ));
         }
@@ -2188,7 +2188,7 @@ where
 {
     options.validate(initial_time)?;
     if initial.is_empty() {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "callable-RHS state must be nonempty".into(),
         ));
     }
@@ -2201,7 +2201,7 @@ where
         let interval = target_time - current_time;
         let steps = (interval.abs() / options.max_step).ceil().max(1.0) as usize;
         if used_steps.saturating_add(steps) > options.max_substeps {
-            return Err(QuSpinError::NonConvergence {
+            return Err(QmbedError::NonConvergence {
                 iterations: used_steps,
                 residual: interval.abs(),
             });
@@ -2214,7 +2214,7 @@ where
         if options.normalize && normalization > f64::EPSILON {
             let norm = vector_norm(&state);
             if norm <= f64::EPSILON || !norm.is_finite() {
-                return Err(QuSpinError::NonConvergence {
+                return Err(QmbedError::NonConvergence {
                     iterations: used_steps + steps,
                     residual: norm,
                 });
@@ -2245,7 +2245,7 @@ where
 {
     let shape = hamiltonian.shape();
     if shape.0 != shape.1 || initial_density.len() != shape.0.saturating_mul(shape.0) {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "density evolution requires a square Hamiltonian and density matrix".into(),
         ));
     }

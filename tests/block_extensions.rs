@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
-use quspin::Complex64;
-use quspin::block::{BlockOps, DynamicBlockOps, block_diag_hamiltonian};
-use quspin::operator::{
+use qmbed::Complex64;
+use qmbed::block::{BlockOps, DynamicBlockOps, block_diag_hamiltonian};
+use qmbed::operator::{
     Dynamic, DynamicComponent, Hamiltonian, LinearOperator, MatrixFormat, Operator,
     TimeDependentOperator,
 };

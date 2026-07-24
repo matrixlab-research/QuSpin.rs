@@ -6,6 +6,7 @@ mod backend;
 pub mod archive;
 pub mod basis;
 pub mod block;
+pub mod compat;
 pub mod dynamics;
 pub mod error;
 pub mod measure;
@@ -13,7 +14,7 @@ pub mod operator;
 pub mod solve;
 pub mod workflow;
 
-pub use error::{QuSpinError, Result};
+pub use error::{QmbedError, QuSpinError, Result};
 pub use num_complex::Complex64;
 
 /// Crate version used by verification adapters.

@@ -2,7 +2,7 @@ use thiserror::Error;
 
 /// Stable failure categories for all recoverable public operations.
 #[derive(Debug, Error)]
-pub enum QuSpinError {
+pub enum QmbedError {
     #[error("invalid or unregistered operator: {0}")]
     InvalidOperator(String),
     #[error("invalid coupling: {0}")]
@@ -32,4 +32,8 @@ pub enum QuSpinError {
 }
 
 /// Crate-wide result type.
-pub type Result<T> = std::result::Result<T, QuSpinError>;
+pub type Result<T> = std::result::Result<T, QmbedError>;
+
+/// Compatibility spelling retained for source migrations from the earlier
+/// QuSpin-derived Rust API.
+pub type QuSpinError = QmbedError;

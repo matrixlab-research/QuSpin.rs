@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 pub use crate::backend::ShiftedLinearSolver;
 use crate::backend::factor_shifted_csc;
 use crate::basis::Basis;
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 /// One complex coefficient and its ordered zero-based sites.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,7 +47,7 @@ impl OperatorTerm {
             .collect();
         let arity = symbols.len();
         if arity == 0 {
-            return Err(QuSpinError::InvalidOperator(operator.into()));
+            return Err(QmbedError::InvalidOperator(operator.into()));
         }
         let split = operator
             .find('|')
@@ -55,13 +55,13 @@ impl OperatorTerm {
         let couplings: Vec<_> = couplings.into_iter().collect();
         for coupling in &couplings {
             if coupling.sites.len() != arity {
-                return Err(QuSpinError::InvalidCoupling(format!(
+                return Err(QmbedError::InvalidCoupling(format!(
                     "operator {operator:?} has arity {arity}, but a coupling has {} sites",
                     coupling.sites.len()
                 )));
             }
             if !coupling.coefficient.re.is_finite() || !coupling.coefficient.im.is_finite() {
-                return Err(QuSpinError::InvalidCoupling(
+                return Err(QmbedError::InvalidCoupling(
                     "coupling coefficients must be finite".into(),
                 ));
             }
@@ -124,7 +124,7 @@ pub trait LinearOperator: Send + Sync {
     fn apply_real(&self, input: &[f64], output: &mut [f64]) -> Result<()> {
         let shape = self.shape();
         if input.len() != shape.1 || output.len() != shape.0 {
-            return Err(QuSpinError::DimensionMismatch(format!(
+            return Err(QmbedError::DimensionMismatch(format!(
                 "shape {shape:?} requires real input length {} and output length {}, got {} and {}",
                 shape.1,
                 shape.0,
@@ -140,7 +140,7 @@ pub trait LinearOperator: Send + Sync {
         self.apply(&complex_input, &mut complex_output)?;
         for (real, complex) in output.iter_mut().zip(complex_output) {
             if complex.im.abs() > 1.0e-12 {
-                return Err(QuSpinError::UnsupportedBackend(
+                return Err(QmbedError::UnsupportedBackend(
                     "operator declared a real action but produced an imaginary component".into(),
                 ));
             }
@@ -157,7 +157,7 @@ pub trait LinearOperator: Send + Sync {
     fn apply_transpose(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         let (rows, columns) = self.shape();
         if input.len() != rows || output.len() != columns {
-            return Err(QuSpinError::DimensionMismatch(format!(
+            return Err(QmbedError::DimensionMismatch(format!(
                 "transpose of shape ({rows}, {columns}) requires input length {rows} and output length {columns}"
             )));
         }
@@ -234,7 +234,7 @@ impl TimeOperator {
         F: Fn(f64, &[Complex64], &mut [Complex64]) -> Result<()> + Send + Sync + 'static,
     {
         if shape.0 == 0 || shape.1 == 0 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "time-dependent operator dimensions must be positive".into(),
             ));
         }
@@ -257,7 +257,7 @@ impl TimeOperator {
 
     pub fn evaluate(&self, time: f64, format: MatrixFormat) -> Result<Operator> {
         if !time.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "evaluation time must be finite".into(),
             ));
         }
@@ -280,7 +280,7 @@ impl TimeOperator {
     pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
         let coefficient = coefficient.into();
         if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "time-operator scale must be finite".into(),
             ));
         }
@@ -296,7 +296,7 @@ impl TimeOperator {
 
     pub fn add(&self, right: &Self) -> Result<Self> {
         if self.shape != right.shape {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "time-dependent sums require equal shapes".into(),
             ));
         }
@@ -319,7 +319,7 @@ impl TimeOperator {
 
     pub fn product(&self, right: &Self) -> Result<Self> {
         if self.shape.1 != right.shape.0 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "time-dependent product inner dimensions do not match".into(),
             ));
         }
@@ -342,7 +342,7 @@ impl TimeOperator {
 
     pub fn pow(&self, exponent: u32) -> Result<Self> {
         if self.shape.0 != self.shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "time-dependent powers require a square operator".into(),
             ));
         }
@@ -363,7 +363,7 @@ impl TimeOperator {
 
     pub fn rotated(&self, unitary: &Operator, tolerance: f64) -> Result<Self> {
         if self.shape.0 != self.shape.1 || unitary.shape() != self.shape {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "time-dependent rotation needs equal square shapes".into(),
             ));
         }
@@ -373,7 +373,7 @@ impl TimeOperator {
             for column in 0..self.shape.1 {
                 let expected = if row == column { 1.0 } else { 0.0 };
                 if (identity.value_at(row, column) - expected).norm() > tolerance {
-                    return Err(QuSpinError::InvalidOptions(
+                    return Err(QmbedError::InvalidOptions(
                         "rotation matrix must be unitary".into(),
                     ));
                 }
@@ -398,7 +398,7 @@ impl TimeDependentOperator for TimeOperator {
 
     fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         if !time.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "time-dependent operator time must be finite".into(),
             ));
         }
@@ -481,7 +481,7 @@ impl Operator {
         values_row_major: Vec<Complex64>,
     ) -> Result<Self> {
         if values_row_major.len() != rows.saturating_mul(columns) {
-            return Err(QuSpinError::DimensionMismatch(format!(
+            return Err(QmbedError::DimensionMismatch(format!(
                 "dense storage has {} entries for shape ({rows}, {columns})",
                 values_row_major.len()
             )));
@@ -509,7 +509,7 @@ impl Operator {
                     || !value.re.is_finite()
                     || !value.im.is_finite()
                 {
-                    return Err(QuSpinError::InvalidCoupling(
+                    return Err(QmbedError::InvalidCoupling(
                         "triplet index is out of bounds or its value is non-finite".into(),
                     ));
                 }
@@ -520,7 +520,7 @@ impl Operator {
         let mut accumulated = HashMap::new();
         for (row, column, value) in triplets {
             if row >= rows || column >= columns || !value.re.is_finite() || !value.im.is_finite() {
-                return Err(QuSpinError::InvalidCoupling(
+                return Err(QmbedError::InvalidCoupling(
                     "triplet index is out of bounds or its value is non-finite".into(),
                 ));
             }
@@ -626,7 +626,7 @@ impl Operator {
     /// Row-vector action `inputᵀ A` without conjugating the input.
     pub fn right_apply(&self, input: &[Complex64]) -> Result<Vec<Complex64>> {
         if input.len() != self.shape.0 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "right-apply input must match the operator row count".into(),
             ));
         }
@@ -759,7 +759,7 @@ impl Operator {
 
     pub fn trace(&self) -> Result<Complex64> {
         if self.shape.0 != self.shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "operator trace requires a square operator".into(),
             ));
         }
@@ -769,7 +769,7 @@ impl Operator {
     pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
         let coefficient = coefficient.into();
         if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "operator scale must be finite".into(),
             ));
         }
@@ -793,7 +793,7 @@ impl Operator {
 
     fn combine(&self, right: &Self, right_scale: Complex64) -> Result<Self> {
         if self.shape != right.shape {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "operator addition requires equal shapes".into(),
             ));
         }
@@ -809,7 +809,7 @@ impl Operator {
     /// Matrix product `self * right`.
     pub fn product(&self, right: &Self) -> Result<Self> {
         if self.shape.1 != right.shape.0 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "operator product has incompatible inner dimensions".into(),
             ));
         }
@@ -837,7 +837,7 @@ impl Operator {
 
     pub fn pow(&self, exponent: u32) -> Result<Self> {
         if self.shape.0 != self.shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "operator powers require a square operator".into(),
             ));
         }
@@ -887,12 +887,12 @@ impl Operator {
     /// Similarity rotation `U† A U` after validating unitarity.
     pub fn rotated(&self, unitary: &Self, tolerance: f64) -> Result<Self> {
         if self.shape.0 != self.shape.1 || unitary.shape != self.shape {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "operator rotation requires equal square shapes".into(),
             ));
         }
         if !tolerance.is_finite() || tolerance <= 0.0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "unitarity tolerance must be positive".into(),
             ));
         }
@@ -901,7 +901,7 @@ impl Operator {
             for column in 0..self.shape.1 {
                 let expected = if row == column { 1.0 } else { 0.0 };
                 if (identity.value_at(row, column) - expected).norm() > tolerance {
-                    return Err(QuSpinError::InvalidOptions(
+                    return Err(QmbedError::InvalidOptions(
                         "rotation matrix must be unitary".into(),
                     ));
                 }
@@ -1067,7 +1067,7 @@ impl LinearOperator for Operator {
 
     fn apply_real(&self, input: &[f64], output: &mut [f64]) -> Result<()> {
         if input.len() != self.shape.1 || output.len() != self.shape.0 {
-            return Err(QuSpinError::DimensionMismatch(format!(
+            return Err(QmbedError::DimensionMismatch(format!(
                 "shape {:?} requires real input length {} and output length {}, got {} and {}",
                 self.shape,
                 self.shape.1,
@@ -1077,7 +1077,7 @@ impl LinearOperator for Operator {
             )));
         }
         if !self.real {
-            return Err(QuSpinError::UnsupportedBackend(
+            return Err(QmbedError::UnsupportedBackend(
                 "real action requires an operator with real-valued storage".into(),
             ));
         }
@@ -1203,7 +1203,7 @@ impl LinearOperator for Operator {
 
     fn shifted_solver(&self, shift: f64) -> Result<Option<Box<dyn ShiftedLinearSolver>>> {
         if self.shape.0 != self.shape.1 || !shift.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "shifted factorization requires a square operator and finite shift".into(),
             ));
         }
@@ -1301,7 +1301,7 @@ pub(crate) fn check_apply_shape(
     output: &[Complex64],
 ) -> Result<()> {
     if input.len() != shape.1 || output.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(format!(
+        return Err(QmbedError::DimensionMismatch(format!(
             "shape {shape:?} requires input length {} and output length {}, got {} and {}",
             shape.1,
             shape.0,
@@ -1341,7 +1341,7 @@ pub fn matvec(
     overwrite: bool,
 ) -> Result<()> {
     if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "matvec coefficient must be finite".into(),
         ));
     }
@@ -1371,7 +1371,7 @@ pub fn matmat(
         .iter()
         .map(|column| {
             if column.len() != input_dimension {
-                return Err(QuSpinError::DimensionMismatch(
+                return Err(QmbedError::DimensionMismatch(
                     "matrix column does not match the operator input dimension".into(),
                 ));
             }
@@ -1653,7 +1653,7 @@ where
                         .target
                         .operator_preserves_particle_sector(term.operator())?
                 {
-                    return Err(QuSpinError::InvalidSector(format!(
+                    return Err(QmbedError::InvalidSector(format!(
                         "operator {:?} does not preserve the selected particle sector",
                         term.operator()
                     )));
@@ -1744,7 +1744,7 @@ where
                 .len()
                 > shape.0.min(shape.1).saturating_mul(2).max(1)
         {
-            return Err(QuSpinError::UnsupportedBackend(
+            return Err(QmbedError::UnsupportedBackend(
                 "the requested operator is not usefully diagonal-banded".into(),
             ));
         }
@@ -1772,7 +1772,7 @@ where
             storage,
         };
         if self.checks.hermiticity && !operator.is_hermitian(1.0e-12) {
-            return Err(QuSpinError::NonHermitian);
+            return Err(QmbedError::NonHermitian);
         }
         Ok(operator)
     }
@@ -1790,7 +1790,7 @@ where
             checks,
         } = self;
         if source.len() != target.len() {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "a Hamiltonian must be square".into(),
             ));
         }
@@ -1842,7 +1842,7 @@ where
 {
     let coefficient = coefficient.into();
     if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
-        return Err(QuSpinError::InvalidCoupling(
+        return Err(QmbedError::InvalidCoupling(
             "transition-table coefficient must be finite".into(),
         ));
     }
@@ -1876,7 +1876,7 @@ where
     Target: Basis<State = Source::State>,
 {
     if input.len() != source.len() || output.len() != target.len() {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "sector-shift state dimensions do not match source and target bases".into(),
         ));
     }
@@ -1997,7 +1997,7 @@ impl Hamiltonian<Static> {
     pub fn new(operator: Operator) -> Result<Self> {
         let shape = operator.shape();
         if shape.0 != shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "a Hamiltonian must be square".into(),
             ));
         }
@@ -2037,7 +2037,7 @@ impl Hamiltonian<Dynamic> {
                 .iter()
                 .any(|component| component.operator.shape() != shape)
         {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "all Hamiltonian components must share one square shape".into(),
             ));
         }
@@ -2050,7 +2050,7 @@ impl Hamiltonian<Dynamic> {
 
     pub fn evaluate(&self, time: f64, format: MatrixFormat) -> Result<Operator> {
         if !time.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "evaluation time must be finite".into(),
             ));
         }
@@ -2127,7 +2127,7 @@ impl Hamiltonian<Dynamic> {
     pub fn scaled(&self, coefficient: impl Into<Complex64>) -> Result<Self> {
         let coefficient = coefficient.into();
         if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "Hamiltonian scale must be finite".into(),
             ));
         }
@@ -2149,7 +2149,7 @@ impl Hamiltonian<Dynamic> {
 
 fn finite_drive_value(time: f64, value: Complex64) -> Result<Complex64> {
     if !time.is_finite() || !value.re.is_finite() || !value.im.is_finite() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "drive time and coefficient must be finite".into(),
         ));
     }
@@ -2193,7 +2193,7 @@ impl TimeDependentOperator for Hamiltonian<Static> {
 
     fn apply_at(&self, time: f64, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         if !time.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "evaluation time must be finite".into(),
             ));
         }
@@ -2278,18 +2278,18 @@ impl QuantumOperator {
     pub fn new(components: impl IntoIterator<Item = QuantumComponent>) -> Result<Self> {
         let components: Vec<_> = components.into_iter().collect();
         let first = components.first().ok_or_else(|| {
-            QuSpinError::InvalidOptions("QuantumOperator requires at least one component".into())
+            QmbedError::InvalidOptions("QuantumOperator requires at least one component".into())
         })?;
         let shape = first.operator.shape();
         let mut names = std::collections::HashSet::new();
         for component in &components {
             if component.name.is_empty() || !names.insert(component.name.clone()) {
-                return Err(QuSpinError::InvalidOptions(
+                return Err(QmbedError::InvalidOptions(
                     "component names must be nonempty and unique".into(),
                 ));
             }
             if component.operator.shape() != shape {
-                return Err(QuSpinError::DimensionMismatch(
+                return Err(QmbedError::DimensionMismatch(
                     "all parameterized components must have equal shapes".into(),
                 ));
             }
@@ -2297,7 +2297,7 @@ impl QuantumOperator {
                 .default
                 .is_some_and(|value| !value.re.is_finite() || !value.im.is_finite())
             {
-                return Err(QuSpinError::InvalidOptions(
+                return Err(QmbedError::InvalidOptions(
                     "component defaults must be finite".into(),
                 ));
             }
@@ -2325,7 +2325,7 @@ impl QuantumOperator {
             .find(|component| component.name == name)
             .map(|component| &component.operator)
             .ok_or_else(|| {
-                QuSpinError::InvalidOptions(format!("unknown operator component {name:?}"))
+                QmbedError::InvalidOptions(format!("unknown operator component {name:?}"))
             })
     }
 
@@ -2340,7 +2340,7 @@ impl QuantumOperator {
                 .iter()
                 .any(|component| &component.name == *name)
         }) {
-            return Err(QuSpinError::InvalidOptions(format!(
+            return Err(QmbedError::InvalidOptions(format!(
                 "unknown operator parameter {name:?}"
             )));
         }
@@ -2351,13 +2351,13 @@ impl QuantumOperator {
                 .copied()
                 .or(component.default)
                 .ok_or_else(|| {
-                    QuSpinError::InvalidOptions(format!(
+                    QmbedError::InvalidOptions(format!(
                         "missing required operator parameter {:?}",
                         component.name
                     ))
                 })?;
             if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
-                return Err(QuSpinError::InvalidOptions(format!(
+                return Err(QmbedError::InvalidOptions(format!(
                     "operator parameter {:?} must be finite",
                     component.name
                 )));
@@ -2400,7 +2400,7 @@ impl QuantumOperator {
 
     pub fn add(&self, right: &Self) -> Result<Self> {
         if self.shape != right.shape {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "parameterized operators must have equal shapes".into(),
             ));
         }
@@ -2457,7 +2457,7 @@ impl QuantumLinearOperator {
     pub fn new(operator: Operator, diagonal: Vec<Complex64>) -> Result<Self> {
         let shape = operator.shape();
         if shape.0 != shape.1 || diagonal.len() != shape.0 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "QuantumLinearOperator needs a square operator and one diagonal value per row"
                     .into(),
             ));
@@ -2466,7 +2466,7 @@ impl QuantumLinearOperator {
             .iter()
             .any(|value| !value.re.is_finite() || !value.im.is_finite())
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "QuantumLinearOperator diagonal values must be finite".into(),
             ));
         }
@@ -2492,7 +2492,7 @@ impl QuantumLinearOperator {
                 .iter()
                 .any(|value| !value.re.is_finite() || !value.im.is_finite())
         {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "replacement diagonal has the wrong length or non-finite values".into(),
             ));
         }
@@ -2593,7 +2593,7 @@ pub struct ExpGrid {
 impl ExpGrid {
     pub fn new(start: f64, stop: f64, points: usize, endpoint: bool) -> Result<Self> {
         if !start.is_finite() || !stop.is_finite() || points == 0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "exponential grid endpoints must be finite and points must be positive".into(),
             ));
         }
@@ -2675,7 +2675,7 @@ impl ExpOp {
     ) -> Result<Self> {
         let shape = operator.shape();
         if shape.0 != shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "ExpOp requires a square operator".into(),
             ));
         }
@@ -2686,7 +2686,7 @@ impl ExpOp {
             || tolerance <= 0.0
             || max_substeps == 0
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "invalid ExpOp coefficient or numerical controls".into(),
             ));
         }
@@ -2709,7 +2709,7 @@ impl ExpOp {
 
     pub fn set_exponent(&mut self, exponent: Complex64) -> Result<()> {
         if !exponent.re.is_finite() || !exponent.im.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "ExpOp coefficient must be finite".into(),
             ));
         }
@@ -2747,7 +2747,7 @@ impl ExpOp {
 
     pub fn iter_grid(&self, input: &[Complex64], grid: ExpGrid) -> Result<ExpOpGridIter> {
         if input.len() != self.shape().1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "ExpOp grid input must match the operator dimension".into(),
             ));
         }
@@ -2794,7 +2794,7 @@ impl ExpOp {
 
     pub fn right_apply(&self, input: &[Complex64]) -> Result<Vec<Complex64>> {
         if input.len() != self.shape().0 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "ExpOp right-apply input must match the operator dimension".into(),
             ));
         }

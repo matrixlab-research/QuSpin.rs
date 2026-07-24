@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use quspin::basis::{Basis, BosonBasis1D, SpinBasis1D, SpinlessFermionBasis1D};
-use quspin::block::block_diag_hamiltonian;
-use quspin::operator::{LinearOperator, MatrixFormat, Operator};
-use quspin::{Complex64, QuSpinError, Result};
+use qmbed::basis::{Basis, BosonBasis1D, SpinBasis1D, SpinlessFermionBasis1D};
+use qmbed::block::block_diag_hamiltonian;
+use qmbed::operator::{LinearOperator, MatrixFormat, Operator};
+use qmbed::{Complex64, QmbedError, Result};
 
 #[derive(Debug)]
 struct StoredOnly {
@@ -20,7 +20,7 @@ impl LinearOperator for StoredOnly {
     }
 
     fn apply(&self, _input: &[Complex64], _output: &mut [Complex64]) -> Result<()> {
-        Err(QuSpinError::UnsupportedBackend(
+        Err(QmbedError::UnsupportedBackend(
             "column probing must not be used for stored blocks".into(),
         ))
     }

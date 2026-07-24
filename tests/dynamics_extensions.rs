@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
-use quspin::dynamics::{
+use qmbed::dynamics::{
     CallableDriveStep, DriveStep, Floquet, FloquetTimeVector, dynamical_correlator,
 };
-use quspin::operator::{Dynamic, DynamicComponent, Hamiltonian, MatrixFormat, Operator};
-use quspin::solve::EvolutionOptions;
-use quspin::{Complex64, QuSpinError};
+use qmbed::operator::{Dynamic, DynamicComponent, Hamiltonian, MatrixFormat, Operator};
+use qmbed::solve::EvolutionOptions;
+use qmbed::{Complex64, QmbedError};
 
 fn diagonal(values: &[f64]) -> Operator {
     let dimension = values.len();
@@ -80,7 +80,7 @@ fn floquet_time_vector_has_exact_cycle_coordinates() {
     assert_eq!(times.coordinate(8).unwrap().cycle, 2);
     assert!(matches!(
         times.coordinate(9).unwrap_err(),
-        QuSpinError::InvalidOptions(_)
+        QmbedError::InvalidOptions(_)
     ));
 }
 

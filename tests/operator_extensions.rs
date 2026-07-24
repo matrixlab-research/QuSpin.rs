@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
-use quspin::basis::SpinBasis1D;
-use quspin::operator::{
+use qmbed::basis::SpinBasis1D;
+use qmbed::operator::{
     AssemblyChecks, Coupling, DynamicTerm, ExpGrid, ExpOp, Hamiltonian, LinearOperator,
     MatrixFormat, Operator, OperatorBuilder, OperatorTerm, QuantumComponent, QuantumLinearOperator,
     QuantumOperator, Static, TimeDependentOperator, TimeOperator, anticommutator, commutator,
     get_matvec_function, is_exp_op, is_hamiltonian, is_quantum_linear_operator,
     is_quantum_operator, matmat, matvec, rmatmat, rmatvec,
 };
-use quspin::{Complex64, QuSpinError};
+use qmbed::{Complex64, QmbedError};
 
 fn assert_complex_close(actual: Complex64, expected: Complex64) {
     assert_abs_diff_eq!(actual.re, expected.re, epsilon = 1.0e-12);
@@ -113,7 +113,7 @@ fn quantum_operator_uses_required_and_default_parameters() {
     let missing = parameterized
         .evaluate(&HashMap::new(), MatrixFormat::Dense)
         .unwrap_err();
-    assert!(matches!(missing, QuSpinError::InvalidOptions(_)));
+    assert!(matches!(missing, QmbedError::InvalidOptions(_)));
 }
 
 #[test]
@@ -395,7 +395,7 @@ fn assembly_particle_check_rejects_sector_leakage_and_can_be_explicitly_disabled
         .term(transverse.clone())
         .build(MatrixFormat::Csc)
         .unwrap_err();
-    assert!(matches!(error, QuSpinError::InvalidSector(_)));
+    assert!(matches!(error, QmbedError::InvalidSector(_)));
 
     let projected = OperatorBuilder::on(&basis)
         .checks(AssemblyChecks {

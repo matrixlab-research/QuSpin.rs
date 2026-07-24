@@ -1,13 +1,13 @@
 use approx::assert_abs_diff_eq;
-use quspin::basis::{Basis, SpinBasis1D, SpinlessFermionBasis1D};
-use quspin::operator::{
+use qmbed::basis::{Basis, SpinBasis1D, SpinlessFermionBasis1D};
+use qmbed::operator::{
     Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorTerm,
 };
-use quspin::solve::{
+use qmbed::solve::{
     EighOptions, EigshOptions, SpectrumTarget, eigh, eigh_with_options, eigsh, eigsh_values,
     eigsh_with_initial,
 };
-use quspin::{Complex64, QuSpinError};
+use qmbed::{Complex64, QmbedError};
 
 fn single_site_operator(basis: &SpinBasis1D, operator: &str) -> Vec<Complex64> {
     OperatorBuilder::on(basis)
@@ -106,7 +106,7 @@ fn higher_spin_rejects_the_spin_half_pauli_convention() {
         .pauli(true)
         .build()
         .unwrap_err();
-    assert!(matches!(error, QuSpinError::InvalidOptions(_)));
+    assert!(matches!(error, QmbedError::InvalidOptions(_)));
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn parity_sectors_reconstruct_the_full_spin_spectrum() {
         .parity(1)
         .build()
         .unwrap_err();
-    assert!(matches!(incompatible, QuSpinError::IncompatibleSymmetry(_)));
+    assert!(matches!(incompatible, QmbedError::IncompatibleSymmetry(_)));
 }
 
 fn periodic_spinless_hopping(sites: usize) -> Vec<OperatorTerm> {
@@ -316,5 +316,5 @@ fn eigsh_covers_magnitude_and_both_end_targets() {
         &[Complex64::new(1.0, 0.0); 2],
     )
     .unwrap_err();
-    assert!(matches!(invalid_initial, QuSpinError::DimensionMismatch(_)));
+    assert!(matches!(invalid_initial, QmbedError::DimensionMismatch(_)));
 }

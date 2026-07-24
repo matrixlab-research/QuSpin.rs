@@ -1,7 +1,7 @@
 use approx::assert_abs_diff_eq;
 use num_bigint::BigUint;
-use quspin::Complex64;
-use quspin::basis::{
+use qmbed::Complex64;
+use qmbed::basis::{
     Basis, BasisProjector, BosonBasis1D, ClosureSymmetryMap, GeneralBasis, PhotonBasis,
     SpinBasis1D, SpinfulFermionBasis1D, StateStorage, SymmetrySector, TensorBasis, U256, UserBasis,
     WideSpinBasis256, basis_int_to_python_int, basis_ones, basis_zeros, bitwise_and,
@@ -9,8 +9,8 @@ use quspin::basis::{
     get_basis_type, photon_hspace_dim, python_int_to_basis_int, state_from_biguint,
     state_to_biguint,
 };
-use quspin::measure::project_operator;
-use quspin::operator::{
+use qmbed::measure::project_operator;
+use qmbed::operator::{
     Coupling, LinearOperator, MatrixFormat, OperatorBuilder, OperatorTerm, apply_sector_shift,
     bra_ket_transitions,
 };
@@ -356,7 +356,7 @@ fn branching_and_parallel_user_basis_paths_preserve_transition_semantics() {
         .unwrap();
     let matrix = OperatorBuilder::on(&qutrit)
         .term(OperatorTerm::new("a", [Coupling::new(1.0, vec![0])]).unwrap())
-        .checks(quspin::operator::AssemblyChecks {
+        .checks(qmbed::operator::AssemblyChecks {
             hermiticity: false,
             particle_conservation: false,
             symmetry_compatibility: true,

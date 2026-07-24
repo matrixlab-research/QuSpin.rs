@@ -5,13 +5,13 @@ use num_complex::Complex64;
 use crate::operator::{
     LinearOperator, MatrixFormat, Operator, TimeDependentOperator, check_apply_shape,
 };
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 fn block_offsets(shapes: impl IntoIterator<Item = (usize, usize)>) -> Result<Vec<usize>> {
     let mut offsets = vec![0_usize];
     for shape in shapes {
         if shape.0 != shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "block-diagonal operators require square blocks".into(),
             ));
         }
@@ -22,12 +22,12 @@ fn block_offsets(shapes: impl IntoIterator<Item = (usize, usize)>) -> Result<Vec
                 .unwrap_or_default()
                 .checked_add(shape.0)
                 .ok_or_else(|| {
-                    QuSpinError::UnsupportedBackend("block dimension overflow".into())
+                    QmbedError::UnsupportedBackend("block dimension overflow".into())
                 })?,
         );
     }
     if offsets.len() == 1 {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "at least one operator block is required".into(),
         ));
     }
@@ -57,7 +57,7 @@ impl BlockOps {
 
     pub fn push(&mut self, block: Arc<dyn LinearOperator>) -> Result<()> {
         if block.shape().0 != block.shape().1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "block-diagonal operators require square blocks".into(),
             ));
         }
@@ -67,7 +67,7 @@ impl BlockOps {
             .copied()
             .unwrap_or_default()
             .checked_add(block.shape().0)
-            .ok_or_else(|| QuSpinError::UnsupportedBackend("block dimension overflow".into()))?;
+            .ok_or_else(|| QmbedError::UnsupportedBackend("block dimension overflow".into()))?;
         self.blocks.push(block);
         self.offsets.push(next);
         Ok(())
@@ -173,7 +173,7 @@ impl DynamicBlockOps {
 
     pub fn push(&mut self, block: Arc<dyn TimeDependentOperator>) -> Result<()> {
         if block.shape().0 != block.shape().1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "block-diagonal operators require square blocks".into(),
             ));
         }
@@ -183,7 +183,7 @@ impl DynamicBlockOps {
             .copied()
             .unwrap_or_default()
             .checked_add(block.shape().0)
-            .ok_or_else(|| QuSpinError::UnsupportedBackend("block dimension overflow".into()))?;
+            .ok_or_else(|| QmbedError::UnsupportedBackend("block dimension overflow".into()))?;
         self.blocks.push(block);
         self.offsets.push(next);
         Ok(())
@@ -191,7 +191,7 @@ impl DynamicBlockOps {
 
     pub fn materialize(&self, time: f64, format: MatrixFormat) -> Result<Operator> {
         if !time.is_finite() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "dynamic block materialization time must be finite".into(),
             ));
         }

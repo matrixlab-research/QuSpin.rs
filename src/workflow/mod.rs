@@ -3,7 +3,7 @@ use std::sync::Arc;
 use num_complex::Complex64;
 
 use crate::operator::{LinearOperator, MatrixFormat, check_apply_shape, materialize_dense};
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 /// Matrix-free Lindblad generator over column-major vectorized density matrices.
 pub struct LindbladGenerator {
@@ -25,12 +25,12 @@ impl LindbladGenerator {
     ) -> Result<Self> {
         let shape = hamiltonian.shape();
         if shape.0 != shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "the Lindblad Hamiltonian must be square".into(),
             ));
         }
         if jumps.iter().any(|jump| jump.shape() != shape) {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "all Lindblad jumps must match the Hamiltonian".into(),
             ));
         }
@@ -168,7 +168,7 @@ pub fn track_states(
         || !ambiguity_tolerance.is_finite()
         || ambiguity_tolerance < 0.0
     {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "state tracking requires equal nonzero ranks and a nonnegative tolerance".into(),
         ));
     }
@@ -177,7 +177,7 @@ pub fn track_states(
         || previous.iter().any(|vector| vector.len() != dimension)
         || current.iter().any(|vector| vector.len() != dimension)
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "tracked state vectors must have equal nonzero dimensions".into(),
         ));
     }

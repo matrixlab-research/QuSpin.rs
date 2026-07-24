@@ -11,7 +11,7 @@ use crate::solve::{
     EvolutionOptions, evolve, evolve_time_dependent, expm_action, hermitian_eigenpairs_all,
     lanczos_spectral_measure,
 };
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 const DENSE_PROPAGATOR_CUTOFF: usize = 128;
 
@@ -29,12 +29,12 @@ impl CallableDriveStep {
     pub fn new(hamiltonian: Arc<dyn TimeDependentOperator>, duration: f64) -> Result<Self> {
         let shape = hamiltonian.shape();
         if shape.0 != shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "a callable drive Hamiltonian must be square".into(),
             ));
         }
         if !duration.is_finite() || duration < 0.0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "drive duration must be finite and nonnegative".into(),
             ));
         }
@@ -54,12 +54,12 @@ impl DriveStep {
     pub fn new(hamiltonian: Arc<dyn LinearOperator>, duration: f64) -> Result<Self> {
         let shape = hamiltonian.shape();
         if shape.0 != shape.1 {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "a drive Hamiltonian must be square".into(),
             ));
         }
         if !duration.is_finite() || duration < 0.0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "drive duration must be finite and nonnegative".into(),
             ));
         }
@@ -81,14 +81,14 @@ impl Floquet {
     pub fn new(steps: impl IntoIterator<Item = DriveStep>) -> Result<Self> {
         let steps: Vec<_> = steps.into_iter().map(FloquetStep::Static).collect();
         let first = steps.first().ok_or_else(|| {
-            QuSpinError::InvalidOptions("Floquet requires at least one drive step".into())
+            QmbedError::InvalidOptions("Floquet requires at least one drive step".into())
         })?;
         let dimension = first.shape().0;
         if steps
             .iter()
             .any(|step| step.shape() != (dimension, dimension))
         {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "all drive steps must have the same square shape".into(),
             ));
         }
@@ -108,14 +108,14 @@ impl Floquet {
     pub fn from_callable(steps: impl IntoIterator<Item = CallableDriveStep>) -> Result<Self> {
         let steps: Vec<_> = steps.into_iter().map(FloquetStep::Callable).collect();
         let first = steps.first().ok_or_else(|| {
-            QuSpinError::InvalidOptions("Floquet requires at least one drive step".into())
+            QmbedError::InvalidOptions("Floquet requires at least one drive step".into())
         })?;
         let dimension = first.shape().0;
         if steps
             .iter()
             .any(|step| step.shape() != (dimension, dimension))
         {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "all drive steps must have the same square shape".into(),
             ));
         }
@@ -140,7 +140,7 @@ impl Floquet {
 
     pub fn apply_period(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         if input.len() != self.dimension || output.len() != self.dimension {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "Floquet input or output length does not match".into(),
             ));
         }
@@ -161,7 +161,7 @@ impl Floquet {
                     state = evolve_time_dependent(step.hamiltonian.as_ref(), &state, options)?
                         .states
                         .pop()
-                        .ok_or(QuSpinError::NonConvergence {
+                        .ok_or(QmbedError::NonConvergence {
                             iterations: 0,
                             residual: f64::INFINITY,
                         })?;
@@ -209,7 +209,7 @@ impl Floquet {
     pub fn eigensystem(&self) -> Result<FloquetEigensystem> {
         let period = self.period();
         if period <= 0.0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "Floquet eigensystems require a positive period".into(),
             ));
         }
@@ -219,7 +219,7 @@ impl Floquet {
         for column in 0..self.dimension {
             let eigenvalue = eigensystem.eigenvalues[column];
             if (eigenvalue.norm() - 1.0).abs() > 1.0e-8 {
-                return Err(QuSpinError::NonConvergence {
+                return Err(QmbedError::NonConvergence {
                     iterations: 1,
                     residual: (eigenvalue.norm() - 1.0).abs(),
                 });
@@ -313,14 +313,14 @@ impl FloquetTimeVector {
         include_endpoint: bool,
     ) -> Result<Self> {
         if !period.is_finite() || period <= 0.0 || cycles == 0 || points_per_cycle == 0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "Floquet time-vector controls must be positive".into(),
             ));
         }
         let points = cycles
             .checked_mul(points_per_cycle)
             .and_then(|value| value.checked_add(usize::from(include_endpoint)))
-            .ok_or_else(|| QuSpinError::InvalidOptions("Floquet time-vector overflow".into()))?;
+            .ok_or_else(|| QmbedError::InvalidOptions("Floquet time-vector overflow".into()))?;
         let step = period / points_per_cycle as f64;
         let times = (0..points).map(|index| index as f64 * step).collect();
         Ok(Self {
@@ -345,7 +345,7 @@ impl FloquetTimeVector {
 
     pub fn coordinate(&self, index: usize) -> Result<FloquetCoordinate> {
         if index >= self.times.len() {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "Floquet time index is out of bounds".into(),
             ));
         }
@@ -391,7 +391,7 @@ impl SpectrumOptions {
             || !self.tolerance.is_finite()
             || self.tolerance <= 0.0
         {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "invalid spectrum frequency grid or numerical controls".into(),
             ));
         }
@@ -417,7 +417,7 @@ where
         || probe_shape.0 != target_shape.0
         || probe_shape.1 != source.len()
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "target Hamiltonian, source, and probe shapes are incompatible".into(),
         ));
     }
@@ -475,7 +475,7 @@ where
         || left_probe.shape() != (dimension, dimension)
         || right_probe.shape() != (dimension, dimension)
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "correlator Hamiltonian, probes, and state dimensions do not match".into(),
         ));
     }
