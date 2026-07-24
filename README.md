@@ -63,16 +63,21 @@ rectangular probe between particle-number or symmetry sectors. The same
 operator can be converted among stored formats or consumed matrix-free by
 Krylov algorithms.
 
-## Numerical backend boundary
+## Runtime and numerical backend boundaries
 
 Physics-facing basis and operator types depend only on the `LinearOperator`
-contract. Dense eigendecomposition, matrix products, and sparse shifted
-factorization are isolated in an internal backend module. The boundary is
-coarse grained: Krylov iterations remain Rust-native and call one reusable
-factorization or dense kernel rather than dispatching inside element or
-matvec loops. Real CSC Hamiltonians retain real arithmetic through both the
-factorization and shift-invert Lanczos path; complex operators use the same
-public solver contract.
+contract. `qmbed::runtime` adds a second narrow waist for owned vectors and
+coarse operations such as `apply`, `axpy`, `dotc`, and host transfer. The
+built-in `CpuRuntime` is single-rank; an `ExecutionProfile` that requests a GPU
+or multiple MPI ranks fails explicitly until an implementation of the same
+`Runtime` contract is installed. No model name crosses this boundary.
+
+Dense eigendecomposition, matrix products, and sparse shifted factorization
+remain isolated in an internal numerical backend module. Krylov iterations
+call one reusable factorization or dense kernel rather than dispatching inside
+element or matvec loops. Real CSC Hamiltonians retain real arithmetic through
+both the factorization and shift-invert Lanczos path; complex operators use the
+same public solver contract.
 
 ## Benchmark and verification boundary
 
