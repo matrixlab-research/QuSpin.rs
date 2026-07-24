@@ -15,7 +15,7 @@ fn cpu_runtime_applies_the_same_scientific_operator() {
         .unwrap();
     let runtime = CpuRuntime::new(2).unwrap();
     let input = runtime
-        .from_host(&[Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)])
+        .upload(&[Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0)])
         .unwrap();
     let mut output = runtime.zeros(2).unwrap();
 
@@ -50,10 +50,10 @@ fn accelerator_and_distributed_requests_never_silently_fall_back() {
 fn cpu_vector_primitives_have_one_runtime_contract() {
     let runtime = CpuRuntime::new(1).unwrap();
     let left = runtime
-        .from_host(&[Complex64::new(1.0, 1.0), Complex64::new(2.0, 0.0)])
+        .upload(&[Complex64::new(1.0, 1.0), Complex64::new(2.0, 0.0)])
         .unwrap();
     let mut right = runtime
-        .from_host(&[Complex64::new(0.0, 1.0), Complex64::new(1.0, 0.0)])
+        .upload(&[Complex64::new(0.0, 1.0), Complex64::new(1.0, 0.0)])
         .unwrap();
     runtime
         .axpy(Complex64::new(0.5, 0.0), &left, &mut right)

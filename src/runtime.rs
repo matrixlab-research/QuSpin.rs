@@ -86,7 +86,7 @@ pub trait Runtime: Send + Sync {
 
     fn capabilities(&self) -> RuntimeCapabilities;
     fn zeros(&self, length: usize) -> Result<Self::Buffer>;
-    fn from_host(&self, values: &[Complex64]) -> Result<Self::Buffer>;
+    fn upload(&self, values: &[Complex64]) -> Result<Self::Buffer>;
     fn to_host(&self, buffer: &Self::Buffer) -> Result<Vec<Complex64>>;
     fn fill(&self, buffer: &mut Self::Buffer, value: Complex64) -> Result<()>;
     fn axpy(&self, alpha: Complex64, input: &Self::Buffer, output: &mut Self::Buffer)
@@ -180,7 +180,7 @@ impl Runtime for CpuRuntime {
         })
     }
 
-    fn from_host(&self, values: &[Complex64]) -> Result<Self::Buffer> {
+    fn upload(&self, values: &[Complex64]) -> Result<Self::Buffer> {
         Ok(CpuBuffer {
             values: values.to_vec(),
         })
