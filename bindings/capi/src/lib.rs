@@ -4,8 +4,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use qmbed::basis::{
-    Basis, BosonBasis1D, PackedBasis, SpinBasis1D, SpinfulFermionBasis1D,
-    SpinlessFermionBasis1D,
+    Basis, BosonBasis1D, PackedBasis, SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D,
 };
 use qmbed::interop::PackedEdModel;
 use qmbed::operator::{
@@ -293,12 +292,7 @@ pub fn run_command_json(request: &str) -> String {
 }
 
 fn execute(request: SolveRequest) -> Result<SolveResult> {
-    let model = build_model(
-        &request.basis,
-        request.terms,
-        AssemblyChecks::all(),
-        None,
-    )?;
+    let model = build_model(&request.basis, request.terms, AssemblyChecks::all(), None)?;
     solve_model(&model, request.format, &request.solver)
 }
 
@@ -505,11 +499,7 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
             let result = model.eigh(EighOptions {
                 return_eigenvectors: eigenvectors,
             })?;
-            Ok(command_eigensystem(
-                model.dimension(),
-                result,
-                eigenvectors,
-            ))
+            Ok(command_eigensystem(model.dimension(), result, eigenvectors))
         }
         CommandRequest::Eigsh {
             basis,
@@ -707,7 +697,10 @@ mod tests {
         let materialize: Value = serde_json::from_str(&materialize).unwrap();
         assert_eq!(materialize["status"], "ok");
         assert_eq!(materialize["result"]["shape"], serde_json::json!([4, 4]));
-        assert_eq!(materialize["result"]["entries"].as_array().unwrap().len(), 9);
+        assert_eq!(
+            materialize["result"]["entries"].as_array().unwrap().len(),
+            9
+        );
 
         let eigh = run_command_json(&format!(
             r#"{{"operation":"eigh","basis":{basis},"terms":{terms}}}"#
