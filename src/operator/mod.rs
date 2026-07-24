@@ -10,6 +10,120 @@ use crate::backend::factor_shifted_csc;
 use crate::basis::Basis;
 use crate::{QmbedError, Result};
 
+/// One typed local action in an operator product.
+///
+/// This is the native QMBED spelling. Character strings belong to compatibility
+/// adapters and are parsed once into this representation before assembly.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LocalOperator {
+    Identity,
+    Number,
+    Z,
+    Raising,
+    Lowering,
+    X,
+    Y,
+    Custom(char),
+}
+
+impl LocalOperator {
+    pub const fn symbol(self) -> char {
+        match self {
+            Self::Identity => 'I',
+            Self::Number => 'n',
+            Self::Z => 'z',
+            Self::Raising => '+',
+            Self::Lowering => '-',
+            Self::X => 'x',
+            Self::Y => 'y',
+            Self::Custom(symbol) => symbol,
+        }
+    }
+}
+
+/// Typed ordered product of local actions.
+///
+/// `split` identifies the boundary between the two species of a spinful
+/// fermion basis. All other basis families use an unsplit product.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpProduct {
+    local: SmallVec<[LocalOperator; 8]>,
+    symbols: SmallVec<[char; 8]>,
+    split: Option<usize>,
+    label: String,
+}
+
+impl OpProduct {
+    pub fn new(local: impl IntoIterator<Item = LocalOperator>) -> Result<Self> {
+        Self::with_split(local, None)
+    }
+
+    pub fn spinful(
+        up: impl IntoIterator<Item = LocalOperator>,
+        down: impl IntoIterator<Item = LocalOperator>,
+    ) -> Result<Self> {
+        let mut local: SmallVec<[LocalOperator; 8]> = up.into_iter().collect();
+        let split = local.len();
+        local.extend(down);
+        Self::with_split(local, Some(split))
+    }
+
+    pub fn with_split(
+        local: impl IntoIterator<Item = LocalOperator>,
+        split: Option<usize>,
+    ) -> Result<Self> {
+        let local: SmallVec<[LocalOperator; 8]> = local.into_iter().collect();
+        if local.is_empty() {
+            return Err(QmbedError::InvalidOperator(
+                "operator products cannot be empty".into(),
+            ));
+        }
+        if local.contains(&LocalOperator::Custom('|')) {
+            return Err(QmbedError::InvalidOperator(
+                "the species separator is not a local operator".into(),
+            ));
+        }
+        if split.is_some_and(|boundary| boundary > local.len()) {
+            return Err(QmbedError::InvalidOperator(
+                "spinful operator split exceeds product arity".into(),
+            ));
+        }
+        let symbols: SmallVec<[char; 8]> = local.iter().map(|operator| operator.symbol()).collect();
+        let mut label = String::with_capacity(symbols.len() + usize::from(split.is_some()));
+        for (position, symbol) in symbols.iter().copied().enumerate() {
+            if split == Some(position) {
+                label.push('|');
+            }
+            label.push(symbol);
+        }
+        if split == Some(symbols.len()) {
+            label.push('|');
+        }
+        Ok(Self {
+            local,
+            symbols,
+            split,
+            label,
+        })
+    }
+
+    pub fn local_operators(&self) -> &[LocalOperator] {
+        &self.local
+    }
+
+    pub const fn split(&self) -> Option<usize> {
+        self.split
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn symbols(&self) -> &[char] {
+        &self.symbols
+    }
+}
+
 /// One complex coefficient and its ordered zero-based sites.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Coupling {
@@ -29,34 +143,27 @@ impl Coupling {
 /// Parsed-once local operator string and its couplings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperatorTerm {
-    operator: String,
-    symbols: SmallVec<[char; 8]>,
-    split: Option<usize>,
+    product: OpProduct,
     couplings: Vec<Coupling>,
 }
 
+/// Native name for one typed product and its spatial couplings.
+///
+/// `OperatorTerm` remains as the compatibility spelling during migration.
+pub type OperatorSpec = OperatorTerm;
+
 impl OperatorTerm {
-    pub fn new(
-        operator: impl AsRef<str>,
+    pub fn from_product(
+        product: OpProduct,
         couplings: impl IntoIterator<Item = Coupling>,
     ) -> Result<Self> {
-        let operator = operator.as_ref();
-        let symbols: SmallVec<[char; 8]> = operator
-            .chars()
-            .filter(|character| *character != '|')
-            .collect();
-        let arity = symbols.len();
-        if arity == 0 {
-            return Err(QmbedError::InvalidOperator(operator.into()));
-        }
-        let split = operator
-            .find('|')
-            .map(|position| operator[..position].chars().count());
+        let arity = product.local_operators().len();
         let couplings: Vec<_> = couplings.into_iter().collect();
         for coupling in &couplings {
             if coupling.sites.len() != arity {
                 return Err(QmbedError::InvalidCoupling(format!(
-                    "operator {operator:?} has arity {arity}, but a coupling has {} sites",
+                    "operator {:?} has arity {arity}, but a coupling has {} sites",
+                    product.label(),
                     coupling.sites.len()
                 )));
             }
@@ -66,16 +173,15 @@ impl OperatorTerm {
                 ));
             }
         }
-        Ok(Self {
-            operator: operator.into(),
-            symbols,
-            split,
-            couplings,
-        })
+        Ok(Self { product, couplings })
     }
 
     pub fn operator(&self) -> &str {
-        &self.operator
+        self.product.label()
+    }
+
+    pub const fn product(&self) -> &OpProduct {
+        &self.product
     }
 
     pub fn couplings(&self) -> &[Coupling] {
@@ -83,11 +189,11 @@ impl OperatorTerm {
     }
 
     pub(crate) fn symbols(&self) -> &[char] {
-        &self.symbols
+        self.product.symbols()
     }
 
     pub(crate) const fn split(&self) -> Option<usize> {
-        self.split
+        self.product.split()
     }
 }
 
