@@ -1,0 +1,47 @@
+name: language-bindings
+
+on:
+  pull_request:
+    paths:
+      - "bindings/**"
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/bindings.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "bindings/**"
+      - "src/**"
+      - "Cargo.toml"
+      - ".github/workflows/bindings.yml"
+  workflow_dispatch:
+
+jobs:
+  bindings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format the shared C boundary
+        run: cargo fmt --manifest-path bindings/capi/Cargo.toml --check
+      - name: Lint the shared C boundary
+        run: cargo clippy --manifest-path bindings/capi/Cargo.toml --all-targets -- -D warnings
+      - name: Test and build the shared C boundary
+        run: |
+          cargo test --manifest-path bindings/capi/Cargo.toml
+          cargo build --release --manifest-path bindings/capi/Cargo.toml
+      - name: Test the Python binding
+        env:
+          PYTHONPATH: bindings/python/src
+          QMBED_LIBRARY_PATH: bindings/capi/target/release/libqmbed_capi.so
+        run: python -m unittest discover -s bindings/python/tests -v
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.10"
+      - name: Test the Julia binding
+        env:
+          QMBED_LIBRARY_PATH: bindings/capi/target/release/libqmbed_capi.so
+        run: julia --project=bindings/julia -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
