@@ -39,17 +39,24 @@ sector dimension instead of scanning the full parent Hilbert space.
 
 ```rust
 use qmbed::basis::SpinBasis1D;
-use qmbed::operator::{Coupling, MatrixFormat, OperatorBuilder, OperatorTerm};
+use qmbed::operator::{
+    Coupling, LocalOperator, MatrixFormat, OpProduct, OperatorBuilder, OperatorSpec,
+};
 use qmbed::solve::{eigsh, EigshOptions};
 
 let basis = SpinBasis1D::builder(12).up(6).momentum(0).build()?;
 let bonds = (0..12).map(|site| Coupling::new(1.0, vec![site, (site + 1) % 12]));
+let zz = OpProduct::new([LocalOperator::Z, LocalOperator::Z])?;
 let hamiltonian = OperatorBuilder::on(&basis)
-    .term(OperatorTerm::new("zz", bonds)?)
+    .term(OperatorSpec::from_product(zz, bonds)?)
     .build(MatrixFormat::Csc)?;
 let low_energy = eigsh(&hamiltonian, EigshOptions::smallest_algebraic(4))?;
 # Ok::<(), qmbed::QmbedError>(())
 ```
+
+QuSpin operator strings remain accepted by `OperatorTerm::new` and by the
+explicit functions in `qmbed::compat::quspin`. They are parsed once into the
+same `OpProduct` used above; they do not select a second assembler.
 
 The same `OperatorBuilder::between(source, target)` path constructs a
 rectangular probe between particle-number or symmetry sectors. The same
