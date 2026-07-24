@@ -76,6 +76,10 @@ coarse operations such as `apply`, `axpy`, `dotc`, and host transfer. The
 built-in `CpuRuntime` is single-rank; an `ExecutionProfile` that requests a GPU
 or multiple MPI ranks fails explicitly until an implementation of the same
 `Runtime` contract is installed. No model name crosses this boundary.
+`ExecutionProfile::throughput(n)` enables bounded shared-memory execution for
+independent batches such as `ExpmMultiplyParallel::apply_batch_with_runtime`;
+results retain input order. The serial profile uses the same path with one
+worker.
 
 Dense eigendecomposition, matrix products, and sparse shifted factorization
 remain isolated in an internal numerical backend module. Krylov iterations

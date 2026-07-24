@@ -64,3 +64,25 @@ fn cpu_vector_primitives_have_one_runtime_contract() {
     );
     assert!((runtime.norm(&left).unwrap() - 6.0_f64.sqrt()).abs() < 1.0e-12);
 }
+
+#[test]
+fn profiled_parallel_map_preserves_input_and_error_order() {
+    let runtime = CpuRuntime::from_profile(ExecutionProfile::throughput(4)).unwrap();
+    let values = [5_i32, 4, 3, 2, 1];
+    let doubled = runtime.map_ordered(&values, |value| Ok(value * 2)).unwrap();
+    assert_eq!(doubled, [10, 8, 6, 4, 2]);
+
+    let error = runtime
+        .map_ordered(&values, |value| {
+            if *value == 4 || *value == 2 {
+                Err(QmbedError::InvalidOptions(format!("failed at {value}")))
+            } else {
+                Ok(*value)
+            }
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        QmbedError::InvalidOptions("failed at 4".into()).to_string()
+    );
+}

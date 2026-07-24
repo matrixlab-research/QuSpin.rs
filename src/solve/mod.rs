@@ -8,6 +8,7 @@ use crate::operator::{
     ExpOp, LinearOperator, MatrixFormat, ShiftedLinearSolver, TimeDependentOperator,
     materialize_dense,
 };
+use crate::runtime::CpuRuntime;
 use crate::{QmbedError, Result};
 
 /// Reusable exponential-action plan for vectors and batches.
@@ -49,20 +50,28 @@ impl ExpmMultiplyParallel {
     }
 
     pub fn apply_batch(&self, states: &[Vec<Complex64>]) -> Result<Vec<Vec<Complex64>>> {
+        self.apply_batch_with_runtime(
+            &CpuRuntime::from_profile(crate::runtime::ExecutionProfile::serial())?,
+            states,
+        )
+    }
+
+    pub fn apply_batch_with_runtime(
+        &self,
+        runtime: &CpuRuntime,
+        states: &[Vec<Complex64>],
+    ) -> Result<Vec<Vec<Complex64>>> {
         let dimension = self.inner.shape().1;
-        states
-            .iter()
-            .map(|state| {
-                if state.len() != dimension {
-                    return Err(QmbedError::DimensionMismatch(
-                        "exponential batch column has the wrong length".into(),
-                    ));
-                }
-                let mut output = vec![Complex64::new(0.0, 0.0); dimension];
-                self.inner.apply(state, &mut output)?;
-                Ok(output)
-            })
-            .collect()
+        runtime.map_ordered(states, |state| {
+            if state.len() != dimension {
+                return Err(QmbedError::DimensionMismatch(
+                    "exponential batch column has the wrong length".into(),
+                ));
+            }
+            let mut output = vec![Complex64::new(0.0, 0.0); dimension];
+            self.inner.apply(state, &mut output)?;
+            Ok(output)
+        })
     }
 }
 

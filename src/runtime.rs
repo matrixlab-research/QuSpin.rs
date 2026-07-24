@@ -5,6 +5,9 @@
 //! implementation is complete; accelerator and multi-rank profiles are
 //! explicit extension points rather than silently falling back to the host.
 
+use std::sync::mpsc;
+use std::thread;
+
 use num_complex::Complex64;
 
 use crate::operator::LinearOperator;
@@ -28,6 +31,14 @@ pub struct ExecutionProfile {
 }
 
 impl ExecutionProfile {
+    pub const fn serial() -> Self {
+        Self::local_cpu(1)
+    }
+
+    pub const fn throughput(threads: usize) -> Self {
+        Self::local_cpu(threads)
+    }
+
     pub const fn local_cpu(threads: usize) -> Self {
         Self {
             accelerator: Accelerator::Cpu,
@@ -160,6 +171,57 @@ impl CpuRuntime {
 
     pub const fn profile(self) -> ExecutionProfile {
         self.profile
+    }
+
+    /// Apply an independent operation with bounded shared-memory parallelism.
+    ///
+    /// Results and errors are returned in input order regardless of worker
+    /// scheduling. A one-thread profile executes through the same contract.
+    pub fn map_ordered<T, U, F>(&self, items: &[T], operation: F) -> Result<Vec<U>>
+    where
+        T: Sync,
+        U: Send,
+        F: Fn(&T) -> Result<U> + Sync,
+    {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = self.profile.threads_per_rank.min(items.len());
+        let mut ordered = (0..items.len()).map(|_| None).collect::<Vec<_>>();
+        thread::scope(|scope| {
+            let (sender, receiver) = mpsc::channel();
+            let mut handles = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                let sender = sender.clone();
+                let operation = &operation;
+                handles.push(scope.spawn(move || {
+                    for index in (worker..items.len()).step_by(workers) {
+                        if sender.send((index, operation(&items[index]))).is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            drop(sender);
+            for (index, result) in receiver {
+                ordered[index] = Some(result);
+            }
+            if handles.into_iter().any(|handle| handle.join().is_err()) {
+                return Err(QmbedError::UnsupportedBackend(
+                    "a CPU runtime worker panicked".into(),
+                ));
+            }
+            let mut output = Vec::with_capacity(items.len());
+            for result in ordered {
+                let result = result.ok_or_else(|| {
+                    QmbedError::UnsupportedBackend(
+                        "a CPU runtime worker did not return a result".into(),
+                    )
+                })?;
+                output.push(result?);
+            }
+            Ok(output)
+        })
     }
 }
 
