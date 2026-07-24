@@ -6,8 +6,8 @@
 /// it does not contain a second implementation or a model-specific execution
 /// path.
 pub mod quspin {
-    use crate::operator::{Coupling, LocalOperator, OpProduct, OperatorTerm};
     use crate::QmbedError;
+    use crate::operator::{Coupling, LocalOperator, OpProduct, OperatorTerm};
 
     pub use crate::archive;
     pub use crate::basis;

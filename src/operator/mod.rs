@@ -91,8 +91,7 @@ impl OpProduct {
                 "spinful operator split exceeds product arity".into(),
             ));
         }
-        let symbols: SmallVec<[char; 8]> =
-            local.iter().map(|operator| operator.symbol()).collect();
+        let symbols: SmallVec<[char; 8]> = local.iter().map(|operator| operator.symbol()).collect();
         let mut label = String::with_capacity(symbols.len() + usize::from(split.is_some()));
         for (position, symbol) in symbols.iter().copied().enumerate() {
             if split == Some(position) {
@@ -177,10 +176,7 @@ impl OperatorTerm {
                 ));
             }
         }
-        Ok(Self {
-            product,
-            couplings,
-        })
+        Ok(Self { product, couplings })
     }
 
     pub fn operator(&self) -> &str {
