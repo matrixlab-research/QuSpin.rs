@@ -4,17 +4,17 @@ use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
 use nalgebra::{DMatrix, linalg::Schur};
-use quspin::basis::{
+use qmbed::basis::{
     Basis, BosonBasis1D, SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D, UserBasis,
 };
-use quspin::dynamics::{DriveStep, Floquet, SpectrumOptions, spectral_function};
-use quspin::measure::{Subspace, subspace_fidelity};
-use quspin::operator::{
+use qmbed::dynamics::{DriveStep, Floquet, SpectrumOptions, spectral_function};
+use qmbed::measure::{Subspace, subspace_fidelity};
+use qmbed::operator::{
     Coupling, LinearOperator, MatrixFormat, Operator, OperatorBuilder, OperatorTerm,
 };
-use quspin::solve::{EigshOptions, EvolutionOptions, SpectrumTarget, eigsh, evolve};
-use quspin::workflow::LindbladGenerator;
-use quspin::{Complex64, QuSpinError, Result};
+use qmbed::solve::{EigshOptions, EvolutionOptions, SpectrumTarget, eigsh, evolve};
+use qmbed::workflow::LindbladGenerator;
+use qmbed::{Complex64, QmbedError, Result};
 
 fn c(value: f64) -> Complex64 {
     Complex64::new(value, 0.0)
@@ -52,7 +52,7 @@ impl LinearOperator for DiagonalOperator {
 
     fn apply(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         if input.len() != self.diagonal.len() || output.len() != self.diagonal.len() {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "diagonal test operator shape mismatch".into(),
             ));
         }
@@ -107,7 +107,7 @@ fn periodic_blockade_states(sites: usize) -> Vec<u128> {
 #[test]
 fn error_categories_are_structured() {
     let basis = SpinBasis1D::builder(4).up(2).build().unwrap();
-    assert!(matches!(basis.state(6), Err(QuSpinError::StateNotInBasis)));
+    assert!(matches!(basis.state(6), Err(QmbedError::StateNotInBasis)));
 }
 
 #[test]

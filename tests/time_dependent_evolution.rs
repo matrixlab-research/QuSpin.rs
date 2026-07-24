@@ -1,7 +1,7 @@
 use approx::assert_abs_diff_eq;
-use quspin::Complex64;
-use quspin::operator::{Dynamic, DynamicComponent, Hamiltonian, MatrixFormat, Operator};
-use quspin::solve::{
+use qmbed::Complex64;
+use qmbed::operator::{Dynamic, DynamicComponent, Hamiltonian, MatrixFormat, Operator};
+use qmbed::solve::{
     EvolutionOptions, RhsEvolutionOptions, evolve_batch, evolve_density, evolve_rhs,
     evolve_time_dependent, evolve_time_dependent_batch,
 };

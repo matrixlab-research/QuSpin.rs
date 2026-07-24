@@ -1,6 +1,6 @@
 use approx::assert_abs_diff_eq;
-use quspin::Complex64;
-use quspin::workflow::track_states;
+use qmbed::Complex64;
+use qmbed::workflow::track_states;
 
 #[test]
 fn state_tracking_is_permutation_and_phase_invariant() {

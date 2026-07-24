@@ -1,11 +1,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use approx::assert_abs_diff_eq;
-use quspin::Complex64;
-use quspin::archive::{
+use qmbed::Complex64;
+use qmbed::archive::{
     ARCHIVE_VERSION, OperatorArchive, load_operator_npz, load_zip, save_operator_npz, save_zip,
 };
-use quspin::operator::{LinearOperator, MatrixFormat, Operator};
+use qmbed::operator::{LinearOperator, MatrixFormat, Operator};
 
 #[test]
 fn versioned_npz_round_trip_preserves_complex_values_and_requested_format() {
@@ -26,7 +26,7 @@ fn versioned_npz_round_trip_preserves_complex_values_and_requested_format() {
         .unwrap()
         .as_nanos();
     let path =
-        std::env::temp_dir().join(format!("quspin-archive-{}-{nonce}.npz", std::process::id()));
+        std::env::temp_dir().join(format!("qmbed-archive-{}-{nonce}.npz", std::process::id()));
     save_operator_npz(&operator, &path).unwrap();
     let loaded = load_operator_npz(&path, MatrixFormat::Csc).unwrap();
     assert_eq!(loaded.format(), MatrixFormat::Csc);
@@ -66,7 +66,7 @@ fn named_archive_preserves_dense_sparse_names_formats_and_defaults() {
         .unwrap();
     entries.insert("sparse", sparse.clone(), None).unwrap();
     let path = std::env::temp_dir().join(format!(
-        "quspin-rust-named-archive-{}.npz",
+        "qmbed-rust-named-archive-{}.npz",
         std::process::id()
     ));
     save_zip(&path, &entries).unwrap();

@@ -10,7 +10,7 @@ use faer::sparse::{SparseColMat, Triplet};
 use nalgebra::{DMatrix, SymmetricEigen, linalg::Schur};
 use num_complex::Complex64;
 
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 /// Backend-neutral result of a complete Hermitian eigendecomposition.
 pub(crate) struct HermitianEigensystem {
@@ -28,7 +28,7 @@ pub(crate) struct ComplexEigensystem {
 
 fn validate_square_dense(values: &[Complex64], dimension: usize) -> Result<()> {
     if values.len() != dimension.saturating_mul(dimension) {
-        return Err(QuSpinError::DimensionMismatch(format!(
+        return Err(QmbedError::DimensionMismatch(format!(
             "dense backend expected {} values for a {dimension}x{dimension} matrix, got {}",
             dimension.saturating_mul(dimension),
             values.len()
@@ -75,7 +75,7 @@ pub(crate) fn hermitian_eigenpairs(
     for column in 0..dimension {
         let value = triangular[(column, column)];
         if value.im.abs() > 1.0e-10 {
-            return Err(QuSpinError::NonHermitian);
+            return Err(QmbedError::NonHermitian);
         }
         let vector = (0..dimension).map(|row| vectors[(row, column)]).collect();
         eigenpairs.push((value.re, vector));
@@ -98,7 +98,7 @@ pub(crate) fn complex_eigenpairs(
         values[row * dimension + column]
     });
     let decomposition = matrix.eigen().map_err(|error| {
-        QuSpinError::UnsupportedBackend(format!("complex eigendecomposition failed: {error:?}"))
+        QmbedError::UnsupportedBackend(format!("complex eigendecomposition failed: {error:?}"))
     })?;
     Ok(ComplexEigensystem {
         eigenvalues: (0..dimension)
@@ -122,7 +122,7 @@ pub(crate) fn hermitian_exponential(
 ) -> Result<Vec<Complex64>> {
     validate_square_dense(values, dimension)?;
     if !coefficient.re.is_finite() || !coefficient.im.is_finite() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "matrix exponential coefficient must be finite".into(),
         ));
     }
@@ -176,7 +176,7 @@ pub trait ShiftedLinearSolver: Send + Sync {
     }
 
     fn solve_real(&self, _input: &[f64], _output: &mut [f64]) -> Result<()> {
-        Err(QuSpinError::UnsupportedBackend(
+        Err(QmbedError::UnsupportedBackend(
             "shifted factorization does not support real right-hand sides".into(),
         ))
     }
@@ -195,7 +195,7 @@ struct FaerShiftedSolver {
 impl ShiftedLinearSolver for FaerShiftedSolver {
     fn solve(&self, input: &[Complex64], output: &mut [Complex64]) -> Result<()> {
         if input.len() != self.dimension || output.len() != self.dimension {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "shifted solve input or output length does not match".into(),
             ));
         }
@@ -226,12 +226,12 @@ impl ShiftedLinearSolver for FaerShiftedSolver {
 
     fn solve_real(&self, input: &[f64], output: &mut [f64]) -> Result<()> {
         if input.len() != self.dimension || output.len() != self.dimension {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "real shifted solve input or output length does not match".into(),
             ));
         }
         let FaerShiftedFactorization::Real(factorization) = &self.factorization else {
-            return Err(QuSpinError::UnsupportedBackend(
+            return Err(QmbedError::UnsupportedBackend(
                 "complex shifted factorization cannot use the real fast path".into(),
             ));
         };
@@ -257,7 +257,7 @@ pub(crate) fn factor_shifted_csc(
         || row_indices.len() != values.len()
         || !shift.is_finite()
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "invalid CSC storage for shifted factorization".into(),
         ));
     }
@@ -277,11 +277,11 @@ pub(crate) fn factor_shifted_csc(
         let matrix =
             SparseColMat::<usize, f64>::try_new_from_triplets(dimension, dimension, &triplets)
                 .map_err(|error| {
-                    QuSpinError::UnsupportedBackend(format!(
+                    QmbedError::UnsupportedBackend(format!(
                         "could not construct real sparse shifted matrix: {error}"
                     ))
                 })?;
-        let factorization = matrix.sp_lu().map_err(|_| QuSpinError::NonConvergence {
+        let factorization = matrix.sp_lu().map_err(|_| QmbedError::NonConvergence {
             iterations: 0,
             residual: f64::INFINITY,
         })?;
@@ -305,11 +305,11 @@ pub(crate) fn factor_shifted_csc(
     let matrix =
         SparseColMat::<usize, Complex64>::try_new_from_triplets(dimension, dimension, &triplets)
             .map_err(|error| {
-                QuSpinError::UnsupportedBackend(format!(
+                QmbedError::UnsupportedBackend(format!(
                     "could not construct complex sparse shifted matrix: {error}"
                 ))
             })?;
-    let factorization = matrix.sp_lu().map_err(|_| QuSpinError::NonConvergence {
+    let factorization = matrix.sp_lu().map_err(|_| QmbedError::NonConvergence {
         iterations: 0,
         residual: f64::INFINITY,
     })?;

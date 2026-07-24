@@ -5,7 +5,7 @@ use num_complex::Complex64;
 use crate::basis::BasisProjector;
 use crate::operator::{LinearOperator, MatrixFormat, Operator};
 use crate::solve::{StateTrajectory, eigh};
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 /// Gauge-independent finite-dimensional subspace.
 #[derive(Clone, Debug)]
@@ -24,7 +24,7 @@ impl Subspace {
             || rank == 0
             || column_major_vectors.len() != ambient_dimension.saturating_mul(rank)
         {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "subspace storage must contain ambient_dimension * rank entries".into(),
             ));
         }
@@ -41,7 +41,7 @@ impl Subspace {
             }
             let norm = vector.iter().map(Complex64::norm_sqr).sum::<f64>().sqrt();
             if norm <= 1.0e-13 {
-                return Err(QuSpinError::RankDeficient);
+                return Err(QmbedError::RankDeficient);
             }
             for value in &mut vector {
                 *value /= norm;
@@ -77,13 +77,13 @@ fn inner(left: &[Complex64], right: &[Complex64]) -> Complex64 {
 /// Mean squared principal-angle cosine between two subspaces.
 pub fn subspace_fidelity(left: &Subspace, right: &Subspace) -> Result<f64> {
     if left.ambient_dimension != right.ambient_dimension {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "subspaces must share an ambient dimension".into(),
         ));
     }
     let denominator = left.rank().min(right.rank());
     if denominator == 0 {
-        return Err(QuSpinError::RankDeficient);
+        return Err(QmbedError::RankDeficient);
     }
     let overlap_norm: f64 = left
         .columns
@@ -105,7 +105,7 @@ pub fn matrix_element(
 ) -> Result<Complex64> {
     let shape = operator.shape();
     if left.len() != shape.0 || right.len() != shape.1 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "matrix-element vectors do not match the operator shape".into(),
         ));
     }
@@ -128,13 +128,13 @@ pub fn quantum_fluctuation(
 ) -> Result<f64> {
     let shape = operator.shape();
     if shape.0 != shape.1 || state.len() != shape.0 {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "quantum fluctuation requires a square operator matching the state".into(),
         ));
     }
     let norm = inner(state, state).re;
     if !norm.is_finite() || norm <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "state must have positive finite norm".into(),
         ));
     }
@@ -157,16 +157,16 @@ pub fn partial_trace(
             != subsystem_dimension
                 .checked_mul(environment_dimension)
                 .ok_or_else(|| {
-                    QuSpinError::DimensionMismatch("tensor-product dimension overflow".into())
+                    QmbedError::DimensionMismatch("tensor-product dimension overflow".into())
                 })?
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "state length must equal subsystem_dimension * environment_dimension".into(),
         ));
     }
     let norm = state.iter().map(Complex64::norm_sqr).sum::<f64>();
     if !norm.is_finite() || norm <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "state must have positive finite norm".into(),
         ));
     }
@@ -193,14 +193,12 @@ pub fn partial_trace_density(
 ) -> Result<Vec<Complex64>> {
     let dimension = subsystem_dimension
         .checked_mul(environment_dimension)
-        .ok_or_else(|| {
-            QuSpinError::DimensionMismatch("tensor-product dimension overflow".into())
-        })?;
+        .ok_or_else(|| QmbedError::DimensionMismatch("tensor-product dimension overflow".into()))?;
     if subsystem_dimension == 0
         || environment_dimension == 0
         || density.len() != dimension.saturating_mul(dimension)
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "density shape must match the bipartite Hilbert space".into(),
         ));
     }
@@ -208,7 +206,7 @@ pub fn partial_trace_density(
         .map(|index| density[index * dimension + index])
         .sum();
     if trace.im.abs() > 1.0e-10 || !trace.re.is_finite() || trace.re <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "density matrix must have a positive real trace".into(),
         ));
     }
@@ -217,7 +215,7 @@ pub fn partial_trace_density(
             if (density[row * dimension + column] - density[column * dimension + row].conj()).norm()
                 > 1.0e-10
             {
-                return Err(QuSpinError::InvalidOptions(
+                return Err(QmbedError::InvalidOptions(
                     "density matrix must be Hermitian".into(),
                 ));
             }
@@ -251,20 +249,20 @@ fn subsystem_index_map(
     retained_sites: &[usize],
 ) -> Result<SubsystemIndexMap> {
     if local_dimensions.is_empty() || local_dimensions.contains(&0) {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "local dimensions must be a nonempty list of positive values".into(),
         ));
     }
     let mut retained = vec![false; local_dimensions.len()];
     for &site in retained_sites {
         if site >= local_dimensions.len() {
-            return Err(QuSpinError::InvalidSite {
+            return Err(QmbedError::InvalidSite {
                 site,
                 sites: local_dimensions.len(),
             });
         }
         if std::mem::replace(&mut retained[site], true) {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "retained subsystem sites must be unique".into(),
             ));
         }
@@ -273,7 +271,7 @@ fn subsystem_index_map(
         sites.iter().try_fold(1_usize, |dimension, &site| {
             dimension
                 .checked_mul(local_dimensions[site])
-                .ok_or_else(|| QuSpinError::DimensionMismatch("Hilbert-space size overflow".into()))
+                .ok_or_else(|| QmbedError::DimensionMismatch("Hilbert-space size overflow".into()))
         })
     };
     let environment_sites: Vec<_> = (0..local_dimensions.len())
@@ -283,7 +281,7 @@ fn subsystem_index_map(
     let environment_dimension = product(&environment_sites)?;
     let full_dimension = subsystem_dimension
         .checked_mul(environment_dimension)
-        .ok_or_else(|| QuSpinError::DimensionMismatch("Hilbert-space size overflow".into()))?;
+        .ok_or_else(|| QmbedError::DimensionMismatch("Hilbert-space size overflow".into()))?;
 
     let mut subsystem_indices = vec![0; full_dimension];
     let mut environment_indices = vec![0; full_dimension];
@@ -323,13 +321,13 @@ pub fn partial_trace_subsystem(
 ) -> Result<Vec<Complex64>> {
     let layout = subsystem_index_map(local_dimensions, retained_sites)?;
     if state.len() != layout.full_dimension {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "state length does not match the product of local dimensions".into(),
         ));
     }
     let norm = state.iter().map(Complex64::norm_sqr).sum::<f64>();
     if !norm.is_finite() || norm <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "state must have positive finite norm".into(),
         ));
     }
@@ -363,7 +361,7 @@ pub fn partial_trace_density_subsystem(
 ) -> Result<Vec<Complex64>> {
     let layout = subsystem_index_map(local_dimensions, retained_sites)?;
     if density.len() != layout.full_dimension.saturating_mul(layout.full_dimension) {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "density shape does not match the product of local dimensions".into(),
         ));
     }
@@ -371,7 +369,7 @@ pub fn partial_trace_density_subsystem(
         .map(|index| density[index * layout.full_dimension + index])
         .sum();
     if trace.im.abs() > 1.0e-10 || !trace.re.is_finite() || trace.re <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "density matrix must have a positive real trace".into(),
         ));
     }
@@ -382,7 +380,7 @@ pub fn partial_trace_density_subsystem(
             .norm()
                 > 1.0e-10
             {
-                return Err(QuSpinError::InvalidOptions(
+                return Err(QmbedError::InvalidOptions(
                     "density matrix must be Hermitian".into(),
                 ));
             }
@@ -426,7 +424,7 @@ fn entropy_from_probabilities(probabilities: Vec<f64>, order: EntropyOrder) -> R
                 .ln()
                 / (1.0 - alpha))
         }
-        EntropyOrder::Renyi(_) => Err(QuSpinError::InvalidOptions(
+        EntropyOrder::Renyi(_) => Err(QmbedError::InvalidOptions(
             "Renyi order must be positive, finite, and different from one".into(),
         )),
     }
@@ -440,7 +438,7 @@ pub fn entanglement_entropy(
 ) -> Result<f64> {
     if matches!(order, EntropyOrder::Renyi(alpha) if !alpha.is_finite() || alpha <= 0.0 || (alpha - 1.0).abs() <= 1.0e-12)
     {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "Renyi order must be positive, finite, and different from one".into(),
         ));
     }
@@ -452,7 +450,7 @@ pub fn entanglement_entropy(
         .into_iter()
         .map(|value| {
             if value < -1.0e-10 {
-                Err(QuSpinError::InvalidOptions(
+                Err(QmbedError::InvalidOptions(
                     "reduced density matrix is not positive".into(),
                 ))
             } else {
@@ -529,7 +527,7 @@ fn density_spectrum(density: Vec<Complex64>, dimension: usize) -> Result<Vec<f64
     let mut probabilities = Vec::with_capacity(dimension);
     for value in spectrum.eigenvalues {
         if value < -1.0e-10 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "density matrix is not positive semidefinite".into(),
             ));
         }
@@ -578,7 +576,7 @@ pub fn density_expectation(
 ) -> Result<Complex64> {
     let shape = operator.shape();
     if shape.0 != shape.1 || density.len() != shape.0.saturating_mul(shape.0) {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "density expectation requires a square operator and matching density".into(),
         ));
     }
@@ -601,14 +599,14 @@ pub fn observables_vs_time(
     observables: &[(String, &dyn LinearOperator)],
 ) -> Result<HashMap<String, Vec<Complex64>>> {
     if trajectory.times.len() != trajectory.states.len() {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "trajectory times and states must have equal lengths".into(),
         ));
     }
     let mut result = HashMap::with_capacity(observables.len());
     for (name, operator) in observables {
         if name.is_empty() || result.contains_key(name) {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "observable names must be nonempty and unique".into(),
             ));
         }
@@ -636,7 +634,7 @@ pub fn ed_state_vs_time(
         || eigenvectors.len() != dimension
         || eigenvectors.iter().any(|vector| vector.len() != dimension)
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "complete eigensystem, state, and finite nonempty times are required".into(),
         ));
     }
@@ -680,7 +678,7 @@ pub fn ed_density_vs_time(
         || times.is_empty()
         || times.iter().any(|time| !time.is_finite())
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "density matrix and complete eigensystem dimensions do not match".into(),
         ));
     }
@@ -736,7 +734,7 @@ fn summarize_diagonal_probabilities(
 ) -> Result<DiagonalEnsemble> {
     let probability_sum = probabilities.iter().sum::<f64>();
     if probability_sum <= f64::EPSILON || !probability_sum.is_finite() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "eigenvectors have no finite overlap with the initial state".into(),
         ));
     }
@@ -776,13 +774,13 @@ pub fn diagonal_ensemble(
             .iter()
             .any(|vector| vector.len() != initial.len())
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "eigensystem and initial state dimensions do not match".into(),
         ));
     }
     let initial_norm = inner(initial, initial).re;
     if !initial_norm.is_finite() || initial_norm <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "initial state must have positive finite norm".into(),
         ));
     }
@@ -803,7 +801,7 @@ pub fn diagonal_ensemble_density(
         || eigenvectors.iter().any(|vector| vector.len() != dimension)
         || initial_density.len() != dimension.saturating_mul(dimension)
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "eigensystem and initial density dimensions do not match".into(),
         ));
     }
@@ -811,7 +809,7 @@ pub fn diagonal_ensemble_density(
         .map(|index| initial_density[index * dimension + index])
         .sum();
     if trace.im.abs() > 1.0e-10 || !trace.re.is_finite() || trace.re <= f64::EPSILON {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "initial density must have a positive real trace".into(),
         ));
     }
@@ -827,7 +825,7 @@ pub fn diagonal_ensemble_density(
                 }
             }
             if value.im.abs() > 1.0e-10 || value.re < -1.0e-10 {
-                Err(QuSpinError::InvalidOptions(
+                Err(QmbedError::InvalidOptions(
                     "initial density is not positive in the supplied eigenbasis".into(),
                 ))
             } else {
@@ -848,7 +846,7 @@ pub fn diagonal_ensemble_observable(
             vector.len() != observable.shape().0 || observable.shape().0 != observable.shape().1
         })
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "diagonal ensemble, eigenvectors, and observable do not match".into(),
         ));
     }
@@ -871,7 +869,7 @@ pub fn energy_window_indices(
         || half_width < 0.0
         || eigenvalues.iter().any(|value| !value.is_finite())
     {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "energy-window inputs must be finite and the half-width nonnegative".into(),
         ));
     }
@@ -890,14 +888,14 @@ pub fn kl_divergence(left: &[f64], right: &[f64]) -> Result<f64> {
             .chain(right)
             .any(|value| !value.is_finite() || *value <= 0.0)
     {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "KL distributions must be nonempty, equal-length, finite, and strictly positive".into(),
         ));
     }
     let left_sum = left.iter().sum::<f64>();
     let right_sum = right.iter().sum::<f64>();
     if (left_sum - 1.0).abs() > 1.0e-13 || (right_sum - 1.0).abs() > 1.0e-13 {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "KL distributions must be normalized".into(),
         ));
     }
@@ -912,12 +910,12 @@ pub fn kl_divergence(left: &[f64], right: &[f64]) -> Result<f64> {
 /// Mean adjacent-gap ratio of an ordered spectrum.
 pub fn mean_level_spacing(eigenvalues: &[f64]) -> Result<f64> {
     if eigenvalues.len() < 3 || eigenvalues.iter().any(|value| !value.is_finite()) {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "level-spacing statistics require at least three finite values".into(),
         ));
     }
     if eigenvalues.windows(2).any(|pair| pair[0] > pair[1]) {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "level spectrum must be sorted in ascending order".into(),
         ));
     }
@@ -941,7 +939,7 @@ pub fn states_to_array(
     local_dimension: usize,
 ) -> Result<Vec<Vec<usize>>> {
     if local_dimension < 2 {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "local dimension must be at least two".into(),
         ));
     }
@@ -955,7 +953,7 @@ pub fn states_to_array(
             value /= base;
         }
         if value != 0 {
-            return Err(QuSpinError::StateNotInBasis);
+            return Err(QmbedError::StateNotInBasis);
         }
         result.push(occupations);
     }
@@ -964,7 +962,7 @@ pub fn states_to_array(
 
 pub fn array_to_states(arrays: &[Vec<usize>], local_dimension: usize) -> Result<Vec<u128>> {
     if local_dimension < 2 {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "local dimension must be at least two".into(),
         ));
     }
@@ -978,7 +976,7 @@ pub fn array_to_states(arrays: &[Vec<usize>], local_dimension: usize) -> Result<
                     .iter()
                     .any(|occupation| *occupation >= local_dimension)
             {
-                return Err(QuSpinError::InvalidSector(
+                return Err(QmbedError::InvalidSector(
                     "occupation arrays must have equal length and valid digits".into(),
                 ));
             }
@@ -987,13 +985,13 @@ pub fn array_to_states(arrays: &[Vec<usize>], local_dimension: usize) -> Result<
             for &occupation in occupations {
                 state = state
                     .checked_add(place.checked_mul(occupation as u128).ok_or_else(|| {
-                        QuSpinError::UnsupportedBackend("state encoding overflow".into())
+                        QmbedError::UnsupportedBackend("state encoding overflow".into())
                     })?)
                     .ok_or_else(|| {
-                        QuSpinError::UnsupportedBackend("state encoding overflow".into())
+                        QmbedError::UnsupportedBackend("state encoding overflow".into())
                     })?;
                 place = place.checked_mul(base).ok_or_else(|| {
-                    QuSpinError::UnsupportedBackend("state encoding overflow".into())
+                    QmbedError::UnsupportedBackend("state encoding overflow".into())
                 })?;
             }
             Ok(state)
@@ -1004,7 +1002,7 @@ pub fn array_to_states(arrays: &[Vec<usize>], local_dimension: usize) -> Result<
 /// Convert integer states to most-significant-site-first binary rows.
 pub fn ints_to_array(states: &[u128], sites: usize) -> Result<Vec<Vec<u8>>> {
     if sites > 128 {
-        return Err(QuSpinError::UnsupportedBackend(
+        return Err(QmbedError::UnsupportedBackend(
             "u128 binary conversion supports at most 128 sites".into(),
         ));
     }
@@ -1012,7 +1010,7 @@ pub fn ints_to_array(states: &[u128], sites: usize) -> Result<Vec<Vec<u8>>> {
         .iter()
         .any(|state| sites < 128 && *state >= (1_u128 << sites))
     {
-        return Err(QuSpinError::StateNotInBasis);
+        return Err(QmbedError::StateNotInBasis);
     }
     Ok(states
         .iter()
@@ -1028,7 +1026,7 @@ pub fn ints_to_array(states: &[u128], sites: usize) -> Result<Vec<Vec<u8>>> {
 pub fn array_to_ints(arrays: &[Vec<u8>]) -> Result<Vec<u128>> {
     let sites = arrays.first().map_or(0, Vec::len);
     if sites > 128 {
-        return Err(QuSpinError::UnsupportedBackend(
+        return Err(QmbedError::UnsupportedBackend(
             "u128 binary conversion supports at most 128 sites".into(),
         ));
     }
@@ -1036,7 +1034,7 @@ pub fn array_to_ints(arrays: &[Vec<u8>]) -> Result<Vec<u128>> {
         .iter()
         .map(|row| {
             if row.len() != sites || row.iter().any(|bit| *bit > 1) {
-                return Err(QuSpinError::InvalidSector(
+                return Err(QmbedError::InvalidSector(
                     "binary state rows must have equal lengths and contain only zero or one".into(),
                 ));
             }
@@ -1059,7 +1057,7 @@ pub fn project_operator(
     if operator_dimension.0 != operator_dimension.1
         || (operator_dimension.0 != source_dimension && operator_dimension.0 != reduced_dimension)
     {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "operator dimension must match the parent or reduced projector space".into(),
         ));
     }

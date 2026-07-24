@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use approx::assert_abs_diff_eq;
-use quspin::Complex64;
-use quspin::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
-use quspin::solve::{
+use qmbed::Complex64;
+use qmbed::operator::{ExpOp, LinearOperator, MatrixFormat, Operator};
+use qmbed::solve::{
     EigshOptions, ExpmMultiplyParallel, ExpmOptions, LanczosOptions, ShiftInvertPlan,
     SpectrumTarget, eigsh, expm_multiply, ftlm_observable_iteration, ftlm_static_iteration,
     lanczos_full, lanczos_iter, linear_combination_qt, ltlm_observable_iteration,

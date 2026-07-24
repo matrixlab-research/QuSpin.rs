@@ -1,10 +1,13 @@
-# QuSpin.rs
+# QMBED
 
-`quspin` is a Rust-native exact-diagonalization toolkit derived from real
-many-body workflows. It preserves the physical capabilities of Python QuSpin
-without copying Python's class layout: a basis defines states and local
+**MATRIX / SIM · Quantum Many-Body Exact Diagonalization**
+
+`qmbed` is a Rust-native exact-diagonalization toolkit derived from real
+many-body workflows. Its native API is organized around mathematical
+capabilities rather than Python class layout: a basis defines states and local
 transitions, and every stored or matrix-free map implements one rectangular
-`LinearOperator` interface.
+`LinearOperator` interface. QuSpin-derived spellings remain available under
+`qmbed::compat::quspin` during migration.
 
 ## Implemented capability surface
 
@@ -35,9 +38,9 @@ sector dimension instead of scanning the full parent Hilbert space.
 ## Minimal example
 
 ```rust
-use quspin::basis::SpinBasis1D;
-use quspin::operator::{Coupling, MatrixFormat, OperatorBuilder, OperatorTerm};
-use quspin::solve::{eigsh, EigshOptions};
+use qmbed::basis::SpinBasis1D;
+use qmbed::operator::{Coupling, MatrixFormat, OperatorBuilder, OperatorTerm};
+use qmbed::solve::{eigsh, EigshOptions};
 
 let basis = SpinBasis1D::builder(12).up(6).momentum(0).build()?;
 let bonds = (0..12).map(|site| Coupling::new(1.0, vec![site, (site + 1) % 12]));
@@ -45,7 +48,7 @@ let hamiltonian = OperatorBuilder::on(&basis)
     .term(OperatorTerm::new("zz", bonds)?)
     .build(MatrixFormat::Csc)?;
 let low_energy = eigsh(&hamiltonian, EigshOptions::smallest_algebraic(4))?;
-# Ok::<(), quspin::QuSpinError>(())
+# Ok::<(), qmbed::QmbedError>(())
 ```
 
 The same `OperatorBuilder::between(source, target)` path constructs a
@@ -64,12 +67,13 @@ matvec loops. Real CSC Hamiltonians retain real arithmetic through both the
 factorization and shift-invert Lanczos path; complex operators use the same
 public solver contract.
 
-## Verification boundary
+## Benchmark and verification boundary
 
 The public suite contains deterministic numerical properties and regressions.
-The private verification repository adds held-out numerical oracles and twelve
-medium-size workflows derived from published many-body calculations. These
-are reported separately:
+The public
+[QMBED Benchmark](https://github.com/matrixlab-research/QMBED-benchmark)
+repository adds independent numerical oracles and twelve medium-size workflows
+derived from published many-body calculations. These are reported separately:
 
 1. public surface and properties;
 2. independent numerical oracles;
@@ -77,7 +81,7 @@ are reported separately:
 4. representative sparse and symmetry-reduced scale.
 
 A green API-presence test alone is not treated as parity. The complete design
-and acceptance criteria are maintained in the private verifier's
+and acceptance criteria are maintained in QMBED Benchmark's
 `rust/full-taskdoc/` documents. The original frozen clean-room task for the
 23-symbol workflow core remains available separately:
 

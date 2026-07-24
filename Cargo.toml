@@ -1,11 +1,11 @@
 [package]
-name = "quspin"
+name = "qmbed"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "Rust-native exact diagonalization toolkit derived from scientific workflows"
-repository = "https://github.com/matrixlab-research/QuSpin.rs"
+description = "QMBED: Rust-native quantum many-body exact diagonalization"
+repository = "https://github.com/matrixlab-research/QMBED"
 readme = "README.md"
 keywords = ["quantum", "exact-diagonalization", "sparse", "physics"]
 categories = ["science", "mathematics"]

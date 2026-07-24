@@ -1,6 +1,6 @@
-use quspin::Complex64;
-use quspin::archive::{load_operator_npz, save_operator_npz};
-use quspin::operator::{MatrixFormat, Operator};
+use qmbed::Complex64;
+use qmbed::archive::{load_operator_npz, save_operator_npz};
+use qmbed::operator::{MatrixFormat, Operator};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: Vec<_> = std::env::args().collect();

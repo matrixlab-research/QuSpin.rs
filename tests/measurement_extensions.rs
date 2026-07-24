@@ -1,6 +1,6 @@
 use approx::assert_abs_diff_eq;
-use quspin::Complex64;
-use quspin::measure::{
+use qmbed::Complex64;
+use qmbed::measure::{
     EntropyOrder, array_to_ints, array_to_states, density_expectation, diagonal_ensemble,
     diagonal_ensemble_density, diagonal_ensemble_observable, ed_density_vs_time, ed_state_vs_time,
     energy_window_indices, entanglement_entropy, entanglement_entropy_batch,
@@ -10,8 +10,8 @@ use quspin::measure::{
     mean_level_spacing, observables_vs_time, partial_trace, partial_trace_density,
     partial_trace_density_subsystem, partial_trace_subsystem, quantum_fluctuation, states_to_array,
 };
-use quspin::operator::Operator;
-use quspin::solve::StateTrajectory;
+use qmbed::operator::Operator;
+use qmbed::solve::StateTrajectory;
 
 fn sigma_z() -> Operator {
     Operator::from_dense(

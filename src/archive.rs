@@ -10,12 +10,12 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 use crate::operator::{
     LinearOperator, MatrixFormat, Operator, QuantumComponent, QuantumOperator, materialize_dense,
 };
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 pub const ARCHIVE_VERSION: u8 = 1;
 
-fn archive_error(error: impl std::fmt::Display) -> QuSpinError {
-    QuSpinError::Archive(error.to_string())
+fn archive_error(error: impl std::fmt::Display) -> QmbedError {
+    QmbedError::Archive(error.to_string())
 }
 
 fn npy_header(descriptor: &str, shape: &[usize]) -> Result<Vec<u8>> {
@@ -38,9 +38,9 @@ fn npy_header(descriptor: &str, shape: &[usize]) -> Result<Vec<u8>> {
         .len()
         .checked_add(padding)
         .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| QuSpinError::Archive("NPY header length overflow".into()))?;
+        .ok_or_else(|| QmbedError::Archive("NPY header length overflow".into()))?;
     let header_length = u16::try_from(header_length)
-        .map_err(|_| QuSpinError::Archive("NPY v1 header is too long".into()))?;
+        .map_err(|_| QmbedError::Archive("NPY v1 header is too long".into()))?;
     let mut output = Vec::with_capacity(10 + usize::from(header_length));
     output.extend_from_slice(b"\x93NUMPY");
     output.extend_from_slice(&[1, 0]);
@@ -77,7 +77,7 @@ fn write_complex_npy(
     values: &[Complex64],
 ) -> Result<()> {
     if values.len() != rows.saturating_mul(columns) {
-        return Err(QuSpinError::DimensionMismatch(
+        return Err(QmbedError::DimensionMismatch(
             "archive matrix values do not match its shape".into(),
         ));
     }
@@ -97,7 +97,7 @@ fn parse_npy_header(reader: &mut impl Read) -> Result<(String, Vec<usize>)> {
     let mut magic = [0_u8; 6];
     reader.read_exact(&mut magic).map_err(archive_error)?;
     if &magic != b"\x93NUMPY" {
-        return Err(QuSpinError::Archive("invalid NPY magic".into()));
+        return Err(QmbedError::Archive("invalid NPY magic".into()));
     }
     let mut version = [0_u8; 2];
     reader.read_exact(&mut version).map_err(archive_error)?;
@@ -111,15 +111,15 @@ fn parse_npy_header(reader: &mut impl Read) -> Result<(String, Vec<usize>)> {
             let mut bytes = [0_u8; 4];
             reader.read_exact(&mut bytes).map_err(archive_error)?;
             usize::try_from(u32::from_le_bytes(bytes))
-                .map_err(|_| QuSpinError::Archive("NPY header is too large".into()))?
+                .map_err(|_| QmbedError::Archive("NPY header is too large".into()))?
         }
-        _ => return Err(QuSpinError::Archive("unsupported NPY version".into())),
+        _ => return Err(QmbedError::Archive("unsupported NPY version".into())),
     };
     let mut header = vec![0_u8; header_length];
     reader.read_exact(&mut header).map_err(archive_error)?;
     let header = std::str::from_utf8(&header).map_err(archive_error)?.trim();
     if header.contains("'fortran_order': True") || header.contains("\"fortran_order\": True") {
-        return Err(QuSpinError::Archive(
+        return Err(QmbedError::Archive(
             "Fortran-ordered NPY matrices are not supported".into(),
         ));
     }
@@ -130,17 +130,17 @@ fn parse_npy_header(reader: &mut impl Read) -> Result<(String, Vec<usize>)> {
     };
     let descriptor_tail = header
         .split_once(descriptor_marker)
-        .ok_or_else(|| QuSpinError::Archive("NPY descriptor is missing".into()))?
+        .ok_or_else(|| QmbedError::Archive("NPY descriptor is missing".into()))?
         .1
         .trim_start();
     let quote = descriptor_tail
         .chars()
         .next()
         .filter(|character| *character == '\'' || *character == '"')
-        .ok_or_else(|| QuSpinError::Archive("invalid NPY descriptor".into()))?;
+        .ok_or_else(|| QmbedError::Archive("invalid NPY descriptor".into()))?;
     let descriptor = descriptor_tail[1..]
         .split_once(quote)
-        .ok_or_else(|| QuSpinError::Archive("invalid NPY descriptor".into()))?
+        .ok_or_else(|| QmbedError::Archive("invalid NPY descriptor".into()))?
         .0
         .to_string();
     let shape_marker = if header.contains("'shape':") {
@@ -150,13 +150,13 @@ fn parse_npy_header(reader: &mut impl Read) -> Result<(String, Vec<usize>)> {
     };
     let shape_tail = header
         .split_once(shape_marker)
-        .ok_or_else(|| QuSpinError::Archive("NPY shape is missing".into()))?
+        .ok_or_else(|| QmbedError::Archive("NPY shape is missing".into()))?
         .1;
     let shape_text = shape_tail
         .split_once('(')
         .and_then(|(_, tail)| tail.split_once(')'))
         .map(|(shape, _)| shape)
-        .ok_or_else(|| QuSpinError::Archive("invalid NPY shape".into()))?;
+        .ok_or_else(|| QmbedError::Archive("invalid NPY shape".into()))?;
     let shape = shape_text
         .split(',')
         .map(str::trim)
@@ -169,7 +169,7 @@ fn parse_npy_header(reader: &mut impl Read) -> Result<(String, Vec<usize>)> {
 fn read_version(reader: &mut impl Read) -> Result<u8> {
     let (descriptor, shape) = parse_npy_header(reader)?;
     if descriptor != "|u1" || shape != [1] {
-        return Err(QuSpinError::Archive("invalid archive-version array".into()));
+        return Err(QmbedError::Archive("invalid archive-version array".into()));
     }
     let mut version = [0_u8; 1];
     reader.read_exact(&mut version).map_err(archive_error)?;
@@ -179,7 +179,7 @@ fn read_version(reader: &mut impl Read) -> Result<u8> {
 fn read_u64_vector(reader: &mut impl Read) -> Result<Vec<u64>> {
     let (descriptor, shape) = parse_npy_header(reader)?;
     if !matches!(descriptor.as_str(), "<u8" | "=u8" | "|u8") || shape.len() != 1 {
-        return Err(QuSpinError::Archive(
+        return Err(QmbedError::Archive(
             "sparse index arrays must be one-dimensional uint64 arrays".into(),
         ));
     }
@@ -195,13 +195,13 @@ fn read_u64_vector(reader: &mut impl Read) -> Result<Vec<u64>> {
 fn read_complex_matrix(reader: &mut impl Read) -> Result<(usize, usize, Vec<Complex64>)> {
     let (descriptor, shape) = parse_npy_header(reader)?;
     if !matches!(descriptor.as_str(), "<c16" | "=c16" | "|c16") || shape.len() != 2 {
-        return Err(QuSpinError::Archive(
+        return Err(QmbedError::Archive(
             "matrix.npy must be a C-order complex128 matrix".into(),
         ));
     }
     let count = shape[0]
         .checked_mul(shape[1])
-        .ok_or_else(|| QuSpinError::Archive("archive matrix size overflow".into()))?;
+        .ok_or_else(|| QmbedError::Archive("archive matrix size overflow".into()))?;
     let mut values = Vec::with_capacity(count);
     for _ in 0..count {
         let mut real = [0_u8; 8];
@@ -245,7 +245,7 @@ pub fn load_operator_npz(path: impl AsRef<Path>, format: MatrixFormat) -> Result
     if let Ok(mut version_entry) = archive.by_name("archive_version.npy") {
         let version = read_version(&mut version_entry)?;
         if version != ARCHIVE_VERSION {
-            return Err(QuSpinError::Archive(format!(
+            return Err(QmbedError::Archive(format!(
                 "unsupported operator archive version {version}"
             )));
         }
@@ -283,7 +283,7 @@ impl OperatorArchive {
                 .chars()
                 .any(|character| !(character.is_ascii_alphanumeric() || "_.-".contains(character)))
         {
-            return Err(QuSpinError::Archive(
+            return Err(QmbedError::Archive(
                 "archive entry names may contain only ASCII letters, digits, `_`, `-`, and `.`"
                     .into(),
             ));
@@ -293,7 +293,7 @@ impl OperatorArchive {
             .insert(name.clone(), OperatorArchiveEntry { operator, default })
             .is_some()
         {
-            return Err(QuSpinError::Archive(format!(
+            return Err(QmbedError::Archive(format!(
                 "duplicate archive entry {name:?}"
             )));
         }
@@ -350,7 +350,7 @@ fn parse_format(value: &str) -> Result<MatrixFormat> {
         "csr" => Ok(MatrixFormat::Csr),
         "dia" => Ok(MatrixFormat::Dia),
         "matrix_free" => Ok(MatrixFormat::MatrixFree),
-        _ => Err(QuSpinError::Archive(format!(
+        _ => Err(QmbedError::Archive(format!(
             "unknown archived matrix format {value:?}"
         ))),
     }
@@ -359,7 +359,7 @@ fn parse_format(value: &str) -> Result<MatrixFormat> {
 /// Save named dense/sparse components without executing serialization callbacks.
 pub fn save_zip(path: impl AsRef<Path>, entries: &OperatorArchive) -> Result<()> {
     if entries.entries.is_empty() {
-        return Err(QuSpinError::Archive(
+        return Err(QmbedError::Archive(
             "an operator archive must contain at least one entry".into(),
         ));
     }
@@ -433,7 +433,7 @@ pub fn load_zip(path: impl AsRef<Path>) -> Result<OperatorArchive> {
             .map_err(archive_error)?;
         let version = read_version(&mut version_entry)?;
         if version != ARCHIVE_VERSION {
-            return Err(QuSpinError::Archive(format!(
+            return Err(QmbedError::Archive(format!(
                 "unsupported operator archive version {version}"
             )));
         }
@@ -448,7 +448,7 @@ pub fn load_zip(path: impl AsRef<Path>) -> Result<OperatorArchive> {
     for (index, line) in manifest.lines().enumerate() {
         let fields: Vec<_> = line.split('\t').collect();
         if fields.len() != 7 {
-            return Err(QuSpinError::Archive("invalid archive manifest row".into()));
+            return Err(QmbedError::Archive("invalid archive manifest row".into()));
         }
         let format = parse_format(fields[1])?;
         let rows = fields[2].parse::<usize>().map_err(archive_error)?;
@@ -459,7 +459,7 @@ pub fn load_zip(path: impl AsRef<Path>) -> Result<OperatorArchive> {
                 fields[5].parse::<f64>().map_err(archive_error)?,
                 fields[6].parse::<f64>().map_err(archive_error)?,
             )),
-            _ => return Err(QuSpinError::Archive("invalid default marker".into())),
+            _ => return Err(QmbedError::Archive("invalid default marker".into())),
         };
         let operator = if format == MatrixFormat::Dense {
             let mut matrix = archive
@@ -467,7 +467,7 @@ pub fn load_zip(path: impl AsRef<Path>) -> Result<OperatorArchive> {
                 .map_err(archive_error)?;
             let (actual_rows, actual_columns, values) = read_complex_matrix(&mut matrix)?;
             if (actual_rows, actual_columns) != (rows, columns) {
-                return Err(QuSpinError::Archive(
+                return Err(QmbedError::Archive(
                     "dense entry shape disagrees with the manifest".into(),
                 ));
             }
@@ -491,14 +491,14 @@ pub fn load_zip(path: impl AsRef<Path>) -> Result<OperatorArchive> {
                     .map_err(archive_error)?;
                 let (value_rows, value_columns, values) = read_complex_matrix(&mut entry)?;
                 if value_columns != 1 || value_rows != row_indices.len() {
-                    return Err(QuSpinError::Archive(
+                    return Err(QmbedError::Archive(
                         "sparse values shape disagrees with sparse indices".into(),
                     ));
                 }
                 values
             };
             if row_indices.len() != column_indices.len() || row_indices.len() != values.len() {
-                return Err(QuSpinError::Archive(
+                return Err(QmbedError::Archive(
                     "sparse archive arrays have unequal lengths".into(),
                 ));
             }

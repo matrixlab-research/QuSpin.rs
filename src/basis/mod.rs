@@ -7,7 +7,7 @@ use num_complex::Complex64;
 use smallvec::SmallVec;
 
 use crate::operator::{LinearOperator, MatrixFormat, check_apply_shape};
-use crate::{QuSpinError, Result};
+use crate::{QmbedError, Result};
 
 /// Compact collection of local-operator destinations.
 ///
@@ -119,7 +119,7 @@ pub trait Basis: Send + Sync {
     ) -> Result<Option<(Self::State, Complex64)>> {
         match self.index(state) {
             Ok(_) => Ok(Some((state, Complex64::new(1.0, 0.0)))),
-            Err(QuSpinError::StateNotInBasis) => Ok(None),
+            Err(QmbedError::StateNotInBasis) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -135,7 +135,7 @@ pub trait Basis: Send + Sync {
     ) -> Result<Option<(usize, Complex64)>> {
         match self.index(state) {
             Ok(index) => Ok(Some((index, Complex64::new(1.0, 0.0)))),
-            Err(QuSpinError::StateNotInBasis) => Ok(None),
+            Err(QmbedError::StateNotInBasis) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -160,7 +160,7 @@ fn operator_number_change(operator: &str) -> Result<Option<i32>> {
             '-' => change -= 1,
             'x' | 'y' => return Ok(None),
             'I' | 'n' | 'z' => {}
-            _ => return Err(QuSpinError::InvalidOperator(operator.into())),
+            _ => return Err(QmbedError::InvalidOperator(operator.into())),
         }
     }
     Ok(Some(change))
@@ -168,12 +168,12 @@ fn operator_number_change(operator: &str) -> Result<Option<i32>> {
 
 fn fixed_weight_states(sites: usize, particles: Option<usize>) -> Result<Vec<u128>> {
     if sites > 128 {
-        return Err(QuSpinError::UnsupportedBackend(
+        return Err(QmbedError::UnsupportedBackend(
             "the initial u128 state backend supports at most 128 orbitals".into(),
         ));
     }
     if particles.is_some_and(|count| count > sites) {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "particle count exceeds site count".into(),
         ));
     }
@@ -181,7 +181,7 @@ fn fixed_weight_states(sites: usize, particles: Option<usize>) -> Result<Vec<u12
         let limit = 1_u128
             .checked_shl(u32::try_from(sites).unwrap_or(u32::MAX))
             .ok_or_else(|| {
-                QuSpinError::UnsupportedBackend(
+                QmbedError::UnsupportedBackend(
                     "enumerating the unconstrained 128-site Hilbert space is infeasible".into(),
                 )
             })?;
@@ -225,20 +225,20 @@ fn fixed_digit_sum_states(
     total: Option<usize>,
 ) -> Result<Vec<u128>> {
     if sites == 0 || states_per_site == 0 {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "sites and local state count must be positive".into(),
         ));
     }
     if total.is_some_and(|value| value > sites.saturating_mul(states_per_site - 1)) {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "requested occupation exceeds the local spin capacity".into(),
         ));
     }
     let base = states_per_site as u128;
     let exponent = u32::try_from(sites)
-        .map_err(|_| QuSpinError::UnsupportedBackend("site count is too large".into()))?;
+        .map_err(|_| QmbedError::UnsupportedBackend("site count is too large".into()))?;
     let limit = base.checked_pow(exponent).ok_or_else(|| {
-        QuSpinError::UnsupportedBackend("mixed-radix state encoding overflow".into())
+        QmbedError::UnsupportedBackend("mixed-radix state encoding overflow".into())
     })?;
     if total.is_none() {
         return Ok((0..limit).collect());
@@ -294,15 +294,15 @@ fn fixed_digit_sum_states(
 fn state_index(states: &[u128], state: u128) -> Result<usize> {
     states
         .binary_search(&state)
-        .map_err(|_| QuSpinError::StateNotInBasis)
+        .map_err(|_| QmbedError::StateNotInBasis)
 }
 
 fn direct_state_index(states: &[u128], state: u128) -> Result<usize> {
-    let index = usize::try_from(state).map_err(|_| QuSpinError::StateNotInBasis)?;
+    let index = usize::try_from(state).map_err(|_| QmbedError::StateNotInBasis)?;
     if index < states.len() {
         Ok(index)
     } else {
-        Err(QuSpinError::StateNotInBasis)
+        Err(QmbedError::StateNotInBasis)
     }
 }
 
@@ -313,7 +313,7 @@ fn fixed_weight_state_index(state: u128, sites: usize, particles: usize) -> Resu
         || state.count_ones() as usize != particles
         || (sites < 128 && state >= (1_u128 << sites))
     {
-        return Err(QuSpinError::StateNotInBasis);
+        return Err(QmbedError::StateNotInBasis);
     }
     let mut rank = 0_usize;
     let mut ordinal = 1_usize;
@@ -391,21 +391,21 @@ fn spin_symmetry_sector(
     parity: Option<i8>,
 ) -> Result<SymmetrySectorData> {
     if sites == 0 {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "symmetry sectors require at least one site".into(),
         ));
     }
     if parity.is_some_and(|value| value != -1 && value != 1) {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "parity must be either -1 or +1".into(),
         ));
     }
     let sites_i64 = i64::try_from(sites)
-        .map_err(|_| QuSpinError::UnsupportedBackend("site count is too large".into()))?;
+        .map_err(|_| QmbedError::UnsupportedBackend("site count is too large".into()))?;
     let normalized_momentum = momentum.map(|value| i64::from(value).rem_euclid(sites_i64) as usize);
     if parity.is_some() && normalized_momentum.is_some_and(|value| value != 0 && 2 * value != sites)
     {
-        return Err(QuSpinError::IncompatibleSymmetry(
+        return Err(QmbedError::IncompatibleSymmetry(
             "parity can share a one-dimensional sector with momentum only at k=0 or k=pi".into(),
         ));
     }
@@ -448,14 +448,15 @@ fn spin_symmetry_sector(
             }
         }
         if orbit.iter().any(|state| !parent_lookup.contains(state)) {
-            return Err(QuSpinError::IncompatibleSymmetry(
+            return Err(QmbedError::IncompatibleSymmetry(
                 "symmetry map leaves the selected magnetization sector".into(),
             ));
         }
         visited.extend(orbit.iter().copied());
-        let representative = *orbit.iter().min().ok_or_else(|| {
-            QuSpinError::InvalidSector("symmetry generated an empty orbit".into())
-        })?;
+        let representative = *orbit
+            .iter()
+            .min()
+            .ok_or_else(|| QmbedError::InvalidSector("symmetry generated an empty orbit".into()))?;
 
         let mut coefficients = HashMap::<u128, Complex64>::new();
         for shift in 0..translations {
@@ -482,7 +483,7 @@ fn spin_symmetry_sector(
             coefficients
                 .get(&representative)
                 .copied()
-                .ok_or(QuSpinError::IncompatibleSymmetry(
+                .ok_or(QmbedError::IncompatibleSymmetry(
                     "symmetry projection removed its orbit representative".into(),
                 ))?;
         let gauge = representative_coefficient / representative_coefficient.norm();
@@ -496,7 +497,7 @@ fn spin_symmetry_sector(
         for (&state, coefficient) in &coefficients {
             let normalized = *coefficient / (gauge * norm);
             if (normalized.norm() - expected_magnitude).abs() > 1.0e-10 {
-                return Err(QuSpinError::IncompatibleSymmetry(
+                return Err(QmbedError::IncompatibleSymmetry(
                     "symmetry projection does not define a one-dimensional orbit sector".into(),
                 ));
             }
@@ -514,7 +515,7 @@ fn spin_symmetry_sector(
 
     sectors.sort_by_key(|(representative, _)| *representative);
     if sectors.is_empty() {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "the requested symmetry sector is empty".into(),
         ));
     }
@@ -570,12 +571,12 @@ fn fermion_translation_sector(
         return Ok((parent_states, orbit_sizes, lookup, None));
     }
     if sites == 0 {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "translation sectors require at least one site".into(),
         ));
     }
     let sites_i64 = i64::try_from(sites)
-        .map_err(|_| QuSpinError::UnsupportedBackend("site count is too large".into()))?;
+        .map_err(|_| QmbedError::UnsupportedBackend("site count is too large".into()))?;
     let normalized = i64::from(momentum.unwrap_or_default()).rem_euclid(sites_i64) as usize;
     let mut visited = HashSet::with_capacity(parent_states.len());
     let mut sectors = Vec::<(u128, usize)>::new();
@@ -590,7 +591,7 @@ fn fermion_translation_sector(
             .collect();
         visited.extend(orbit.iter().copied());
         let representative = *orbit.iter().min().ok_or_else(|| {
-            QuSpinError::InvalidSector("translation generated an empty fermion orbit".into())
+            QmbedError::InvalidSector("translation generated an empty fermion orbit".into())
         })?;
         let mut coefficients = HashMap::<u128, Complex64>::new();
         for shift in 0..sites {
@@ -608,7 +609,7 @@ fn fermion_translation_sector(
             coefficients
                 .get(&representative)
                 .copied()
-                .ok_or(QuSpinError::IncompatibleSymmetry(
+                .ok_or(QmbedError::IncompatibleSymmetry(
                     "translation projection removed its fermion representative".into(),
                 ))?;
         let gauge = representative_coefficient / representative_coefficient.norm();
@@ -622,7 +623,7 @@ fn fermion_translation_sector(
         for (&state, coefficient) in &coefficients {
             let projected = *coefficient / (gauge * norm);
             if (projected.norm() - expected_magnitude).abs() > 1.0e-10 {
-                return Err(QuSpinError::IncompatibleSymmetry(
+                return Err(QmbedError::IncompatibleSymmetry(
                     "fermion translation does not define a one-dimensional orbit sector".into(),
                 ));
             }
@@ -639,7 +640,7 @@ fn fermion_translation_sector(
     }
     sectors.sort_by_key(|(representative, _)| *representative);
     if sectors.is_empty() {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "the requested fermion momentum sector is empty".into(),
         ));
     }
@@ -649,7 +650,7 @@ fn fermion_translation_sector(
 
 fn checked_site(site: usize, sites: usize) -> Result<()> {
     if site >= sites {
-        Err(QuSpinError::InvalidSite { site, sites })
+        Err(QmbedError::InvalidSite { site, sites })
     } else {
         Ok(())
     }
@@ -661,7 +662,7 @@ fn operator_chars(operator: &str, sites: &[usize]) -> Result<SmallVec<[char; 8]>
         .filter(|character| *character != '|')
         .collect();
     if chars.len() != sites.len() {
-        return Err(QuSpinError::InvalidCoupling(format!(
+        return Err(QmbedError::InvalidCoupling(format!(
             "operator arity {} does not match {} sites",
             chars.len(),
             sites.len()
@@ -765,7 +766,7 @@ impl SpinBasis1D {
         F: FnMut(u128, Complex64) -> Result<()>,
     {
         if symbols.len() != sites.len() {
-            return Err(QuSpinError::InvalidCoupling(format!(
+            return Err(QmbedError::InvalidCoupling(format!(
                 "operator arity {} does not match {} sites",
                 symbols.len(),
                 sites.len()
@@ -792,7 +793,7 @@ impl SpinBasis1D {
                     },
                 );
                 let digit =
-                    usize::try_from(encoded_digit).map_err(|_| QuSpinError::StateNotInBasis)?;
+                    usize::try_from(encoded_digit).map_err(|_| QmbedError::StateNotInBasis)?;
                 let raise_factor = self.raise_factors[digit];
                 let lower_factor = self.lower_factors[digit];
                 match op {
@@ -855,7 +856,7 @@ impl SpinBasis1D {
                             (false, false) => break,
                         }
                     }
-                    _ => return Err(QuSpinError::InvalidOperator(op.to_string())),
+                    _ => return Err(QmbedError::InvalidOperator(op.to_string())),
                 }
                 remaining = position;
             }
@@ -907,12 +908,12 @@ impl SpinBasisBuilder {
 
     pub fn build(self) -> Result<SpinBasis1D> {
         if self.spin_twice == 0 {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "spin_twice must be positive".into(),
             ));
         }
         if self.pauli && self.spin_twice != 1 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "the Pauli convention is defined only for spin one-half".into(),
             ));
         }
@@ -926,7 +927,7 @@ impl SpinBasisBuilder {
                 states_per_site_u128
                     .checked_pow(u32::try_from(site).unwrap_or(u32::MAX))
                     .ok_or_else(|| {
-                        QuSpinError::UnsupportedBackend(
+                        QmbedError::UnsupportedBackend(
                             "spin-state place value exceeds the u128 backend".into(),
                         )
                     })
@@ -963,7 +964,7 @@ impl SpinBasisBuilder {
             self.parity,
         )?;
         if states.is_empty() {
-            return Err(QuSpinError::InvalidSector("empty spin sector".into()));
+            return Err(QmbedError::InvalidSector("empty spin sector".into()));
         }
         Ok(SpinBasis1D {
             sites: self.sites,
@@ -996,7 +997,7 @@ impl Basis for SpinBasis1D {
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
@@ -1024,7 +1025,7 @@ impl Basis for SpinBasis1D {
         match transitions.as_slice() {
             [] => Ok(None),
             [transition] => Ok(Some(*transition)),
-            _ => Err(QuSpinError::UnsupportedBackend(
+            _ => Err(QmbedError::UnsupportedBackend(
                 "this higher-spin local action branches; use apply_local_transitions".into(),
             )),
         }
@@ -1128,7 +1129,7 @@ impl Basis for SpinBasis1D {
         if self.momentum.is_none() && self.parity.is_none() {
             return match self.index(state) {
                 Ok(index) => Ok(Some((index, Complex64::new(1.0, 0.0)))),
-                Err(QuSpinError::StateNotInBasis) => Ok(None),
+                Err(QmbedError::StateNotInBasis) => Ok(None),
                 Err(error) => Err(error),
             };
         }
@@ -1183,7 +1184,7 @@ impl BosonBasis1D {
         sites: &[usize],
     ) -> Result<Option<(u128, Complex64)>> {
         if symbols.len() != sites.len() {
-            return Err(QuSpinError::InvalidCoupling(format!(
+            return Err(QmbedError::InvalidCoupling(format!(
                 "operator arity {} does not match {} sites",
                 symbols.len(),
                 sites.len()
@@ -1207,7 +1208,7 @@ impl BosonBasis1D {
                     amplitude *= (occupation as f64).sqrt();
                 }
                 '+' | '-' => return Ok(None),
-                _ => return Err(QuSpinError::InvalidOperator(op.to_string())),
+                _ => return Err(QmbedError::InvalidOperator(op.to_string())),
             }
         }
         Ok(Some((state, amplitude)))
@@ -1229,7 +1230,7 @@ impl BosonBasisBuilder {
 
     pub fn build(self) -> Result<BosonBasis1D> {
         if self.sites == 0 || self.states_per_site == 0 {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "boson sites and states_per_site must be positive".into(),
             ));
         }
@@ -1237,13 +1238,13 @@ impl BosonBasisBuilder {
             .particles
             .is_some_and(|count| count > self.sites * (self.states_per_site - 1))
         {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "particle count exceeds the local cutoff".into(),
             ));
         }
         let states = fixed_digit_sum_states(self.sites, self.states_per_site, self.particles)?;
         if states.is_empty() {
-            return Err(QuSpinError::InvalidSector("empty boson sector".into()));
+            return Err(QmbedError::InvalidSector("empty boson sector".into()));
         }
         Ok(BosonBasis1D {
             sites: self.sites,
@@ -1265,7 +1266,7 @@ impl Basis for BosonBasis1D {
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
@@ -1357,7 +1358,7 @@ impl SpinlessFermionBasis1D {
         sites: &[usize],
     ) -> Result<Option<(u128, Complex64)>> {
         if symbols.len() != sites.len() {
-            return Err(QuSpinError::InvalidCoupling(format!(
+            return Err(QmbedError::InvalidCoupling(format!(
                 "operator arity {} does not match {} sites",
                 symbols.len(),
                 sites.len()
@@ -1447,7 +1448,7 @@ fn apply_fermion(mut state: u128, orbital: usize, op: char) -> Result<Option<(u1
             )));
         }
         '+' | '-' => return Ok(None),
-        _ => return Err(QuSpinError::InvalidOperator(op.to_string())),
+        _ => return Err(QmbedError::InvalidOperator(op.to_string())),
     };
     Ok(Some((state, Complex64::new(amplitude, 0.0))))
 }
@@ -1463,7 +1464,7 @@ impl Basis for SpinlessFermionBasis1D {
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
@@ -1585,7 +1586,7 @@ impl Basis for SpinlessFermionBasis1D {
         if self.momentum.is_none() {
             return match self.index(state) {
                 Ok(index) => Ok(Some((index, Complex64::new(1.0, 0.0)))),
-                Err(QuSpinError::StateNotInBasis) => Ok(None),
+                Err(QmbedError::StateNotInBasis) => Ok(None),
                 Err(error) => Err(error),
             };
         }
@@ -1647,7 +1648,7 @@ impl SpinfulFermionBasis1D {
         sites: &[usize],
     ) -> Result<Option<(u128, Complex64)>> {
         if symbols.len() != sites.len() || split > symbols.len() {
-            return Err(QuSpinError::InvalidCoupling(format!(
+            return Err(QmbedError::InvalidCoupling(format!(
                 "operator arity {} does not match {} sites",
                 symbols.len(),
                 sites.len()
@@ -1707,13 +1708,13 @@ impl SpinfulFermionBasisBuilder {
 
     pub fn build(self) -> Result<SpinfulFermionBasis1D> {
         if self.sites > 64 {
-            return Err(QuSpinError::UnsupportedBackend(
+            return Err(QmbedError::UnsupportedBackend(
                 "the packed spinful backend supports at most 64 sites".into(),
             ));
         }
         let sectors = match &self.particle_sectors {
             Some(sectors) if sectors.is_empty() => {
-                return Err(QuSpinError::InvalidSector(
+                return Err(QmbedError::InvalidSector(
                     "spinful particle-sector union must be nonempty".into(),
                 ));
             }
@@ -1759,7 +1760,7 @@ impl Basis for SpinfulFermionBasis1D {
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
@@ -1772,27 +1773,27 @@ impl Basis for SpinfulFermionBasis1D {
             let up_state = state & mask;
             let down_state = state >> self.sites;
             let up_index = self.particles_up.map_or_else(
-                || usize::try_from(up_state).map_err(|_| QuSpinError::StateNotInBasis),
+                || usize::try_from(up_state).map_err(|_| QmbedError::StateNotInBasis),
                 |particles| fixed_weight_state_index(up_state, self.sites, particles),
             )?;
             let down_index = self.particles_down.map_or_else(
-                || usize::try_from(down_state).map_err(|_| QuSpinError::StateNotInBasis),
+                || usize::try_from(down_state).map_err(|_| QmbedError::StateNotInBasis),
                 |particles| fixed_weight_state_index(down_state, self.sites, particles),
             )?;
             let up_dimension = match self.particles_up {
                 Some(particles) => binomial(self.sites, particles),
                 None => 1_usize
                     .checked_shl(u32::try_from(self.sites).unwrap_or(u32::MAX))
-                    .ok_or(QuSpinError::StateNotInBasis)?,
+                    .ok_or(QmbedError::StateNotInBasis)?,
             };
             let index = down_index
                 .checked_mul(up_dimension)
                 .and_then(|offset| offset.checked_add(up_index))
-                .ok_or(QuSpinError::StateNotInBasis)?;
+                .ok_or(QmbedError::StateNotInBasis)?;
             if index < self.states.len() {
                 return Ok(index);
             }
-            return Err(QuSpinError::StateNotInBasis);
+            return Err(QmbedError::StateNotInBasis);
         }
         state_index(&self.states, state)
     }
@@ -1833,7 +1834,7 @@ impl Basis for SpinfulFermionBasis1D {
     fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
         let (up_operator, down_operator) = operator.split_once('|').unwrap_or((operator, ""));
         if down_operator.contains('|') {
-            return Err(QuSpinError::InvalidOperator(operator.into()));
+            return Err(QmbedError::InvalidOperator(operator.into()));
         }
         let Some(up_change) = operator_number_change(up_operator)? else {
             return Ok(self.particles_up.is_none()
@@ -1965,14 +1966,14 @@ where
             }
         }
         if self.states.is_empty() {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "UserBasis requires at least one accepted state".into(),
             ));
         }
         let mut indices = HashMap::with_capacity(self.states.len());
         for (index, state) in self.states.iter().copied().enumerate() {
             if indices.insert(state, index).is_some() {
-                return Err(QuSpinError::InvalidSector(
+                return Err(QmbedError::InvalidSector(
                     "UserBasis states must be unique".into(),
                 ));
             }
@@ -1996,7 +1997,7 @@ impl UserBasisBuilder<u128> {
         F: Fn(u128) -> bool,
     {
         if self.sites > 127 {
-            return Err(QuSpinError::UnsupportedBackend(
+            return Err(QmbedError::UnsupportedBackend(
                 "u128 UserBasis filters support at most 127 sites".into(),
             ));
         }
@@ -2011,7 +2012,7 @@ impl UserBasisBuilder<u128> {
         F: Fn(u128) -> bool + Sync,
     {
         if self.sites > 127 {
-            return Err(QuSpinError::UnsupportedBackend(
+            return Err(QmbedError::UnsupportedBackend(
                 "u128 UserBasis filters support at most 127 sites".into(),
             ));
         }
@@ -2074,7 +2075,7 @@ where
         F: FnMut(State, Complex64) -> Result<()>,
     {
         if symbols.len() != sites.len() {
-            return Err(QuSpinError::InvalidCoupling(format!(
+            return Err(QmbedError::InvalidCoupling(format!(
                 "operator arity {} does not match {} sites",
                 symbols.len(),
                 sites.len()
@@ -2112,7 +2113,7 @@ where
         let action = self
             .operators
             .get(&op)
-            .ok_or_else(|| QuSpinError::InvalidOperator(op.to_string()))?;
+            .ok_or_else(|| QmbedError::InvalidOperator(op.to_string()))?;
         action(state, site, &mut |target, local| {
             if local.norm() <= f64::EPSILON {
                 return Ok(());
@@ -2136,14 +2137,14 @@ where
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
         self.indices
             .get(&state)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn apply_local(
@@ -2156,7 +2157,7 @@ where
         match transitions.as_slice() {
             [] => Ok(None),
             [transition] => Ok(Some(*transition)),
-            _ => Err(QuSpinError::UnsupportedBackend(
+            _ => Err(QmbedError::UnsupportedBackend(
                 "this user local action branches; use apply_local_transitions".into(),
             )),
         }
@@ -2230,7 +2231,7 @@ impl<State> ClosureSymmetryMap<State> {
         F: Fn(State) -> Result<(State, Complex64)> + Send + Sync + 'static,
     {
         if period == 0 {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "a symmetry-map period must be positive".into(),
             ));
         }
@@ -2324,7 +2325,7 @@ where
         let generator = &generators[generator_index];
         let period = generator.map.period();
         if period == 0 {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "a symmetry-map period must be positive".into(),
             ));
         }
@@ -2342,7 +2343,7 @@ where
             )?;
             let (next, phase) = generator.map.apply(image)?;
             if !phase.re.is_finite() || !phase.im.is_finite() {
-                return Err(QuSpinError::IncompatibleSymmetry(
+                return Err(QmbedError::IncompatibleSymmetry(
                     "a symmetry map returned a non-finite phase".into(),
                 ));
             }
@@ -2350,7 +2351,7 @@ where
             map_phase *= phase;
         }
         if image != state || (map_phase - Complex64::new(1.0, 0.0)).norm() > 1.0e-10 {
-            return Err(QuSpinError::IncompatibleSymmetry(
+            return Err(QmbedError::IncompatibleSymmetry(
                 "a symmetry map does not close at its declared period".into(),
             ));
         }
@@ -2415,7 +2416,7 @@ where
             let mut coefficients = enumerate_symmetry_images(seed, &sector.generators)?;
             for state in coefficients.keys() {
                 parent.index(*state).map_err(|_| {
-                    QuSpinError::IncompatibleSymmetry(
+                    QmbedError::IncompatibleSymmetry(
                         "a symmetry map leaves the parent basis".into(),
                     )
                 })?;
@@ -2426,7 +2427,7 @@ where
                 continue;
             }
             let representative = *coefficients.keys().min().ok_or_else(|| {
-                QuSpinError::InvalidSector("symmetry projection generated no state".into())
+                QmbedError::InvalidSector("symmetry projection generated no state".into())
             })?;
             let representative_coefficient = coefficients[&representative];
             let gauge = representative_coefficient / representative_coefficient.norm();
@@ -2440,7 +2441,7 @@ where
             for (&state, &coefficient) in &coefficients {
                 let normalized = coefficient / (gauge * norm);
                 if (normalized.norm() - expected_magnitude).abs() > 1.0e-10 {
-                    return Err(QuSpinError::IncompatibleSymmetry(
+                    return Err(QmbedError::IncompatibleSymmetry(
                         "symmetry maps do not define a one-dimensional orbit sector".into(),
                     ));
                 }
@@ -2457,7 +2458,7 @@ where
         }
         representatives.sort_by_key(|(state, _)| *state);
         if representatives.is_empty() {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "the requested general symmetry sector is empty".into(),
             ));
         }
@@ -2478,14 +2479,14 @@ where
         self.lookup
             .get(&state)
             .map(|image| image.representative)
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     pub fn orbit_size(&self, state: Parent::State) -> Result<usize> {
         self.lookup
             .get(&state)
             .map(|image| image.orbit_size)
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     /// Normalized coefficient of a parent state in its reduced representative.
@@ -2493,7 +2494,7 @@ where
         self.lookup
             .get(&state)
             .map(|image| image.phase / (image.orbit_size as f64).sqrt())
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 }
 
@@ -2512,13 +2513,13 @@ where
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
         self.states
             .binary_search(&state)
-            .map_err(|_| QuSpinError::StateNotInBasis)
+            .map_err(|_| QmbedError::StateNotInBasis)
     }
 
     fn apply_local(
@@ -2531,7 +2532,7 @@ where
         match transitions.as_slice() {
             [] => Ok(None),
             [transition] => Ok(Some(*transition)),
-            _ => Err(QuSpinError::UnsupportedBackend(
+            _ => Err(QmbedError::UnsupportedBackend(
                 "this reduced local action branches; use apply_local_transitions".into(),
             )),
         }
@@ -2665,7 +2666,7 @@ where
     pub fn new(left: Left, right: Right) -> Result<Self> {
         left.len()
             .checked_mul(right.len())
-            .ok_or_else(|| QuSpinError::UnsupportedBackend("tensor-basis size overflow".into()))?;
+            .ok_or_else(|| QmbedError::UnsupportedBackend("tensor-basis size overflow".into()))?;
         Ok(Self { left, right })
     }
 
@@ -2693,7 +2694,7 @@ where
 
     fn state(&self, index: usize) -> Result<Self::State> {
         if index >= self.len() {
-            return Err(QuSpinError::StateNotInBasis);
+            return Err(QmbedError::StateNotInBasis);
         }
         Ok((
             self.left.state(index / self.right.len())?,
@@ -2715,7 +2716,7 @@ where
         match transitions.as_slice() {
             [] => Ok(None),
             [transition] => Ok(Some(*transition)),
-            _ => Err(QuSpinError::UnsupportedBackend(
+            _ => Err(QmbedError::UnsupportedBackend(
                 "this tensor local action branches; use apply_local_transitions".into(),
             )),
         }
@@ -2728,19 +2729,19 @@ where
         sites: &[usize],
     ) -> Result<LocalTransitions<Self::State>> {
         let (left_operator, right_operator) = operator.split_once('|').ok_or_else(|| {
-            QuSpinError::InvalidOperator(
+            QmbedError::InvalidOperator(
                 "tensor-basis operator strings must contain one `|` separator".into(),
             )
         })?;
         if right_operator.contains('|') {
-            return Err(QuSpinError::InvalidOperator(
+            return Err(QmbedError::InvalidOperator(
                 "a two-factor tensor operator contains too many separators".into(),
             ));
         }
         let left_arity = left_operator.chars().count();
         let right_arity = right_operator.chars().count();
         if sites.len() != left_arity + right_arity {
-            return Err(QuSpinError::InvalidCoupling(
+            return Err(QmbedError::InvalidCoupling(
                 "tensor operator arity does not match its sites".into(),
             ));
         }
@@ -2784,9 +2785,9 @@ where
     fn operator_preserves_particle_sector(&self, operator: &str) -> Result<bool> {
         let (left_operator, right_operator) = operator
             .split_once('|')
-            .ok_or_else(|| QuSpinError::InvalidOperator(operator.into()))?;
+            .ok_or_else(|| QmbedError::InvalidOperator(operator.into()))?;
         if right_operator.contains('|') {
-            return Err(QuSpinError::InvalidOperator(operator.into()));
+            return Err(QmbedError::InvalidOperator(operator.into()));
         }
         Ok(self
             .left
@@ -2841,7 +2842,7 @@ where
         F: Fn(Matter::State) -> usize,
     {
         if photon.sites() != 1 {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "PhotonBasis requires a one-mode boson basis".into(),
             ));
         }
@@ -2856,7 +2857,7 @@ where
             }
         }
         if states.is_empty() {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "the requested photon sector is empty".into(),
             ));
         }
@@ -2902,14 +2903,14 @@ where
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
         self.indices
             .get(&state)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn apply_local(
@@ -2922,7 +2923,7 @@ where
         match transitions.as_slice() {
             [] => Ok(None),
             [transition] => Ok(Some(*transition)),
-            _ => Err(QuSpinError::UnsupportedBackend(
+            _ => Err(QmbedError::UnsupportedBackend(
                 "this photon-basis action branches; use apply_local_transitions".into(),
             )),
         }
@@ -2997,7 +2998,7 @@ impl<const WORDS: usize> WideState<WORDS> {
 
     pub fn bit(&self, index: usize) -> Result<bool> {
         if index >= Self::capacity_bits() {
-            return Err(QuSpinError::InvalidSite {
+            return Err(QmbedError::InvalidSite {
                 site: index,
                 sites: Self::capacity_bits(),
             });
@@ -3007,7 +3008,7 @@ impl<const WORDS: usize> WideState<WORDS> {
 
     pub fn with_bit(mut self, index: usize, occupied: bool) -> Result<Self> {
         if index >= Self::capacity_bits() {
-            return Err(QuSpinError::InvalidSite {
+            return Err(QmbedError::InvalidSite {
                 site: index,
                 sites: Self::capacity_bits(),
             });
@@ -3106,13 +3107,13 @@ pub struct WideSpinBasis<const WORDS: usize> {
 impl<const WORDS: usize> WideSpinBasis<WORDS> {
     pub fn new(sites: usize, particles: Option<usize>, pauli: bool) -> Result<Self> {
         if sites == 0 || sites > WideState::<WORDS>::capacity_bits() {
-            return Err(QuSpinError::UnsupportedBackend(format!(
+            return Err(QmbedError::UnsupportedBackend(format!(
                 "wide spin basis needs 1..={} sites",
                 WideState::<WORDS>::capacity_bits()
             )));
         }
         if particles.is_some_and(|count| count > sites) {
-            return Err(QuSpinError::InvalidSector(
+            return Err(QmbedError::InvalidSector(
                 "particle count exceeds the wide spin site count".into(),
             ));
         }
@@ -3146,7 +3147,7 @@ impl<const WORDS: usize> WideSpinBasis<WORDS> {
             enumerate(0, sites, count, WideState::zero(), &mut states)?;
         } else {
             if sites > 24 {
-                return Err(QuSpinError::InvalidOptions(
+                return Err(QmbedError::InvalidOptions(
                     "an unrestricted wide spin basis above 24 sites is not enumerable; select a particle sector"
                         .into(),
                 ));
@@ -3183,13 +3184,13 @@ impl<const WORDS: usize> Basis for WideSpinBasis<WORDS> {
         self.states
             .get(index)
             .copied()
-            .ok_or(QuSpinError::StateNotInBasis)
+            .ok_or(QmbedError::StateNotInBasis)
     }
 
     fn index(&self, state: Self::State) -> Result<usize> {
         self.states
             .binary_search(&state)
-            .map_err(|_| QuSpinError::StateNotInBasis)
+            .map_err(|_| QmbedError::StateNotInBasis)
     }
 
     fn apply_local(
@@ -3223,7 +3224,7 @@ impl<const WORDS: usize> Basis for WideSpinBasis<WORDS> {
                     amplitude *= Complex64::new(0.0, if occupied { scale } else { -scale });
                 }
                 '+' | '-' => return Ok(None),
-                _ => return Err(QuSpinError::InvalidOperator(op.to_string())),
+                _ => return Err(QmbedError::InvalidOperator(op.to_string())),
             }
         }
         Ok(Some((state, amplitude)))
@@ -3299,7 +3300,7 @@ pub fn python_int_to_basis_int<const WORDS: usize>(value: u128) -> WideState<WOR
 
 pub fn basis_int_to_python_int<const WORDS: usize>(value: WideState<WORDS>) -> Result<u128> {
     if value.words.iter().skip(2).any(|word| *word != 0) {
-        return Err(QuSpinError::UnsupportedBackend(
+        return Err(QmbedError::UnsupportedBackend(
             "wide basis integer does not fit into a Python-compatible u128".into(),
         ));
     }
@@ -3312,7 +3313,7 @@ pub fn basis_int_to_python_int<const WORDS: usize>(value: WideState<WORDS>) -> R
 pub fn state_from_biguint<const WORDS: usize>(value: &BigUint) -> Result<WideState<WORDS>> {
     let digits = value.to_u64_digits();
     if digits.len() > WORDS {
-        return Err(QuSpinError::UnsupportedBackend(format!(
+        return Err(QmbedError::UnsupportedBackend(format!(
             "integer needs {} bits but this state stores {} bits",
             value.bits(),
             WideState::<WORDS>::capacity_bits()
@@ -3339,7 +3340,7 @@ pub fn get_basis_type(
     states_per_site: usize,
 ) -> Result<StateStorage> {
     if states_per_site < 2 {
-        return Err(QuSpinError::InvalidSector(
+        return Err(QmbedError::InvalidSector(
             "states_per_site must be at least two".into(),
         ));
     }
@@ -3347,14 +3348,14 @@ pub fn get_basis_type(
         usize::try_from(usize::BITS - (states_per_site - 1).leading_zeros()).unwrap_or(usize::MAX);
     let bits = sites
         .checked_mul(bits_per_site)
-        .ok_or_else(|| QuSpinError::UnsupportedBackend("basis bit width overflow".into()))?;
+        .ok_or_else(|| QmbedError::UnsupportedBackend("basis bit width overflow".into()))?;
     match bits {
         0..=128 => Ok(StateStorage::U128),
         129..=256 => Ok(StateStorage::U256),
         257..=1024 => Ok(StateStorage::U1024),
         1025..=4096 => Ok(StateStorage::U4096),
         4097..=16384 => Ok(StateStorage::U16384),
-        _ => Err(QuSpinError::UnsupportedBackend(
+        _ => Err(QmbedError::UnsupportedBackend(
             "basis requires more than 16384 state bits".into(),
         )),
     }
@@ -3362,7 +3363,7 @@ pub fn get_basis_type(
 
 pub fn coherent_state(amplitude: Complex64, states: usize) -> Result<Vec<Complex64>> {
     if states == 0 || !amplitude.re.is_finite() || !amplitude.im.is_finite() {
-        return Err(QuSpinError::InvalidOptions(
+        return Err(QmbedError::InvalidOptions(
             "coherent-state amplitude must be finite and the cutoff positive".into(),
         ));
     }
@@ -3393,7 +3394,7 @@ pub fn photon_hspace_dim(
         (None, Some(cutoff)) => 1_usize
             .checked_shl(u32::try_from(sites).unwrap_or(u32::MAX))
             .and_then(|matter| matter.checked_mul(cutoff.saturating_add(1)))
-            .ok_or_else(|| QuSpinError::UnsupportedBackend("photon dimension overflow".into())),
+            .ok_or_else(|| QmbedError::UnsupportedBackend("photon dimension overflow".into())),
         (Some(total), cutoff) => {
             let minimum_matter =
                 cutoff.map_or(0, |maximum_photons| total.saturating_sub(maximum_photons));
@@ -3402,7 +3403,7 @@ pub fn photon_hspace_dim(
                 .map(|matter| binomial(sites, matter))
                 .sum())
         }
-        (None, None) => Err(QuSpinError::InvalidSector(
+        (None, None) => Err(QmbedError::InvalidSector(
             "either total excitation or photon cutoff must be finite".into(),
         )),
     }
@@ -3426,7 +3427,7 @@ impl BasisProjector {
         if columns.iter().flatten().any(|(row, value)| {
             *row >= source_dimension || !value.re.is_finite() || !value.im.is_finite()
         }) {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "projector contains an invalid parent-space row or coefficient".into(),
             ));
         }
@@ -3495,7 +3496,7 @@ impl BasisProjector {
     /// Apply the adjoint projector to a parent-space vector.
     pub fn project(&self, parent: &[Complex64], reduced: &mut [Complex64]) -> Result<()> {
         if parent.len() != self.source_dimension || reduced.len() != self.reduced_dimension {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "projector input or output length does not match".into(),
             ));
         }
@@ -3533,7 +3534,7 @@ impl BasisProjector {
     /// sector; no parent-space square projector is formed.
     pub fn symmetry_leakage_norm(&self, operator: &(impl LinearOperator + ?Sized)) -> Result<f64> {
         if operator.shape() != (self.source_dimension, self.source_dimension) {
-            return Err(QuSpinError::DimensionMismatch(
+            return Err(QmbedError::DimensionMismatch(
                 "symmetry check requires a square parent-space operator".into(),
             ));
         }
@@ -3562,7 +3563,7 @@ impl BasisProjector {
         tolerance: f64,
     ) -> Result<bool> {
         if !tolerance.is_finite() || tolerance < 0.0 {
-            return Err(QuSpinError::InvalidOptions(
+            return Err(QmbedError::InvalidOptions(
                 "symmetry-check tolerance must be finite and nonnegative".into(),
             ));
         }
