@@ -11,6 +11,7 @@ pub mod dynamics;
 pub mod error;
 pub mod measure;
 pub mod operator;
+pub mod runtime;
 pub mod solve;
 pub mod workflow;
 
