@@ -1,8 +1,10 @@
 use approx::assert_abs_diff_eq;
-use qmbed::basis::{Basis, BosonBasis1D, PackedBasis, SpinBasis1D};
-use qmbed::interop::PackedEdModel;
+use qmbed::Complex64;
+use qmbed::basis::{Basis, BosonBasis1D, PackedBasis, SpinBasis1D, SpinNormalization};
+use qmbed::interop::{OperatorAction, PackedEdModel};
 use qmbed::operator::{
-    Coupling, LinearOperator, LocalOperator, MatrixFormat, OpProduct, OperatorBuilder, OperatorSpec,
+    AssemblyChecks, Coupling, LinearOperator, LocalOperator, MatrixFormat, OpProduct,
+    OperatorBuilder, OperatorSpec,
 };
 use qmbed::solve::EighOptions;
 use std::sync::Arc;
@@ -149,4 +151,119 @@ fn transformed_model_does_not_reuse_a_stale_operator() {
 
     assert!(!Arc::ptr_eq(&original, &permuted));
     assert_ne!(original.triplets(), permuted.triplets());
+}
+
+#[test]
+fn spin_normalization_distinguishes_ladder_and_cartesian_conventions() {
+    let angular = SpinBasis1D::builder(1)
+        .normalization(SpinNormalization::AngularMomentum)
+        .build()
+        .unwrap();
+    let pauli = SpinBasis1D::builder(1)
+        .normalization(SpinNormalization::Pauli)
+        .build()
+        .unwrap();
+    let cartesian = SpinBasis1D::builder(1)
+        .normalization(SpinNormalization::PauliCartesian)
+        .build()
+        .unwrap();
+
+    let amplitude =
+        |basis: &SpinBasis1D, operator| basis.apply_local(0, operator, &[0]).unwrap().unwrap().1.re;
+    assert_abs_diff_eq!(amplitude(&angular, "+"), 1.0);
+    assert_abs_diff_eq!(amplitude(&pauli, "+"), 2.0);
+    assert_abs_diff_eq!(amplitude(&cartesian, "+"), 1.0);
+    assert_abs_diff_eq!(amplitude(&angular, "x"), 0.5);
+    assert_abs_diff_eq!(amplitude(&pauli, "x"), 1.0);
+    assert_abs_diff_eq!(amplitude(&cartesian, "x"), 1.0);
+    assert_abs_diff_eq!(
+        angular.apply_local(0, "z", &[0]).unwrap().unwrap().1.re,
+        -0.5
+    );
+    assert_abs_diff_eq!(pauli.apply_local(0, "z", &[0]).unwrap().unwrap().1.re, -1.0);
+}
+
+#[test]
+fn temporary_terms_reuse_basis_and_support_all_algebraic_actions() {
+    let basis = SpinBasis1D::builder(1).build().unwrap();
+    let model = PackedEdModel::new(basis, []);
+    let term = OperatorSpec::from_product(
+        OpProduct::new([LocalOperator::Y]).unwrap(),
+        [Coupling::new(2.0, vec![0])],
+    )
+    .unwrap();
+    let operator = model
+        .assemble_terms([term.clone()], AssemblyChecks::none(), MatrixFormat::Csc)
+        .unwrap();
+    let inputs = vec![vec![Complex64::new(1.0, 0.5), Complex64::new(-0.25, 2.0)]];
+
+    for action in [
+        OperatorAction::Normal,
+        OperatorAction::Transpose,
+        OperatorAction::Conjugate,
+        OperatorAction::Adjoint,
+    ] {
+        let actual = model
+            .apply_terms_batch([term.clone()], &inputs, action)
+            .unwrap();
+        let mut expected = vec![Complex64::new(0.0, 0.0); 2];
+        match action {
+            OperatorAction::Normal => operator.apply(&inputs[0], &mut expected).unwrap(),
+            OperatorAction::Transpose => {
+                operator.apply_transpose(&inputs[0], &mut expected).unwrap()
+            }
+            OperatorAction::Conjugate => {
+                let conjugated = inputs[0]
+                    .iter()
+                    .map(|value| value.conj())
+                    .collect::<Vec<_>>();
+                operator.apply(&conjugated, &mut expected).unwrap();
+                expected.iter_mut().for_each(|value| *value = value.conj());
+            }
+            OperatorAction::Adjoint => operator.apply_adjoint(&inputs[0], &mut expected).unwrap(),
+        }
+        assert_eq!(actual, vec![expected]);
+    }
+
+    let fixed_model = PackedEdModel::new(SpinBasis1D::builder(1).build().unwrap(), [term.clone()]);
+    assert_eq!(
+        fixed_model
+            .apply_batch(&inputs, OperatorAction::Normal)
+            .unwrap(),
+        model
+            .apply_terms_batch([term], &inputs, OperatorAction::Normal)
+            .unwrap()
+    );
+}
+
+#[test]
+fn temporary_terms_and_bra_ket_share_the_models_site_convention() {
+    let basis = SpinBasis1D::builder(2).build().unwrap();
+    let model = PackedEdModel::new(basis, [])
+        .with_site_permutation(&[1, 0])
+        .unwrap();
+    let term = OperatorSpec::from_product(
+        OpProduct::new([LocalOperator::Raising]).unwrap(),
+        [Coupling::new(3.0, vec![0])],
+    )
+    .unwrap();
+
+    let operator = model
+        .assemble_terms([term.clone()], AssemblyChecks::none(), MatrixFormat::Csc)
+        .unwrap();
+    assert_eq!(
+        operator.triplets(),
+        vec![
+            (2, 0, Complex64::new(3.0, 0.0)),
+            (3, 1, Complex64::new(3.0, 0.0))
+        ]
+    );
+    let transitions = model.bra_ket_terms([term], &[0, 1]).unwrap();
+    assert_eq!(transitions[0][0].bra, 2);
+    assert_eq!(transitions[0][0].matrix_element, Complex64::new(3.0, 0.0));
+    assert_eq!(transitions[1][0].bra, 3);
+
+    let invalid = PackedEdModel::new(SpinBasis1D::builder(2).build().unwrap(), std::iter::empty())
+        .with_site_permutation(&[0, 0]);
+    assert!(invalid.is_err());
 }

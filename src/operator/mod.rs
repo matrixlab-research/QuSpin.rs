@@ -584,6 +584,18 @@ impl AssemblyChecks {
             symmetry_compatibility: true,
         }
     }
+
+    /// Disable Hamiltonian-specific validation for a general linear action.
+    ///
+    /// Individual local operators, cross-sector probes, and matrix-free
+    /// actions are not necessarily Hermitian or particle conserving.
+    pub const fn none() -> Self {
+        Self {
+            hermiticity: false,
+            particle_conservation: false,
+            symmetry_compatibility: false,
+        }
+    }
 }
 
 impl Default for AssemblyChecks {

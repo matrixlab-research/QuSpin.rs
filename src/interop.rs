@@ -5,11 +5,16 @@
 //! runtime and need to reuse one mathematical model across materialization and
 //! solver operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use num_complex::Complex64;
+
 use crate::basis::{Basis, PackedBasis};
-use crate::operator::{AssemblyChecks, MatrixFormat, Operator, OperatorBuilder, OperatorSpec};
+use crate::operator::{
+    AssemblyChecks, BraKetTransition, LinearOperator, MatrixFormat, Operator, OperatorBuilder,
+    OperatorSpec,
+};
 use crate::solve::{Eigensystem, EighOptions, EigshOptions, eigh_with_options, eigsh};
 use crate::{QmbedError, Result};
 
@@ -19,7 +24,18 @@ pub struct PackedEdModel {
     basis: PackedBasis,
     terms: Vec<OperatorSpec>,
     checks: AssemblyChecks,
+    site_permutation: Option<Vec<usize>>,
     operators: Arc<Mutex<HashMap<MatrixFormat, Arc<Operator>>>>,
+}
+
+/// Algebraic view used when applying a temporary operator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OperatorAction {
+    #[default]
+    Normal,
+    Transpose,
+    Conjugate,
+    Adjoint,
 }
 
 impl PackedEdModel {
@@ -31,6 +47,7 @@ impl PackedEdModel {
             basis: basis.into(),
             terms: terms.into_iter().collect(),
             checks: AssemblyChecks::all(),
+            site_permutation: None,
             operators: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -42,11 +59,16 @@ impl PackedEdModel {
     }
 
     pub fn with_site_permutation(mut self, permutation: &[usize]) -> Result<Self> {
+        validate_site_permutation(permutation)?;
         self.terms = self
             .terms
             .iter()
             .map(|term| term.with_site_permutation(permutation))
             .collect::<Result<Vec<_>>>()?;
+        self.site_permutation = Some(match self.site_permutation {
+            Some(previous) => previous.into_iter().map(|site| permutation[site]).collect(),
+            None => permutation.to_vec(),
+        });
         self.operators = Arc::new(Mutex::new(HashMap::new()));
         Ok(self)
     }
@@ -96,6 +118,92 @@ impl PackedEdModel {
         Ok((*self.materialized(format)?).clone())
     }
 
+    /// Assemble caller-supplied terms on this model's already-owned basis.
+    ///
+    /// This is the native narrow waist for low-level basis operations. The
+    /// terms use the model's original site convention and are relabeled by the
+    /// same permutation as its persistent terms.
+    pub fn assemble_terms(
+        &self,
+        terms: impl IntoIterator<Item = OperatorSpec>,
+        checks: AssemblyChecks,
+        format: MatrixFormat,
+    ) -> Result<Operator> {
+        OperatorBuilder::on(&self.basis)
+            .terms(self.prepare_terms(terms)?)
+            .checks(checks)
+            .build(format)
+    }
+
+    /// Apply one temporary operator to a batch of column vectors.
+    ///
+    /// The operator is assembled once for the whole batch and never converted
+    /// to a dense matrix.
+    pub fn apply_terms_batch(
+        &self,
+        terms: impl IntoIterator<Item = OperatorSpec>,
+        inputs: &[Vec<Complex64>],
+        action: OperatorAction,
+    ) -> Result<Vec<Vec<Complex64>>> {
+        let operator =
+            self.assemble_terms(terms, AssemblyChecks::none(), MatrixFormat::MatrixFree)?;
+        apply_operator_batch(&operator, inputs, action)
+    }
+
+    /// Apply the model's persistent terms without dense materialization.
+    ///
+    /// The matrix-free representation is cached after the first call and
+    /// reused by subsequent vectors and algebraic views.
+    pub fn apply_batch(
+        &self,
+        inputs: &[Vec<Complex64>],
+        action: OperatorAction,
+    ) -> Result<Vec<Vec<Complex64>>> {
+        let operator = self.materialized(MatrixFormat::MatrixFree)?;
+        apply_operator_batch(operator.as_ref(), inputs, action)
+    }
+
+    /// Return raw local transitions grouped by input ket.
+    ///
+    /// Unlike square operator assembly, this operation intentionally does not
+    /// reduce destination states into the model's symmetry sector.
+    pub fn bra_ket_terms(
+        &self,
+        terms: impl IntoIterator<Item = OperatorSpec>,
+        kets: &[u128],
+    ) -> Result<Vec<Vec<BraKetTransition<u128>>>> {
+        let terms = self.prepare_terms(terms)?;
+        kets.iter()
+            .copied()
+            .map(|ket| {
+                let mut transitions = Vec::new();
+                for term in &terms {
+                    for coupling in term.couplings() {
+                        self.basis.visit_preparsed_local_unreduced_transitions(
+                            ket,
+                            term.operator(),
+                            term.symbols(),
+                            term.split(),
+                            &coupling.sites,
+                            |bra, amplitude| {
+                                let matrix_element = coupling.coefficient * amplitude;
+                                if matrix_element.norm() > f64::EPSILON {
+                                    transitions.push(BraKetTransition {
+                                        bra,
+                                        ket,
+                                        matrix_element,
+                                    });
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                }
+                Ok(transitions)
+            })
+            .collect()
+    }
+
     pub fn eigh(&self, options: EighOptions) -> Result<Eigensystem> {
         let operator = self.materialized(MatrixFormat::Dense)?;
         eigh_with_options(operator.as_ref(), options)
@@ -105,4 +213,71 @@ impl PackedEdModel {
         let operator = self.materialized(format)?;
         eigsh(operator.as_ref(), options)
     }
+
+    fn prepare_terms(
+        &self,
+        terms: impl IntoIterator<Item = OperatorSpec>,
+    ) -> Result<Vec<OperatorSpec>> {
+        let terms = terms.into_iter();
+        match &self.site_permutation {
+            Some(permutation) => terms
+                .map(|term| term.with_site_permutation(permutation))
+                .collect(),
+            None => Ok(terms.collect()),
+        }
+    }
+}
+
+fn validate_site_permutation(permutation: &[usize]) -> Result<()> {
+    if let Some(site) = permutation
+        .iter()
+        .copied()
+        .find(|&site| site >= permutation.len())
+    {
+        return Err(QmbedError::InvalidSite {
+            site,
+            sites: permutation.len(),
+        });
+    }
+    if permutation.iter().copied().collect::<HashSet<_>>().len() != permutation.len() {
+        return Err(QmbedError::InvalidOptions(
+            "site permutation must be bijective".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_operator_batch(
+    operator: &dyn LinearOperator,
+    inputs: &[Vec<Complex64>],
+    action: OperatorAction,
+) -> Result<Vec<Vec<Complex64>>> {
+    let (rows, columns) = operator.shape();
+    let (input_dimension, output_dimension) = match action {
+        OperatorAction::Normal | OperatorAction::Conjugate => (columns, rows),
+        OperatorAction::Transpose | OperatorAction::Adjoint => (rows, columns),
+    };
+    inputs
+        .iter()
+        .map(|input| {
+            if input.len() != input_dimension {
+                return Err(QmbedError::DimensionMismatch(format!(
+                    "operator action needs input length {input_dimension}, got {}",
+                    input.len()
+                )));
+            }
+            let mut output = vec![Complex64::new(0.0, 0.0); output_dimension];
+            match action {
+                OperatorAction::Normal => operator.apply(input, &mut output)?,
+                OperatorAction::Transpose => operator.apply_transpose(input, &mut output)?,
+                OperatorAction::Conjugate => {
+                    let conjugated: Vec<_> = input.iter().map(|value| value.conj()).collect();
+                    operator.apply(&conjugated, &mut output)?;
+                    output.iter_mut().for_each(|value| *value = value.conj());
+                }
+                OperatorAction::Adjoint => operator.apply_adjoint(input, &mut output)?,
+            }
+            Ok(output)
+        })
+        .collect()
 }

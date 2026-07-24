@@ -671,6 +671,21 @@ fn operator_chars(operator: &str, sites: &[usize]) -> Result<SmallVec<[char; 8]>
     Ok(chars)
 }
 
+/// Normalization of local spin operators.
+///
+/// The distinction matters for spin one-half because two common interfaces
+/// assign different meanings to the ladder symbols. `PauliCartesian` keeps
+/// the conventional unit-amplitude sigma-plus/minus operators, while `Pauli`
+/// scales every non-identity spin symbol by two relative to angular-momentum
+/// operators.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SpinNormalization {
+    #[default]
+    AngularMomentum,
+    Pauli,
+    PauliCartesian,
+}
+
 /// Spin-chain basis for the full or fixed-magnetization spin space.
 #[derive(Clone, Debug)]
 pub struct SpinBasis1D {
@@ -679,7 +694,7 @@ pub struct SpinBasis1D {
     states_per_site: u128,
     radix_bits: Option<u32>,
     up: Option<usize>,
-    pauli: bool,
+    normalization: SpinNormalization,
     place_values: Vec<u128>,
     z_factors: Vec<f64>,
     raise_factors: Vec<f64>,
@@ -699,7 +714,7 @@ impl SpinBasis1D {
             up: None,
             momentum: None,
             parity: None,
-            pauli: false,
+            normalization: SpinNormalization::AngularMomentum,
         }
     }
 
@@ -716,7 +731,11 @@ impl SpinBasis1D {
     }
 
     pub const fn pauli(&self) -> bool {
-        self.pauli
+        !matches!(self.normalization, SpinNormalization::AngularMomentum)
+    }
+
+    pub const fn normalization(&self) -> SpinNormalization {
+        self.normalization
     }
 
     pub const fn momentum(&self) -> Option<usize> {
@@ -824,7 +843,10 @@ impl SpinBasis1D {
                         }
                     }
                     'x' | 'y' => {
-                        let scale = if self.pauli { 1.0 } else { 0.5 };
+                        let scale = match self.normalization {
+                            SpinNormalization::AngularMomentum | SpinNormalization::Pauli => 0.5,
+                            SpinNormalization::PauliCartesian => 1.0,
+                        };
                         let raise_phase = if op == 'x' {
                             Complex64::new(scale, 0.0)
                         } else {
@@ -872,7 +894,7 @@ pub struct SpinBasisBuilder {
     up: Option<usize>,
     momentum: Option<i32>,
     parity: Option<i8>,
-    pauli: bool,
+    normalization: SpinNormalization,
 }
 
 impl SpinBasisBuilder {
@@ -902,7 +924,16 @@ impl SpinBasisBuilder {
     }
 
     pub const fn pauli(mut self, pauli: bool) -> Self {
-        self.pauli = pauli;
+        self.normalization = if pauli {
+            SpinNormalization::PauliCartesian
+        } else {
+            SpinNormalization::AngularMomentum
+        };
+        self
+    }
+
+    pub const fn normalization(mut self, normalization: SpinNormalization) -> Self {
+        self.normalization = normalization;
         self
     }
 
@@ -912,7 +943,7 @@ impl SpinBasisBuilder {
                 "spin_twice must be positive".into(),
             ));
         }
-        if self.pauli && self.spin_twice != 1 {
+        if self.normalization != SpinNormalization::AngularMomentum && self.spin_twice != 1 {
             return Err(QmbedError::InvalidOptions(
                 "the Pauli convention is defined only for spin one-half".into(),
             ));
@@ -939,17 +970,32 @@ impl SpinBasisBuilder {
         let mut lower_factors = Vec::with_capacity(states_per_site);
         for digit in 0..states_per_site {
             let magnetic = digit as f64 - spin;
-            z_factors.push(if self.pauli { 2.0 * magnetic } else { magnetic });
-            raise_factors.push(if digit + 1 < states_per_site {
-                (spin * (spin + 1.0) - magnetic * (magnetic + 1.0)).sqrt()
+            z_factors.push(
+                if self.normalization == SpinNormalization::AngularMomentum {
+                    magnetic
+                } else {
+                    2.0 * magnetic
+                },
+            );
+            let ladder_scale = if self.normalization == SpinNormalization::Pauli {
+                2.0
             } else {
-                0.0
-            });
-            lower_factors.push(if digit > 0 {
-                (spin * (spin + 1.0) - magnetic * (magnetic - 1.0)).sqrt()
-            } else {
-                0.0
-            });
+                1.0
+            };
+            raise_factors.push(
+                if digit + 1 < states_per_site {
+                    (spin * (spin + 1.0) - magnetic * (magnetic + 1.0)).sqrt()
+                } else {
+                    0.0
+                } * ladder_scale,
+            );
+            lower_factors.push(
+                if digit > 0 {
+                    (spin * (spin + 1.0) - magnetic * (magnetic - 1.0)).sqrt()
+                } else {
+                    0.0
+                } * ladder_scale,
+            );
         }
         let parent_states = if self.spin_twice == 1 {
             fixed_weight_states(self.sites, self.up)?
@@ -972,7 +1018,7 @@ impl SpinBasisBuilder {
             states_per_site: states_per_site_u128,
             radix_bits,
             up: self.up,
-            pauli: self.pauli,
+            normalization: self.normalization,
             place_values,
             z_factors,
             raise_factors,

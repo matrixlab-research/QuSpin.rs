@@ -8,9 +8,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use qmbed::basis::{
     Basis, BosonBasis1D, ExchangeStatistics, GeneralBasis, LatticeSymmetryMap, PackedBasis,
-    SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetrySector,
+    SpinBasis1D, SpinNormalization, SpinfulFermionBasis1D, SpinlessFermionBasis1D, SymmetrySector,
 };
-use qmbed::interop::PackedEdModel;
+use qmbed::interop::{OperatorAction, PackedEdModel};
 use qmbed::operator::{
     AssemblyChecks, Coupling, LocalOperator, MatrixFormat, OpProduct, OperatorSpec,
 };
@@ -76,6 +76,32 @@ enum CommandRequest {
         #[serde(default)]
         format: StorageFormat,
     },
+    MaterializeTermsModel {
+        handle: String,
+        terms: Vec<TermRequest>,
+        #[serde(default)]
+        format: StorageFormat,
+        #[serde(default)]
+        checks: ChecksRequest,
+    },
+    ApplyModel {
+        handle: String,
+        vectors: Vec<Vec<[f64; 2]>>,
+        #[serde(default)]
+        action: OperatorActionRequest,
+    },
+    ApplyTermsModel {
+        handle: String,
+        terms: Vec<TermRequest>,
+        vectors: Vec<Vec<[f64; 2]>>,
+        #[serde(default)]
+        action: OperatorActionRequest,
+    },
+    BraKetTermsModel {
+        handle: String,
+        terms: Vec<TermRequest>,
+        kets: Vec<String>,
+    },
     EighModel {
         handle: String,
         #[serde(default)]
@@ -121,6 +147,7 @@ enum BasisRequest {
         parity: Option<i8>,
         #[serde(default)]
         pauli: bool,
+        normalization: Option<SpinNormalizationRequest>,
         #[serde(default)]
         symmetries: Vec<SymmetryRequest>,
         #[serde(default)]
@@ -195,10 +222,57 @@ enum StorageFormat {
     MatrixFree,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperatorActionRequest {
+    #[default]
+    Normal,
+    Transpose,
+    Conjugate,
+    Adjoint,
+}
+
+impl From<OperatorActionRequest> for OperatorAction {
+    fn from(value: OperatorActionRequest) -> Self {
+        match value {
+            OperatorActionRequest::Normal => Self::Normal,
+            OperatorActionRequest::Transpose => Self::Transpose,
+            OperatorActionRequest::Conjugate => Self::Conjugate,
+            OperatorActionRequest::Adjoint => Self::Adjoint,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SpinNormalizationRequest {
+    AngularMomentum,
+    Pauli,
+    PauliCartesian,
+}
+
+impl From<SpinNormalizationRequest> for SpinNormalization {
+    fn from(value: SpinNormalizationRequest) -> Self {
+        match value {
+            SpinNormalizationRequest::AngularMomentum => Self::AngularMomentum,
+            SpinNormalizationRequest::Pauli => Self::Pauli,
+            SpinNormalizationRequest::PauliCartesian => Self::PauliCartesian,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct MatrixEntry {
     row: usize,
     column: usize,
+    value: [f64; 2],
+}
+
+#[derive(Debug, Serialize)]
+struct TransitionEntry {
+    input: usize,
+    bra: String,
+    ket: String,
     value: [f64; 2],
 }
 
@@ -213,6 +287,13 @@ enum CommandResult {
         shape: [usize; 2],
         format: StorageFormat,
         entries: Vec<MatrixEntry>,
+    },
+    Vectors {
+        dimension: usize,
+        vectors: Vec<Vec<[f64; 2]>>,
+    },
+    Transitions {
+        entries: Vec<TransitionEntry>,
     },
     Eigensystem {
         dimension: usize,
@@ -431,6 +512,7 @@ fn build_spin_basis(request: &BasisRequest) -> Result<PackedBasis> {
         momentum,
         parity,
         pauli,
+        normalization,
         symmetries,
         reverse,
     } = request
@@ -442,9 +524,11 @@ fn build_spin_basis(request: &BasisRequest) -> Result<PackedBasis> {
             "built-in and general spin symmetries cannot be mixed".into(),
         ));
     }
-    let mut builder = SpinBasis1D::builder(*sites)
-        .spin_twice(*spin_twice)
-        .pauli(*pauli);
+    let mut builder = SpinBasis1D::builder(*sites).spin_twice(*spin_twice);
+    builder = match normalization {
+        Some(normalization) => builder.normalization((*normalization).into()),
+        None => builder.pauli(*pauli),
+    };
     if let Some(up) = up {
         builder = builder.up(*up);
     }
@@ -691,7 +775,14 @@ fn command_eigensystem(
 
 fn command_operator(model: &PackedEdModel, format: StorageFormat) -> Result<CommandResult> {
     let operator = model.materialized(format.into())?;
-    let (rows, columns) = qmbed::operator::LinearOperator::shape(operator.as_ref());
+    Ok(command_operator_value(operator.as_ref(), format))
+}
+
+fn command_operator_value(
+    operator: &qmbed::operator::Operator,
+    format: StorageFormat,
+) -> CommandResult {
+    let (rows, columns) = qmbed::operator::LinearOperator::shape(operator);
     let entries = operator
         .triplets()
         .into_iter()
@@ -701,11 +792,101 @@ fn command_operator(model: &PackedEdModel, format: StorageFormat) -> Result<Comm
             value: [value.re, value.im],
         })
         .collect();
-    Ok(CommandResult::Operator {
+    CommandResult::Operator {
         shape: [rows, columns],
         format,
         entries,
-    })
+    }
+}
+
+fn command_apply_terms(
+    model: &PackedEdModel,
+    terms: Vec<TermRequest>,
+    vectors: Vec<Vec<[f64; 2]>>,
+    action: OperatorActionRequest,
+) -> Result<CommandResult> {
+    let terms = terms
+        .into_iter()
+        .map(typed_term)
+        .collect::<Result<Vec<_>>>()?;
+    let vectors = complex_vectors(vectors);
+    let vectors = model.apply_terms_batch(terms, &vectors, action.into())?;
+    Ok(command_vectors(model, vectors))
+}
+
+fn command_apply_model(
+    model: &PackedEdModel,
+    vectors: Vec<Vec<[f64; 2]>>,
+    action: OperatorActionRequest,
+) -> Result<CommandResult> {
+    let vectors = complex_vectors(vectors);
+    let vectors = model.apply_batch(&vectors, action.into())?;
+    Ok(command_vectors(model, vectors))
+}
+
+fn complex_vectors(vectors: Vec<Vec<[f64; 2]>>) -> Vec<Vec<Complex64>> {
+    vectors
+        .into_iter()
+        .map(|vector| {
+            vector
+                .into_iter()
+                .map(|[real, imaginary]| Complex64::new(real, imaginary))
+                .collect()
+        })
+        .collect()
+}
+
+fn command_vectors(model: &PackedEdModel, vectors: Vec<Vec<Complex64>>) -> CommandResult {
+    let dimension = vectors.first().map_or(model.dimension(), Vec::len);
+    CommandResult::Vectors {
+        dimension,
+        vectors: vectors
+            .into_iter()
+            .map(|vector| {
+                vector
+                    .into_iter()
+                    .map(|value| [value.re, value.im])
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+fn command_bra_ket_terms(
+    model: &PackedEdModel,
+    terms: Vec<TermRequest>,
+    kets: Vec<String>,
+) -> Result<CommandResult> {
+    let terms = terms
+        .into_iter()
+        .map(typed_term)
+        .collect::<Result<Vec<_>>>()?;
+    let kets = kets
+        .into_iter()
+        .map(|ket| {
+            ket.parse::<u128>().map_err(|_| {
+                QmbedError::InvalidOptions(format!(
+                    "ket state {ket:?} is not an unsigned 128-bit integer"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let entries = model
+        .bra_ket_terms(terms, &kets)?
+        .into_iter()
+        .enumerate()
+        .flat_map(|(input, transitions)| {
+            transitions
+                .into_iter()
+                .map(move |transition| TransitionEntry {
+                    input,
+                    bra: transition.bra.to_string(),
+                    ket: transition.ket.to_string(),
+                    value: [transition.matrix_element.re, transition.matrix_element.im],
+                })
+        })
+        .collect();
+    Ok(CommandResult::Transitions { entries })
 }
 
 fn command_eigh(model: &PackedEdModel, eigenvectors: bool) -> Result<CommandResult> {
@@ -793,6 +974,12 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
             let handle = register_model(model)?;
             Ok(CommandResult::Model { handle, dimension })
         }
+        request => execute_registered_command(request),
+    }
+}
+
+fn execute_registered_command(request: CommandRequest) -> Result<CommandResult> {
+    match request {
         CommandRequest::DescribeModel { handle } => {
             let model = registered_model(&handle)?;
             let states = model
@@ -808,6 +995,45 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
         CommandRequest::MaterializeModel { handle, format } => {
             let model = registered_model(&handle)?;
             command_operator(&model, format)
+        }
+        CommandRequest::MaterializeTermsModel {
+            handle,
+            terms,
+            format,
+            checks,
+        } => {
+            let model = registered_model(&handle)?;
+            let terms = terms
+                .into_iter()
+                .map(typed_term)
+                .collect::<Result<Vec<_>>>()?;
+            let operator = model.assemble_terms(terms, checks.into(), format.into())?;
+            Ok(command_operator_value(&operator, format))
+        }
+        CommandRequest::ApplyModel {
+            handle,
+            vectors,
+            action,
+        } => {
+            let model = registered_model(&handle)?;
+            command_apply_model(&model, vectors, action)
+        }
+        CommandRequest::ApplyTermsModel {
+            handle,
+            terms,
+            vectors,
+            action,
+        } => {
+            let model = registered_model(&handle)?;
+            command_apply_terms(&model, terms, vectors, action)
+        }
+        CommandRequest::BraKetTermsModel {
+            handle,
+            terms,
+            kets,
+        } => {
+            let model = registered_model(&handle)?;
+            command_bra_ket_terms(&model, terms, kets)
         }
         CommandRequest::EighModel {
             handle,
@@ -827,6 +1053,13 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
         CommandRequest::ReleaseModel { handle } => {
             let handle = release_model(&handle)?;
             Ok(CommandResult::Released { handle })
+        }
+        CommandRequest::DescribeBasis { .. }
+        | CommandRequest::Materialize { .. }
+        | CommandRequest::Eigh { .. }
+        | CommandRequest::Eigsh { .. }
+        | CommandRequest::CreateModel { .. } => {
+            unreachable!("stateless command was pre-dispatched")
         }
     }
 }
@@ -1118,5 +1351,93 @@ mod tests {
         let invalid: Value = serde_json::from_str(&invalid).unwrap();
         assert_eq!(invalid["status"], "error");
         assert!(invalid["error"].as_str().unwrap().contains("expected 3"));
+    }
+
+    #[test]
+    fn registered_basis_executes_temporary_terms_vectors_and_transition_tables() {
+        let create = run_command_json(
+            r#"{
+                "operation":"create_model",
+                "basis":{
+                    "kind":"spin",
+                    "sites":1,
+                    "normalization":"pauli",
+                    "reverse":true
+                },
+                "terms":[],
+                "site_permutation":[0],
+                "checks":{
+                    "hermiticity":false,
+                    "particle_conservation":false,
+                    "symmetry_compatibility":false
+                }
+            }"#,
+        );
+        let create: Value = serde_json::from_str(&create).unwrap();
+        assert_eq!(create["status"], "ok");
+        let handle = create["result"]["handle"].as_str().unwrap();
+        let raising = r#"[
+            {
+                "product":{"local":["raising"]},
+                "couplings":[{"coefficient":[1.0,0.0],"sites":[0]}]
+            }
+        ]"#;
+
+        let materialize = run_command_json(&format!(
+            r#"{{
+                "operation":"materialize_terms_model",
+                "handle":"{handle}",
+                "terms":{raising},
+                "format":"csc",
+                "checks":{{
+                    "hermiticity":false,
+                    "particle_conservation":false,
+                    "symmetry_compatibility":false
+                }}
+            }}"#
+        ));
+        let materialize: Value = serde_json::from_str(&materialize).unwrap();
+        assert_eq!(materialize["status"], "ok");
+        assert_eq!(materialize["result"]["entries"][0]["value"][0], 2.0);
+
+        let apply = run_command_json(&format!(
+            r#"{{
+                "operation":"apply_terms_model",
+                "handle":"{handle}",
+                "terms":{raising},
+                "vectors":[[[0.0,0.0],[1.0,0.0]]],
+                "action":"normal"
+            }}"#
+        ));
+        let apply: Value = serde_json::from_str(&apply).unwrap();
+        assert_eq!(apply["status"], "ok");
+        assert_eq!(
+            apply["result"]["vectors"],
+            serde_json::json!([[[2.0, 0.0], [0.0, 0.0]]])
+        );
+
+        let transitions = run_command_json(&format!(
+            r#"{{
+                "operation":"bra_ket_terms_model",
+                "handle":"{handle}",
+                "terms":{raising},
+                "kets":["0","1"]
+            }}"#
+        ));
+        let transitions: Value = serde_json::from_str(&transitions).unwrap();
+        assert_eq!(transitions["status"], "ok");
+        assert_eq!(
+            transitions["result"]["entries"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(transitions["result"]["entries"][0]["input"], 0);
+        assert_eq!(transitions["result"]["entries"][0]["bra"], "1");
+        assert_eq!(transitions["result"]["entries"][0]["value"][0], 2.0);
+
+        let release = run_command_json(&format!(
+            r#"{{"operation":"release_model","handle":"{handle}"}}"#
+        ));
+        let release: Value = serde_json::from_str(&release).unwrap();
+        assert_eq!(release["status"], "ok");
     }
 }

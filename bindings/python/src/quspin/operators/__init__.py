@@ -17,6 +17,49 @@ _TARGETS = {
 }
 
 
+class _OperatorView:
+    def __init__(self, owner, *, transposed=False, conjugated=False):
+        self._owner = owner
+        self._transposed = bool(transposed)
+        self._conjugated = bool(conjugated)
+
+    @property
+    def shape(self):
+        return self._owner.shape[::-1] if self._transposed else self._owner.shape
+
+    @property
+    def T(self):
+        return _OperatorView(
+            self._owner,
+            transposed=not self._transposed,
+            conjugated=self._conjugated,
+        )
+
+    @property
+    def H(self):
+        return _OperatorView(
+            self._owner,
+            transposed=not self._transposed,
+            conjugated=not self._conjugated,
+        )
+
+    def conj(self):
+        return _OperatorView(
+            self._owner,
+            transposed=self._transposed,
+            conjugated=not self._conjugated,
+        )
+
+    conjugate = conj
+
+    def dot(self, vector):
+        return self._owner._dot_action(
+            vector,
+            transposed=self._transposed,
+            conjugated=self._conjugated,
+        )
+
+
 class hamiltonian:
     def __init__(
         self,
@@ -104,6 +147,39 @@ class hamiltonian:
             matrix = matrix.real
         return np.asarray(matrix, dtype=self.dtype)
 
+    def _dot_action(self, vector, *, transposed=False, conjugated=False):
+        input_array = np.asanyarray(vector)
+        if input_array.ndim == 0 or input_array.shape[0] != self.Ns:
+            raise ValueError("dimension mismatch")
+        result_dtype = np.result_type(input_array.dtype, self.dtype)
+        input_array = input_array.astype(result_dtype, order="C", copy=False)
+        input_matrix = input_array.reshape((self.Ns, -1))
+        vectors = [
+            [[complex(value).real, complex(value).imag] for value in input_matrix[:, column]]
+            for column in range(input_matrix.shape[1])
+        ]
+        if transposed and conjugated:
+            action = "adjoint"
+        elif transposed:
+            action = "transpose"
+        elif conjugated:
+            action = "conjugate"
+        else:
+            action = "normal"
+        result = self._execute("apply_model", vectors=vectors, action=action)
+        applied = np.column_stack(
+            [
+                np.asarray([complex(*value) for value in output])
+                for output in result["vectors"]
+            ]
+        ).reshape(input_array.shape)
+        if np.dtype(result_dtype).kind != "c":
+            tolerance = 10 * np.finfo(np.float64).eps
+            if np.any(np.abs(applied.imag) > tolerance):
+                raise TypeError("complex result cannot be represented by a real dtype")
+            applied = applied.real
+        return np.asarray(applied, dtype=result_dtype)
+
     def toarray(self, time: float | None = None) -> np.ndarray:
         if time is not None:
             raise NotImplementedError("time-dependent materialization is not implemented yet")
@@ -174,10 +250,30 @@ class hamiltonian:
         return values, vectors
 
     def dot(self, vector):
-        return self.toarray().dot(vector)
+        return self._dot_action(vector)
+
+    @property
+    def T(self):
+        return _OperatorView(self, transposed=True)
+
+    @property
+    def H(self):
+        return _OperatorView(self, transposed=True, conjugated=True)
+
+    def conj(self):
+        return _OperatorView(self, conjugated=True)
+
+    conjugate = conj
 
     def trace(self):
         return np.trace(self.toarray())
 
 
-__all__ = ["hamiltonian"]
+class quantum_LinearOperator(hamiltonian):
+    """Matrix-free QuSpin-compatible view over one persistent Rust model."""
+
+    def __init__(self, static, **options):
+        super().__init__(static, [], **options)
+
+
+__all__ = ["hamiltonian", "quantum_LinearOperator"]

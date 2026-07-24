@@ -4,8 +4,9 @@ import numpy as np
 import qmbed
 from qmbed.compat import quspin
 from qmbed._ffi import QmbedError, command
-from quspin.basis import spin_basis_1d, spin_basis_general
+from quspin.basis import basis_int_to_python_int, spin_basis_1d, spin_basis_general
 from quspin.operators import hamiltonian
+from quspin.operators._make_hamiltonian import _consolidate_static
 
 
 class QmbedBindingTests(unittest.TestCase):
@@ -113,6 +114,87 @@ class QmbedBindingTests(unittest.TestCase):
             optimized_operator.toarray(),
             atol=1.0e-12,
         )
+
+    def test_low_level_basis_operations_share_one_rust_action_protocol(self):
+        basis = spin_basis_general(2, pauli=-1)
+        static = [["y", [[0.75, 0]]], ["+", [[-0.5j, 1]]]]
+        op_list = _consolidate_static(static)
+        operator = hamiltonian(
+            static,
+            [],
+            basis=basis,
+            check_herm=False,
+            check_pcon=False,
+            check_symm=False,
+        ).toarray()
+        vector = np.asarray([1 + 0.5j, -2j, 0.25, -0.5 + 0.75j])
+
+        actions = [
+            (False, False, operator),
+            (True, False, operator.T),
+            (False, True, operator.conj()),
+            (True, True, operator.conj().T),
+        ]
+        for transposed, conjugated, matrix in actions:
+            actual = basis.inplace_Op(
+                vector,
+                op_list,
+                np.complex128,
+                transposed=transposed,
+                conjugated=conjugated,
+            )
+            np.testing.assert_allclose(actual, matrix.dot(vector), atol=1.0e-12)
+
+        initial = np.ones_like(vector)
+        returned = basis.inplace_Op(
+            vector,
+            op_list,
+            np.complex128,
+            v_out=initial,
+        )
+        self.assertIs(returned, initial)
+        np.testing.assert_allclose(returned, 1.0 + operator.dot(vector), atol=1.0e-12)
+
+        elements, rows, columns = basis.Op("y", [0], 0.75, np.complex128)
+        reconstructed = np.zeros_like(operator)
+        reconstructed[rows, columns] = elements
+        expected = hamiltonian(
+            [["y", [[0.75, 0]]]],
+            [],
+            basis=basis,
+            check_herm=False,
+            check_pcon=False,
+            check_symm=False,
+        ).toarray()
+        np.testing.assert_allclose(reconstructed, expected, atol=1.0e-12)
+
+        elements, bras, kets = basis.Op_bra_ket(
+            "+",
+            [0],
+            1.5,
+            np.float64,
+            basis.states,
+        )
+        self.assertTrue(np.all(elements == 1.5))
+        self.assertTrue(np.all(bras > kets))
+        self.assertTrue(all(basis_int_to_python_int(value) == int(value) for value in bras))
+
+    def test_python_pauli_modes_map_to_distinct_rust_normalizations(self):
+        spin = spin_basis_1d(1, pauli=0)
+        pauli = spin_basis_1d(1, pauli=1)
+        cartesian = spin_basis_1d(1, pauli=-1)
+
+        spin_raising = spin.Op("+", [0], 1.0, np.float64)[0]
+        pauli_raising = pauli.Op("+", [0], 1.0, np.float64)[0]
+        cartesian_raising = cartesian.Op("+", [0], 1.0, np.float64)[0]
+        np.testing.assert_allclose(pauli_raising, 2.0 * spin_raising)
+        np.testing.assert_allclose(cartesian_raising, spin_raising)
+
+        spin_x = spin.Op("x", [0], 1.0, np.float64)[0]
+        pauli_x = pauli.Op("x", [0], 1.0, np.float64)[0]
+        cartesian_x = cartesian.Op("x", [0], 1.0, np.float64)[0]
+        np.testing.assert_allclose(pauli_x, 2.0 * spin_x)
+        np.testing.assert_allclose(cartesian_x, 2.0 * spin_x)
 
 
 if __name__ == "__main__":

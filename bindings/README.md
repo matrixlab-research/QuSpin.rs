@@ -16,6 +16,15 @@ explicitly. The Rust `PackedEdModel` also caches one assembled operator per
 storage format, so repeated solver and export calls reuse both the basis and
 the assembled matrix.
 
+The same handle can apply its persistent terms or execute caller-supplied
+temporary terms without replacing the model. `apply_model` reuses a cached
+matrix-free operator, `materialize_terms_model` returns sparse triplets,
+`apply_terms_model` assembles one temporary action for a batch of vectors, and
+`bra_ket_terms_model` returns raw local transition tables. Algebraic actions
+cover normal, transpose, conjugate, and adjoint forms. These commands are the
+language-neutral protocol behind Python `dot`, `Op`, `inplace_Op`, and
+`Op_bra_ket`; none materializes a dense matrix.
+
 - `python/` exposes the native `qmbed` module and the versioned
   `qmbed.compat.quspin` migration surface.
 - `julia/` exposes only the native `QMBED` API.
@@ -32,6 +41,10 @@ optional per-site permutations of local states, and a character sector. Rust
 validates the map, derives its finite period, and computes fermionic exchange
 phases. The same representation therefore covers translations, reflections,
 local spin inversion, and higher-dimensional lattice permutations.
+
+Spin requests also carry an explicit normalization instead of overloading one
+boolean: angular-momentum operators, Pauli scaling of every non-identity
+symbol, and Cartesian-only Pauli scaling are distinct Rust core conventions.
 
 ## Python compatibility contract
 

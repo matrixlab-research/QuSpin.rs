@@ -6,7 +6,9 @@ from typing import Any
 
 import numpy as np
 
-from qmbed._ffi import command
+from qmbed._ffi import NativeModel
+from qmbed.compat.quspin import operator_term
+from qmbed.model import Coupling
 
 
 def _reject_options(family: str, options: dict[str, Any]) -> None:
@@ -28,6 +30,19 @@ def _spin_twice(spin: str | int | float) -> int:
     if doubled.denominator != 1 or doubled <= 0:
         raise ValueError(f"invalid spin quantum number {spin!r}")
     return int(doubled)
+
+
+def _spin_normalization(pauli: bool | int, spin_twice: int) -> str:
+    if spin_twice != 1:
+        return "angular_momentum"
+    value = int(pauli)
+    if value not in (-1, 0, 1):
+        raise ValueError("pauli must be one of -1, 0, or 1")
+    return {
+        0: "angular_momentum",
+        1: "pauli",
+        -1: "pauli_cartesian",
+    }[value]
 
 
 def _rust_site_map(site_map, sites: int) -> tuple[list[int], list[bool]]:
@@ -135,8 +150,23 @@ class _PackedBasis:
     N: int
 
     @cached_property
+    def _model(self) -> NativeModel:
+        return NativeModel(
+            {
+                "basis": self._request,
+                "terms": [],
+                "site_permutation": self._site_permutation,
+                "checks": {
+                    "hermiticity": False,
+                    "particle_conservation": False,
+                    "symmetry_compatibility": False,
+                },
+            }
+        )
+
+    @cached_property
     def _description(self) -> dict[str, Any]:
-        return command({"operation": "describe_basis", "basis": self._request})
+        return self._model.execute("describe_model")
 
     @property
     def Ns(self) -> int:
@@ -152,12 +182,165 @@ class _PackedBasis:
     def __len__(self) -> int:
         return self.Ns
 
+    def __getitem__(self, index):
+        return self.states[index]
+
     @property
     def _site_permutation(self) -> list[int]:
         return list(range(self.N - 1, -1, -1))
 
     def expanded_form(self, static, dynamic):
         return static, dynamic
+
+    @staticmethod
+    def _term_request(opstr, indx, coefficient) -> dict[str, Any]:
+        term = operator_term(
+            str(opstr),
+            [Coupling(complex(coefficient), tuple(int(site) for site in indx))],
+        )
+        return term.request()
+
+    @staticmethod
+    def _values_for_dtype(values, dtype) -> np.ndarray:
+        target = np.dtype(dtype)
+        values = np.asarray(values, dtype=np.complex128)
+        if target.kind != "c":
+            tolerance = 10 * np.finfo(np.float64).eps
+            if np.any(np.abs(values.imag) > tolerance):
+                raise TypeError("complex matrix elements cannot be represented by a real dtype")
+            values = values.real
+        return np.asarray(values, dtype=target)
+
+    def Op(self, opstr, indx, J, dtype):
+        term = self._term_request(opstr, indx, J)
+        result = self._model.execute(
+            "materialize_terms_model",
+            terms=[term],
+            format="csc",
+            checks={
+                "hermiticity": False,
+                "particle_conservation": False,
+                "symmetry_compatibility": False,
+            },
+        )
+        entries = sorted(
+            result["entries"],
+            key=lambda entry: (entry["column"], entry["row"]),
+        )
+        matrix_elements = self._values_for_dtype(
+            [complex(*entry["value"]) for entry in entries],
+            dtype,
+        )
+        row = np.asarray([entry["row"] for entry in entries], dtype=np.intp)
+        column = np.asarray([entry["column"] for entry in entries], dtype=np.intp)
+        return matrix_elements, row, column
+
+    def inplace_Op(
+        self,
+        v_in,
+        op_list,
+        dtype,
+        transposed=False,
+        conjugated=False,
+        a=1.0,
+        v_out=None,
+    ):
+        input_array = np.asanyarray(v_in)
+        if input_array.ndim == 0 or input_array.shape[0] != self.Ns:
+            raise ValueError("dimension mismatch")
+        result_dtype = np.result_type(input_array.dtype, dtype)
+        input_array = input_array.astype(result_dtype, order="C", copy=False)
+        input_matrix = input_array.reshape((self.Ns, -1))
+
+        if transposed and conjugated:
+            action = "adjoint"
+        elif transposed:
+            action = "transpose"
+        elif conjugated:
+            action = "conjugate"
+        else:
+            action = "normal"
+
+        terms = [
+            self._term_request(opstr, indx, a * coefficient)
+            for opstr, indx, coefficient in op_list
+        ]
+        vectors = [
+            [[complex(value).real, complex(value).imag] for value in input_matrix[:, column]]
+            for column in range(input_matrix.shape[1])
+        ]
+        result = self._model.execute(
+            "apply_terms_model",
+            terms=terms,
+            vectors=vectors,
+            action=action,
+        )
+        applied = np.column_stack(
+            [
+                np.asarray([complex(*value) for value in vector])
+                for vector in result["vectors"]
+            ]
+        )
+        applied = self._values_for_dtype(applied, result_dtype).reshape(input_array.shape)
+
+        if v_out is None:
+            return applied.squeeze()
+        if np.dtype(v_out.dtype) != np.dtype(result_dtype):
+            raise TypeError("v_out does not have the correct data type.")
+        if not v_out.flags["CARRAY"]:
+            raise ValueError("v_out is not a writable C-contiguous array")
+        if v_out.shape != input_array.shape:
+            raise ValueError("invalid shape for v_out and v_in: v_in.shape != v_out.shape")
+        v_out += applied
+        return v_out.squeeze()
+
+    def Op_bra_ket(
+        self,
+        opstr,
+        indx,
+        J,
+        dtype,
+        ket_states,
+        reduce_output=True,
+    ):
+        kets = np.array(ket_states, dtype=object, ndmin=1)
+        result = self._model.execute(
+            "bra_ket_terms_model",
+            terms=[self._term_request(opstr, indx, J)],
+            kets=[str(int(ket)) for ket in kets],
+        )
+        grouped: list[list[dict[str, Any]]] = [[] for _ in range(kets.size)]
+        for entry in result["entries"]:
+            grouped[int(entry["input"])].append(entry)
+
+        if reduce_output:
+            entries = [entry for group in grouped for entry in group]
+            matrix_elements = self._values_for_dtype(
+                [complex(*entry["value"]) for entry in entries],
+                dtype,
+            )
+            bras = np.asarray([int(entry["bra"]) for entry in entries], dtype=object)
+            returned_kets = np.asarray([int(entry["ket"]) for entry in entries], dtype=object)
+            return matrix_elements, bras, returned_kets
+
+        if any(len(group) > 1 for group in grouped):
+            raise NotImplementedError(
+                "reduce_output=False cannot represent a branching local operator"
+            )
+        values = []
+        bras = []
+        for ket, group in zip(kets, grouped):
+            if group:
+                values.append(complex(*group[0]["value"]))
+                bras.append(int(group[0]["bra"]))
+            else:
+                values.append(0.0)
+                bras.append(0)
+        return (
+            self._values_for_dtype(values, dtype),
+            np.asarray(bras, dtype=object),
+            kets,
+        )
 
 
 class spin_basis_1d(_PackedBasis):
@@ -170,6 +353,7 @@ class spin_basis_1d(_PackedBasis):
         pauli: bool | int = True,
         kblock: int | None = None,
         pblock: int | None = None,
+        zblock: int | None = None,
         a: int = 1,
         **blocks,
     ):
@@ -180,14 +364,44 @@ class spin_basis_1d(_PackedBasis):
             Nup = round((float(m) + spin_twice / 2) * L)
         _reject_options("spin_basis_1d", {"a": a, **blocks})
         self.N = int(L)
+        symmetries = []
+        momentum = None if kblock is None else -int(kblock)
+        parity = pblock
+        if zblock is not None:
+            if zblock not in (-1, 1):
+                raise ValueError("zblock must be either -1 or +1")
+            symmetries.extend(
+                _one_dimensional_symmetries(
+                    self.N,
+                    states_per_site=spin_twice + 1,
+                    momentum=kblock,
+                    parity=pblock,
+                )
+            )
+            inversion = -(np.arange(self.N) + 1)
+            symmetries.extend(
+                _general_symmetries(
+                    {
+                        "spin_inversion": (
+                            inversion,
+                            0 if zblock == 1 else 1,
+                        )
+                    },
+                    sites=self.N,
+                    states_per_site=spin_twice + 1,
+                )
+            )
+            momentum = None
+            parity = None
         self._request = {
             "kind": "spin",
             "sites": self.N,
             "spin_twice": spin_twice,
             "up": Nup,
-            "momentum": None if kblock is None else -int(kblock),
-            "parity": pblock,
-            "pauli": bool(pauli) if spin_twice == 1 else False,
+            "momentum": momentum,
+            "parity": parity,
+            "normalization": _spin_normalization(pauli, spin_twice),
+            "symmetries": symmetries,
             "reverse": True,
         }
 
@@ -308,7 +522,7 @@ class spin_basis_general(_PackedBasis):
             "up": None if Nup is None else int(Nup),
             "momentum": None,
             "parity": None,
-            "pauli": bool(pauli) if spin_twice == 1 else False,
+            "normalization": _spin_normalization(pauli, spin_twice),
             "symmetries": _general_symmetries(
                 blocks,
                 sites=self.N,
@@ -405,6 +619,7 @@ class spinful_fermion_basis_general(_PackedBasis):
 
 
 __all__ = [
+    "basis_int_to_python_int",
     "boson_basis_1d",
     "boson_basis_general",
     "ho_basis",
@@ -415,3 +630,7 @@ __all__ = [
     "spinless_fermion_basis_1d",
     "spinless_fermion_basis_general",
 ]
+
+
+def basis_int_to_python_int(value) -> int:
+    return int(value)
