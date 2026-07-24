@@ -5,6 +5,7 @@ use qmbed::operator::{
     Coupling, LinearOperator, LocalOperator, MatrixFormat, OpProduct, OperatorBuilder, OperatorSpec,
 };
 use qmbed::solve::EighOptions;
+use std::sync::Arc;
 
 #[test]
 fn packed_basis_preserves_concrete_operator_semantics() {
@@ -112,4 +113,40 @@ fn packed_model_reuses_one_spec_for_states_matrix_and_eigh() {
     assert_eq!(result.eigenvalues.len(), 4);
     assert!(result.eigenvectors.is_empty());
     assert_abs_diff_eq!(result.eigenvalues[0], -1.885007105857148, epsilon = 1.0e-12);
+}
+
+#[test]
+fn packed_model_caches_each_materialized_format() {
+    let basis = SpinBasis1D::builder(2).build().unwrap();
+    let term = OperatorSpec::from_product(
+        OpProduct::new([LocalOperator::Z]).unwrap(),
+        [Coupling::new(1.0, vec![0])],
+    )
+    .unwrap();
+    let model = PackedEdModel::new(basis, [term]);
+
+    let first = model.materialized(MatrixFormat::Csc).unwrap();
+    let second = model.materialized(MatrixFormat::Csc).unwrap();
+    let dense = model.materialized(MatrixFormat::Dense).unwrap();
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(!Arc::ptr_eq(&first, &dense));
+    assert_eq!(first.to_dense(), dense.to_dense());
+}
+
+#[test]
+fn transformed_model_does_not_reuse_a_stale_operator() {
+    let basis = SpinBasis1D::builder(2).build().unwrap();
+    let term = OperatorSpec::from_product(
+        OpProduct::new([LocalOperator::Z]).unwrap(),
+        [Coupling::new(1.0, vec![0])],
+    )
+    .unwrap();
+    let model = PackedEdModel::new(basis, [term]);
+    let original = model.materialized(MatrixFormat::Csc).unwrap();
+    let permuted_model = model.with_site_permutation(&[1, 0]).unwrap();
+    let permuted = permuted_model.materialized(MatrixFormat::Csc).unwrap();
+
+    assert!(!Arc::ptr_eq(&original, &permuted));
+    assert_ne!(original.triplets(), permuted.triplets());
 }

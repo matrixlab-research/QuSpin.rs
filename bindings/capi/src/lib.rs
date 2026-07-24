@@ -1,7 +1,10 @@
 //! Stable, language-neutral entry point shared by the Python and Julia layers.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use qmbed::basis::{
     Basis, BosonBasis1D, PackedBasis, SpinBasis1D, SpinfulFermionBasis1D, SpinlessFermionBasis1D,
@@ -56,6 +59,35 @@ enum CommandRequest {
         solver: SolverRequest,
         #[serde(default)]
         checks: ChecksRequest,
+    },
+    CreateModel {
+        basis: BasisRequest,
+        terms: Vec<TermRequest>,
+        site_permutation: Option<Vec<usize>>,
+        #[serde(default)]
+        checks: ChecksRequest,
+    },
+    DescribeModel {
+        handle: String,
+    },
+    MaterializeModel {
+        handle: String,
+        #[serde(default)]
+        format: StorageFormat,
+    },
+    EighModel {
+        handle: String,
+        #[serde(default)]
+        eigenvectors: bool,
+    },
+    EigshModel {
+        handle: String,
+        #[serde(default)]
+        format: StorageFormat,
+        solver: SolverRequest,
+    },
+    ReleaseModel {
+        handle: String,
     },
 }
 
@@ -175,6 +207,76 @@ enum CommandResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         eigenvectors: Option<Vec<Vec<[f64; 2]>>>,
     },
+    Model {
+        handle: String,
+        dimension: usize,
+    },
+    Released {
+        handle: String,
+    },
+}
+
+static NEXT_MODEL_HANDLE: AtomicU64 = AtomicU64::new(1);
+static MODEL_REGISTRY: OnceLock<RwLock<HashMap<u64, Arc<PackedEdModel>>>> = OnceLock::new();
+
+fn model_registry() -> &'static RwLock<HashMap<u64, Arc<PackedEdModel>>> {
+    MODEL_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn parse_model_handle(handle: &str) -> Result<u64> {
+    let parsed = handle.parse::<u64>().map_err(|_| {
+        QmbedError::InvalidOptions(format!("model handle {handle:?} is not a positive integer"))
+    })?;
+    if parsed == 0 {
+        return Err(QmbedError::InvalidOptions(
+            "model handle must be positive".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn register_model(model: PackedEdModel) -> Result<String> {
+    let handle = NEXT_MODEL_HANDLE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| QmbedError::InvalidOptions("model handle space is exhausted".into()))?;
+    let previous = model_registry()
+        .write()
+        .map_err(|_| QmbedError::InternalState("model registry lock is poisoned".into()))?
+        .insert(handle, Arc::new(model));
+    if previous.is_some() {
+        return Err(QmbedError::InvalidOptions(format!(
+            "model handle {handle} is already registered"
+        )));
+    }
+    Ok(handle.to_string())
+}
+
+fn registered_model(handle: &str) -> Result<Arc<PackedEdModel>> {
+    let handle = parse_model_handle(handle)?;
+    model_registry()
+        .read()
+        .map_err(|_| QmbedError::InternalState("model registry lock is poisoned".into()))?
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| {
+            QmbedError::InvalidOptions(format!("model handle {handle} is not registered"))
+        })
+}
+
+fn release_model(handle: &str) -> Result<String> {
+    let parsed = parse_model_handle(handle)?;
+    let removed = model_registry()
+        .write()
+        .map_err(|_| QmbedError::InternalState("model registry lock is poisoned".into()))?
+        .remove(&parsed);
+    if removed.is_none() {
+        return Err(QmbedError::InvalidOptions(format!(
+            "model handle {parsed} is not registered"
+        )));
+    }
+    Ok(parsed.to_string())
 }
 
 impl From<StorageFormat> for MatrixFormat {
@@ -451,6 +553,56 @@ fn command_eigensystem(
     }
 }
 
+fn command_operator(model: &PackedEdModel, format: StorageFormat) -> Result<CommandResult> {
+    let operator = model.materialized(format.into())?;
+    let (rows, columns) = qmbed::operator::LinearOperator::shape(operator.as_ref());
+    let entries = operator
+        .triplets()
+        .into_iter()
+        .map(|(row, column, value)| MatrixEntry {
+            row,
+            column,
+            value: [value.re, value.im],
+        })
+        .collect();
+    Ok(CommandResult::Operator {
+        shape: [rows, columns],
+        format,
+        entries,
+    })
+}
+
+fn command_eigh(model: &PackedEdModel, eigenvectors: bool) -> Result<CommandResult> {
+    let result = model.eigh(EighOptions {
+        return_eigenvectors: eigenvectors,
+    })?;
+    Ok(command_eigensystem(model.dimension(), result, eigenvectors))
+}
+
+fn command_eigsh(
+    model: &PackedEdModel,
+    format: StorageFormat,
+    solver: &SolverRequest,
+) -> Result<CommandResult> {
+    let include_vectors = solver.eigenvectors;
+    let result = model.eigsh(
+        format.into(),
+        EigshOptions {
+            eigenpairs: solver.eigenpairs,
+            target: solver.target.into(),
+            krylov_dimension: solver.krylov_dimension,
+            tolerance: solver.tolerance,
+            max_iterations: solver.max_iterations,
+            seed: solver.seed,
+        },
+    )?;
+    Ok(command_eigensystem(
+        model.dimension(),
+        result,
+        include_vectors,
+    ))
+}
+
 fn execute_command(request: CommandRequest) -> Result<CommandResult> {
     match request {
         CommandRequest::DescribeBasis { basis } => {
@@ -471,22 +623,7 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
             checks,
         } => {
             let model = build_model(&basis, terms, checks.into(), site_permutation)?;
-            let operator = model.materialize(format.into())?;
-            let (rows, columns) = qmbed::operator::LinearOperator::shape(&operator);
-            let entries = operator
-                .triplets()
-                .into_iter()
-                .map(|(row, column, value)| MatrixEntry {
-                    row,
-                    column,
-                    value: [value.re, value.im],
-                })
-                .collect();
-            Ok(CommandResult::Operator {
-                shape: [rows, columns],
-                format,
-                entries,
-            })
+            command_operator(&model, format)
         }
         CommandRequest::Eigh {
             basis,
@@ -496,10 +633,7 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
             checks,
         } => {
             let model = build_model(&basis, terms, checks.into(), site_permutation)?;
-            let result = model.eigh(EighOptions {
-                return_eigenvectors: eigenvectors,
-            })?;
-            Ok(command_eigensystem(model.dimension(), result, eigenvectors))
+            command_eigh(&model, eigenvectors)
         }
         CommandRequest::Eigsh {
             basis,
@@ -510,23 +644,53 @@ fn execute_command(request: CommandRequest) -> Result<CommandResult> {
             checks,
         } => {
             let model = build_model(&basis, terms, checks.into(), site_permutation)?;
-            let include_vectors = solver.eigenvectors;
-            let result = model.eigsh(
-                format.into(),
-                EigshOptions {
-                    eigenpairs: solver.eigenpairs,
-                    target: solver.target.into(),
-                    krylov_dimension: solver.krylov_dimension,
-                    tolerance: solver.tolerance,
-                    max_iterations: solver.max_iterations,
-                    seed: solver.seed,
-                },
-            )?;
-            Ok(command_eigensystem(
-                model.dimension(),
-                result,
-                include_vectors,
-            ))
+            command_eigsh(&model, format, &solver)
+        }
+        CommandRequest::CreateModel {
+            basis,
+            terms,
+            site_permutation,
+            checks,
+        } => {
+            let model = build_model(&basis, terms, checks.into(), site_permutation)?;
+            let dimension = model.dimension();
+            let handle = register_model(model)?;
+            Ok(CommandResult::Model { handle, dimension })
+        }
+        CommandRequest::DescribeModel { handle } => {
+            let model = registered_model(&handle)?;
+            let states = model
+                .states()?
+                .into_iter()
+                .map(|state| state.to_string())
+                .collect();
+            Ok(CommandResult::Basis {
+                dimension: model.dimension(),
+                states,
+            })
+        }
+        CommandRequest::MaterializeModel { handle, format } => {
+            let model = registered_model(&handle)?;
+            command_operator(&model, format)
+        }
+        CommandRequest::EighModel {
+            handle,
+            eigenvectors,
+        } => {
+            let model = registered_model(&handle)?;
+            command_eigh(&model, eigenvectors)
+        }
+        CommandRequest::EigshModel {
+            handle,
+            format,
+            solver,
+        } => {
+            let model = registered_model(&handle)?;
+            command_eigsh(&model, format, &solver)
+        }
+        CommandRequest::ReleaseModel { handle } => {
+            let handle = release_model(&handle)?;
+            Ok(CommandResult::Released { handle })
         }
     }
 }
@@ -651,6 +815,7 @@ pub unsafe extern "C" fn qmbed_string_free(response: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use std::thread;
 
     use super::{run_command_json, run_json};
 
@@ -709,5 +874,61 @@ mod tests {
         assert_eq!(eigh["status"], "ok");
         assert_eq!(eigh["result"]["eigenvalues"].as_array().unwrap().len(), 4);
         assert!(eigh["result"].get("eigenvectors").is_none());
+    }
+
+    #[test]
+    fn registered_model_is_thread_safe_and_rejects_stale_handles() {
+        let create = run_command_json(
+            r#"{
+                "operation":"create_model",
+                "basis":{"kind":"spin","sites":3,"reverse":true},
+                "terms":[
+                    {"product":{"local":["z"]},"couplings":[
+                        {"coefficient":[1.0,0.0],"sites":[0]},
+                        {"coefficient":[2.0,0.0],"sites":[1]}
+                    ]}
+                ],
+                "site_permutation":[2,1,0]
+            }"#,
+        );
+        let create: Value = serde_json::from_str(&create).unwrap();
+        assert_eq!(create["status"], "ok");
+        assert_eq!(create["result"]["dimension"], 8);
+        let handle = create["result"]["handle"].as_str().unwrap().to_owned();
+
+        let workers = (0..4)
+            .map(|_| {
+                let handle = handle.clone();
+                thread::spawn(move || {
+                    run_command_json(&format!(
+                        r#"{{"operation":"materialize_model","handle":"{handle}","format":"csc"}}"#
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            let response: Value = serde_json::from_str(&worker.join().unwrap()).unwrap();
+            assert_eq!(response["status"], "ok");
+            assert_eq!(response["result"]["shape"], serde_json::json!([8, 8]));
+        }
+
+        let release = run_command_json(&format!(
+            r#"{{"operation":"release_model","handle":"{handle}"}}"#
+        ));
+        let release: Value = serde_json::from_str(&release).unwrap();
+        assert_eq!(release["status"], "ok");
+        assert_eq!(release["result"]["handle"], handle);
+
+        let stale = run_command_json(&format!(
+            r#"{{"operation":"eigh_model","handle":"{handle}"}}"#
+        ));
+        let stale: Value = serde_json::from_str(&stale).unwrap();
+        assert_eq!(stale["status"], "error");
+        assert!(
+            stale["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not registered")
+        );
     }
 }

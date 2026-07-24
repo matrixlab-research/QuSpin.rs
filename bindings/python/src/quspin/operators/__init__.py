@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
 
-from qmbed._ffi import command
+from qmbed._ffi import NativeModel
 from qmbed.compat.quspin import terms_from_static
 
 
@@ -53,7 +52,6 @@ class hamiltonian:
             raise ValueError("basis construction options cannot accompany an explicit basis")
 
         self.basis = basis
-        self.Ns = basis.Ns
         self.dtype = np.dtype(dtype)
         self._terms = tuple(terms_from_static(static))
         self._checks = {
@@ -61,6 +59,15 @@ class hamiltonian:
             "particle_conservation": bool(check_pcon),
             "symmetry_compatibility": bool(check_symm),
         }
+        self._model = NativeModel(
+            {
+                "basis": self.basis._request,
+                "terms": [term.request() for term in self._terms],
+                "site_permutation": self.basis._site_permutation,
+                "checks": self._checks,
+            }
+        )
+        self.Ns = self._model.dimension
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -70,15 +77,21 @@ class hamiltonian:
     def get_shape(self) -> tuple[int, int]:
         return self.shape
 
-    def _request(self, operation: str, **options) -> dict[str, Any]:
-        return {
-            "operation": operation,
-            "basis": self.basis._request,
-            "terms": [term.request() for term in self._terms],
-            "site_permutation": self.basis._site_permutation,
-            "checks": self._checks,
-            **options,
-        }
+    @property
+    def closed(self) -> bool:
+        return self._model.closed
+
+    def close(self) -> None:
+        self._model.close()
+
+    def __enter__(self) -> hamiltonian:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def _execute(self, operation: str, **options: Any) -> dict[str, Any]:
+        return self._model.execute(operation, **options)
 
     def _coerce_matrix(self, result: dict[str, Any]) -> np.ndarray:
         rows, columns = result["shape"]
@@ -94,9 +107,7 @@ class hamiltonian:
     def toarray(self, time: float | None = None) -> np.ndarray:
         if time is not None:
             raise NotImplementedError("time-dependent materialization is not implemented yet")
-        return self._coerce_matrix(
-            command(self._request("materialize", format="csc"))
-        )
+        return self._coerce_matrix(self._execute("materialize_model", format="csc"))
 
     def todense(self, time: float | None = None) -> np.matrix:
         return np.asmatrix(self.toarray(time))
@@ -104,13 +115,13 @@ class hamiltonian:
     def eigvalsh(self, time: float | None = None) -> np.ndarray:
         if time is not None:
             raise NotImplementedError("time-dependent eigvalsh is not implemented yet")
-        result = command(self._request("eigh", eigenvectors=False))
+        result = self._execute("eigh_model", eigenvectors=False)
         return np.asarray(result["eigenvalues"])
 
     def eigh(self, time: float | None = None):
         if time is not None:
             raise NotImplementedError("time-dependent eigh is not implemented yet")
-        result = command(self._request("eigh", eigenvectors=True))
+        result = self._execute("eigh_model", eigenvectors=True)
         vectors = np.column_stack(
             [
                 np.asarray([complex(*value) for value in vector])
@@ -139,19 +150,17 @@ class hamiltonian:
             if sigma is not None
             else {"kind": _TARGETS[which]}
         )
-        result = command(
-            self._request(
-                "eigsh",
-                format="csc",
-                solver={
-                    "eigenpairs": int(k),
-                    "target": target,
-                    "krylov_dimension": ncv,
-                    "tolerance": float(tol),
-                    "max_iterations": int(maxiter),
-                    "eigenvectors": bool(return_eigenvectors),
-                },
-            )
+        result = self._execute(
+            "eigsh_model",
+            format="csc",
+            solver={
+                "eigenpairs": int(k),
+                "target": target,
+                "krylov_dimension": ncv,
+                "tolerance": float(tol),
+                "max_iterations": int(maxiter),
+                "eigenvectors": bool(return_eigenvectors),
+            },
         )
         values = np.asarray(result["eigenvalues"])
         if not return_eigenvectors:
