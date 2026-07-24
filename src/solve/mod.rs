@@ -355,14 +355,13 @@ where
                     .sum();
             }
         }
-        let coefficients =
-            normal
-                .lu()
-                .solve(&projected_rhs)
-                .ok_or(QmbedError::NonConvergence {
-                    iterations,
-                    residual: beta,
-                })?;
+        let coefficients = normal
+            .lu()
+            .solve(&projected_rhs)
+            .ok_or(QmbedError::NonConvergence {
+                iterations,
+                residual: beta,
+            })?;
         for (coefficient, vector) in coefficients.iter().zip(&basis) {
             for (value, basis_value) in solution.iter_mut().zip(vector) {
                 *value += *coefficient * *basis_value;

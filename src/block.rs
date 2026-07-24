@@ -21,9 +21,7 @@ fn block_offsets(shapes: impl IntoIterator<Item = (usize, usize)>) -> Result<Vec
                 .copied()
                 .unwrap_or_default()
                 .checked_add(shape.0)
-                .ok_or_else(|| {
-                    QmbedError::UnsupportedBackend("block dimension overflow".into())
-                })?,
+                .ok_or_else(|| QmbedError::UnsupportedBackend("block dimension overflow".into()))?,
         );
     }
     if offsets.len() == 1 {

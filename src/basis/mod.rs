@@ -453,9 +453,10 @@ fn spin_symmetry_sector(
             ));
         }
         visited.extend(orbit.iter().copied());
-        let representative = *orbit.iter().min().ok_or_else(|| {
-            QmbedError::InvalidSector("symmetry generated an empty orbit".into())
-        })?;
+        let representative = *orbit
+            .iter()
+            .min()
+            .ok_or_else(|| QmbedError::InvalidSector("symmetry generated an empty orbit".into()))?;
 
         let mut coefficients = HashMap::<u128, Complex64>::new();
         for shift in 0..translations {

@@ -193,9 +193,7 @@ pub fn partial_trace_density(
 ) -> Result<Vec<Complex64>> {
     let dimension = subsystem_dimension
         .checked_mul(environment_dimension)
-        .ok_or_else(|| {
-            QmbedError::DimensionMismatch("tensor-product dimension overflow".into())
-        })?;
+        .ok_or_else(|| QmbedError::DimensionMismatch("tensor-product dimension overflow".into()))?;
     if subsystem_dimension == 0
         || environment_dimension == 0
         || density.len() != dimension.saturating_mul(dimension)
