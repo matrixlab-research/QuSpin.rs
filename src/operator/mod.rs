@@ -78,10 +78,7 @@ impl OpProduct {
                 "operator products cannot be empty".into(),
             ));
         }
-        if local
-            .iter()
-            .any(|operator| *operator == LocalOperator::Custom('|'))
-        {
+        if local.contains(&LocalOperator::Custom('|')) {
             return Err(QmbedError::InvalidOperator(
                 "the species separator is not a local operator".into(),
             ));
