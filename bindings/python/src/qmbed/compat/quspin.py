@@ -11,6 +11,8 @@ from ..model import (
     eigsh as native_eigsh,
 )
 
+TARGET_QUSPIN_VERSION = "1.0.1"
+
 _SYMBOLS = {
     "I": LocalOperator.IDENTITY,
     "n": LocalOperator.NUMBER,
